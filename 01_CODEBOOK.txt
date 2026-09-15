@@ -1,0 +1,471 @@
+CODEBOOK AND ANALYSIS MAP
+BHPS / Understanding Society relationship-course study
+
+===============================================================================
+1. DATA SOURCES AND IDENTIFIERS
+===============================================================================
+
+pidp
+  Cross-wave person identifier. Used to link respondents longitudinally and as
+  the respondent clustering variable in repeated-observation analyses.
+
+survey
+  Harmonized survey indicator (BHPS or UKHLS) where both survey eras contribute.
+
+wave / wave_n
+  UKHLS wave identifier / numeric wave order. Several relationship-quality and
+  nonresident-partner measures are UKHLS-specific.
+
+interview_year, interview_month, interview_ym
+  Calendar timing of interview. Month indices are used for relationship duration,
+  temporal ordering, and time-to-event calculations.
+
+relationship_spell_id / lat_episode_id
+  Derived identifiers for a focal cohabiting relationship spell or reconstructed
+  living-apart-together (LAT) episode.
+
+===============================================================================
+2. CORE PSYCHOLOGICAL MEASURES
+===============================================================================
+
+scghq1_dv -> ghq / ghq12
+  General Health Questionnaire, 12-item Likert score.
+  Range: 0-36.
+  Higher raw values = greater psychological distress.
+  For selection models and some anticipation modules, a favorable-oriented score
+  is constructed as ghq_wb = -GHQ, so higher values = lower distress.
+
+sclfsato -> life_satisfaction / life_sat
+  Overall life satisfaction.
+  Range: 1-7.
+  Higher values = greater life satisfaction.
+
+STANDARDIZATION
+  Standardized coefficients are expressed in outcome-specific SD units using the
+  reference population specified in the relevant component script. Do not assume
+  that every module uses the same SD reference. For example, the current no36
+  LAT-to-cohabitation pathway deliberately reuses the incident-LAT last-unpartnered
+  outcome SD so its effect scale matches the formation analysis.
+
+===============================================================================
+3. RELATIONSHIP QUALITY (RDAS)
+===============================================================================
+
+scdassat_dv -> rdas_satisfaction
+  Relationship Satisfaction subscale of the Revised Dyadic Adjustment Scale
+  (RDAS; Busby et al., 1995). The subscale reflects relationship stability and
+  conflict (e.g., thoughts of termination, regret, quarrelling, irritation).
+  Derived UKHLS score: 0-20; higher = greater relationship satisfaction.
+  Available in the analysis workflow at UKHLS Waves 1, 3, 5, 7, 9, 11, 13, 15.
+
+scdascoh_dv -> rdas_cohesion
+  RDAS Relationship Cohesion subscale. It reflects shared engagement and positive
+  interaction, such as exchange of ideas, discussion, and shared activities.
+  Higher derived scores = greater cohesion.
+  Available in the analysis workflow at UKHLS Waves 1, 5, 7, 9, 11, 13, 15.
+  Wave 3 is not used for cohesion because a comparable derived cohesion score
+  could not be constructed there.
+
+rdas_satisfaction_change / rdas_cohesion_change
+  Current RDAS value minus the most recent eligible prior value within the same
+  cohabiting relationship spell. The eligible prior interval is defined in the
+  core workflow (generally 6-30 months for RDAS history in these analyses).
+
+prior_rdas_satisfaction / prior_rdas_cohesion
+  Most recent eligible prior relationship-quality level within the focal spell.
+
+===============================================================================
+4. CURRENT RELATIONSHIP STATE AND LAT MEASURES
+===============================================================================
+
+mastat_dv -> harmonized status
+  Current marital/co-residential status. Harmonized analysis labels include:
+    single
+    cohab
+    married
+    civil_partner
+    other
+
+ncrr1
+  Steady nonresident relationship indicator among relevant UKHLS respondents.
+    1 = steady relationship with a nonresident person regarded as partner
+    2 = no steady nonresident partner
+  Other/special codes are treated as missing.
+
+CURRENTLY UNPARTNERED / CLEAN UNPARTNERED
+  Primary exact-wave definition used in the current selection analyses:
+    harmonized status == "single" AND ncrr1 == 2 at the same interview.
+  Previous relationships are not an automatic primary exclusion; increasingly
+  stringent prior-history exclusions are sensitivity analyses.
+
+LAT (living apart together)
+  A steady nonresident partnership. In the focal incident-LAT workflow, the
+  respondent is observed single + ncrr1==2 before the event and later single +
+  ncrr1==1, with reported relationship-start timing located between the relevant
+  interviews under the timing rules in script 02.
+
+ncrrm / ncrry4
+  Reported month / year in which the nonresident relationship began. Used to
+  derive LAT relationship-start month when available.
+
+===============================================================================
+5. SUBJECTIVE RELATIONSHIP EXPECTATIONS
+===============================================================================
+
+ncrr11
+  Intention to begin living with the current nonresident partner within three
+  years.
+    1 = yes
+    2 = no
+  Script 07 recodes this as 1=yes, 0=no and defines strengthening intention as a
+  no-to-yes change between eligible observations.
+
+ncrr12
+  Perceived likelihood of marrying the current nonresident partner.
+    1 = very likely
+    2 = likely
+    3 = not sure
+    4 = unlikely
+    5 = very unlikely
+    6 = prefer not to disclose
+  Category 6 is excluded from substantive analyses. The numeric likelihood score
+  is reversed so higher = stronger marriage expectation:
+    original 1->5, 2->4, 3->3, 4->2, 5->1.
+
+===============================================================================
+6. PHISTORY RELATIONSHIP-HISTORY VARIABLES
+===============================================================================
+
+PHISTORY status
+    2  = marriage
+    3  = civil partnership
+    10 = living together as a couple / cohabitation
+
+spellno
+  Relationship-history spell number.
+
+partner
+  Partner pidp when available. Used for conservative relationship continuity
+  checks where the estimand requires the same focal relationship.
+
+starty, startm / endy, endm
+  Start and end year/month of the PHISTORY spell.
+
+start_if / end_if
+  Date-imputation flags used to define exact/usable timing in relevant modules.
+  The preparation workflow retains the original flags and labels their status.
+
+ongoing
+  Indicator that the PHISTORY spell was ongoing at the relevant history endpoint.
+
+cohend
+  How a cohabiting spell ended. In the workflows:
+    1 = breakup
+    2 = transition to marriage
+  Ongoing spells are treated separately.
+
+===============================================================================
+7. KEY DERIVED PSYCHOLOGICAL SELECTION VARIABLES
+===============================================================================
+
+Wave-adjusted psychological input
+  Before latent decomposition, each psychological score is centered on the mean
+  of its ACTUAL UKHLS survey wave in the adult UKHLS panel. For GHQ, the score is
+  first favorably oriented (-GHQ-12), so higher values indicate lower distress.
+  This removes common survey-wave/secular shifts before the between-/within-
+  person components are constructed.
+
+stable_score_SD
+  Model-based stable between-person psychological component obtained from the
+  stable-trait / within-person variability score (WPVS) measurement model. It is
+  expressed in units of the outcome-specific raw current-score SD.
+
+current_wpvs_SD
+  Current within-person variability score at the focal clean-unpartnered
+  baseline, conditional on the stable component. It is expressed using the same
+  outcome-specific raw current-score SD as stable_score_SD.
+
+Primary measurement history (T = 4)
+  Current clean-unpartnered baseline plus the 3 immediately preceding UKHLS
+  waves, all with valid psychological measurements. These are exact consecutive
+  UKHLS waves. No observation after the focal baseline contributes to the score.
+
+History-length sensitivities
+  T = 5 and T = 6 repeat the decomposition with longer exact consecutive-wave
+  histories.
+
+Interpretation
+  stable_score_SD and current_wpvs_SD are entered simultaneously in the final
+  H1 selection models. OR/HR > 1 indicates that more favorable psychological
+  functioning (higher life satisfaction or lower GHQ distress) is associated
+  with greater subsequent relationship-transition odds/rate. These are
+  prospective selection associations, not causal effects.
+
+Obsolete variables
+  The prior-mean plus current-deviation specification used in an earlier version
+  of the selection analysis is NOT part of the current reproducibility workflow.
+
+===============================================================================
+8. INCIDENT LAT FORMATION / RELATIONSHIP-GAIN VARIABLES
+===============================================================================
+
+pre25_36
+  Psychological observation approximately 25-36 months before LAT formation.
+
+last_unpartnered
+  Last eligible observation before clean incident LAT formation.
+
+first_LAT
+  First eligible observation confirming the focal steady nonresident relationship.
+
+Primary formation contrast
+  last_unpartnered -> first_LAT.
+  Positive life-satisfaction change = favorable.
+  Negative raw GHQ-distress change = favorable.
+
+Primary preformation diagnostic
+  pre25_36 -> last_unpartnered.
+
+===============================================================================
+9. RELATIONSHIP-AGE / MAINTENANCE VARIABLES
+===============================================================================
+
+cohab_duration_months
+  Months between the start of the focal cohabiting spell and the interview.
+
+Primary duration categories
+    0-11 months   (reference)
+    12-23
+    24-35
+    36-59
+    60-83
+    84-119
+    120-179
+
+spell_outcome
+  Focal relationship outcome used to compare trajectories, generally:
+    ongoing cohabitation
+    later marriage
+    breakup
+
+Relationship-age models
+  Estimate within-relationship change over duration and interactions with later
+  relationship outcome. Relationship-spell and wave fixed effects are used in
+  the corrected specifications. Balanced/common-spell sensitivities require the
+  same spell to contribute both the 0-11-month reference and target duration bin.
+
+===============================================================================
+10. PROSPECTIVE RELATIONSHIP SORTING VARIABLES
+===============================================================================
+
+future_event
+  Binary event indicator in a specified contrast and horizon.
+
+Primary sorting horizon
+  24 months after the cohabiting landmark.
+
+Marriage contrast
+  Marriage within the horizon vs observed continued cohabitation through the
+  horizon. Breakups within the horizon are excluded as competing outcomes.
+
+Breakup contrast
+  Breakup within the horizon vs observed continued cohabitation through the
+  horizon. Marriages within the horizon are excluded as competing outcomes.
+
+Current-level model predictors
+  Standardized current RDAS satisfaction and cohesion entered simultaneously.
+
+Recent-change model predictors
+  Standardized recent RDAS satisfaction and cohesion change, with prior RDAS
+  satisfaction and cohesion levels controlled.
+
+===============================================================================
+11. PERSON-LEVEL COHABITATION / MARRIAGE SELECTION ENDPOINTS
+===============================================================================
+
+Analytic unit
+  One psychologically eligible baseline per non-overlapping clean-unpartnered
+  episode. A respondent may contribute again after returning to clean unpartnered
+  status. Standard errors are clustered by respondent.
+
+Cohabitation endpoint
+  Cause-specific Cox model. Marriage before (or in the same recorded month as)
+  observed cohabitation ends the cohabitation risk interval as a competing event.
+
+Marriage endpoint
+  First subsequent marriage during episode follow-up. Cohabitation may be an
+  intermediate state and does not censor the marriage model.
+
+Cohabitation-or-marriage endpoint
+  First subsequent occurrence of either state.
+
+Primary time scale
+  Months since psychological baseline.
+
+===============================================================================
+12. ANTICIPATION / PATHWAY VARIABLES
+===============================================================================
+
+CURRENT LAT-to-cohabitation pathway (script 06)
+  Among clean incident LAT episodes, a treated relationship is one that later
+  progresses to a conservatively linked cohabitation at any observed time.
+  A control must remain at risk in LAT through the same relationship duration at
+  which the treated relationship cohabits. Psychological observations are kept
+  strictly before the matched cohabitation time. Later-cohabiting controls may
+  serve as controls before their own event.
+
+  Only duration stages with adequate treated-set support enter the primary
+  support-qualified omnibus. The current data support primary interpretation of
+  the 12-23-month stage; later stages are too sparse for affirmative inference.
+
+Marriage pathway (script 07)
+  Compares post-cohabitation psychological trajectories of relationships that
+  marry within the fixed 36-month pathway horizon with cohabitations observed to
+  remain unmarried/stable through the corresponding horizon.
+
+Subjective anticipation (script 07)
+  NCRR11 change at t predicts psychological change after t.
+  NCRR12 likelihood change/level at t predicts psychological change after t.
+  This preserves temporal ordering of expectation and subsequent psychological
+  change.
+
+IMPORTANT
+  Script 07 retains an older fixed-36-month LAT-to-cohabitation branch for
+  historical continuity. It is superseded in the current manuscript by script 06.
+
+===============================================================================
+13. CLUSTERING, FIXED EFFECTS, WEIGHTING, MULTIPLICITY
+===============================================================================
+
+Clustering
+  Respondent-level clustered/robust standard errors are used when repeated
+  observations, repeated episodes, or matched-set reuse induce dependence.
+
+Fixed effects
+  Models use the fixed effects appropriate to their estimand, including
+  relationship-spell, wave, risk-set, and/or calendar-time effects. See each
+  component script for the exact formula.
+
+Risk-set / ATT weighting
+  Proximity and pathway models use the matching/weighting rules defined within
+  their component workflow. The no36 LAT-to-cohabitation module uses incidence-
+  density style risk-set matching at the treated relationship duration.
+
+Multiplicity
+  Holm adjustment is applied within prespecified families of related primary or
+  diagnostic tests. Family definitions differ by analysis and are explicitly
+  encoded in the corresponding script; p-values should not be re-adjusted across
+  unrelated analysis families post hoc.
+
+===============================================================================
+14. SCRIPT-TO-MANUSCRIPT RESULT MAP
+===============================================================================
+
+03_prepare_current_unpartnered_selection_base.R.txt
+  Data preparation only: creates the exact-wave clean-unpartnered landmark base
+  (status=single and NCRR1=NO at the same interview).
+
+03B_prepare_unpartnered_episode_structure.R.txt
+  Data preparation only: creates non-overlapping clean-unpartnered episode IDs
+  and prospective follow-up boundaries for the Cox selection design.
+
+UKHLS_latent_stable_WPVS_final_measurement_stage_v2_1_WAVECENTERED_AGEFIX.R.txt
+  Final wave-adjusted stable-trait / WPVS measurement stage. Produces the T=4
+  stable between-person and current within-person scores used by H1; T=5/T=6 are
+  history-length sensitivities.
+
+UKHLS_H1_latent_stable_WPVS_selection_v1.R.txt
+  Final H1 psychological-selection analyses: matched incident-LAT conditional
+  logit plus non-overlapping clean-unpartnered Cox models for cohabitation,
+  marriage, and either endpoint, entering stable_score_SD and current_wpvs_SD
+  simultaneously.
+
+02_incident_LAT_formation_gain.R.txt
+  Preformation and relationship-formation-associated psychological change.
+
+01_core_relationship_development_proximity.R.txt
+  Corrected relationship-age GHQ/life-satisfaction/RDAS trajectories; lagged
+  RDAS-to-psychological change; primary objective proximity analyses and related
+  history/weighting diagnostics.
+
+01B_relationship_development_sensitivities.R.txt
+  Balanced common-spell relationship-age sensitivities and strict nonoverlapping
+  lag-ordering checks. This module underlies, among other results, the reported
+  balanced RDAS satisfaction differential at 24-35 months.
+
+01C_RDAS_gradient_pair_balanced_diagnostics.R.txt
+  Additional direct RDAS proximity-gradient and pair-balanced sensitivity output.
+
+05_RDAS_sorting_progression.R.txt
+  Prospective RDAS satisfaction/cohesion levels and changes predicting marriage
+  or breakup within 24 months; 12-month and weighting/history sensitivities.
+
+06_LAT_to_cohabitation_pathway_no36.R.txt
+  CURRENT cohabitation-pathway matching, support diagnostics, primary omnibus,
+  balanced 12-23-month sensitivity, stricter control definitions, and first-LAT
+  to last-precohabitation sensitivity.
+
+07_pathway_subjective_anticipation.R.txt
+  Marriage-pathway trajectory tests and balanced sensitivities; NCRR11
+  cohabitation-intention change; NCRR12 marriage-likelihood change/level and
+  behavioral-validity analysis.
+
+===============================================================================
+15. SAMPLE-SIZE LANDMARKS FOR REPRODUCTION CHECKING
+===============================================================================
+
+Current-unpartnered source risk set
+  63,158 person-wave landmarks; 18,589 respondents.
+
+Final latent psychological selection
+  Sample sizes depend on latent-score eligibility and therefore differ from the
+  earlier prior-mean/deviation analyses. For exact reproduction checks, use the
+  T=4 rows in:
+    tables/T01_PRIMARY_T4_H1_latent_selection_coefficients.csv
+    diagnostics/02_LAT_score_join_and_pruning_audit.csv
+    diagnostics/05_latent_episode_baseline_and_event_support.csv
+    diagnostics/06_COX_model_sample_support.csv
+  T=5 and T=6 are history-length sensitivity samples and are expected to be
+  progressively smaller because they require longer complete consecutive-wave
+  psychological histories.
+
+Relationship-age panels
+  GHQ: 31,215 observations; 7,289 respondents; 7,486 spells.
+  Life satisfaction: 31,290 observations; 7,293 respondents; 7,490 spells.
+  RDAS satisfaction: 12,575 observations; 4,229 respondents; 4,271 spells.
+  RDAS cohesion: 9,145 observations; 3,138 respondents; 3,156 spells.
+
+Lagged RDAS -> psychological change
+  GHQ: 4,644 observations / 1,201 spells.
+  Life satisfaction: 4,682 observations / 1,207 spells.
+
+LAT-to-cohabitation pathway
+  2,736 linked clean incident LAT episodes; 318 later cohabitation progressors;
+  177 retained primary matched progressor sets; 684 trajectory rows.
+
+Marriage pathway
+  1,027 future-marriage matched sets;
+  19,732 life-satisfaction trajectory rows and 19,637 GHQ trajectory rows.
+
+Subjective expectations
+  Cohabitation intention: 6,241 episodes with >=2 observations; 1,586 with change.
+  Marriage likelihood: 6,560 episodes with >=2 observations; 3,726 with change.
+
+These counts are audit targets, not universal fixed Ns: fitted-model N can vary
+with outcome availability, lag requirements, and sensitivity restrictions.
+
+===============================================================================
+16. INTERPRETIVE CONSTRAINTS
+===============================================================================
+
+- All analyses are observational.
+- "Relationship gain" denotes formation-associated change, not a proven causal
+  treatment effect of relationship formation.
+- "Sorting" denotes prospective/compositional differentiation in relationship
+  fate, not a causal effect of RDAS on marriage or dissolution.
+- Null annual-scale anticipation results do not rule out short-lived or more
+  proximal anticipatory processes that occur between survey interviews.
+- The Selection-Relationship Gain-Maintenance-Sorting Model is a synthesis of
+  complementary empirical contrasts, not a single estimated structural model.
+
+END OF CODEBOOK

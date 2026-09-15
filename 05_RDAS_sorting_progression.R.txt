@@ -1,0 +1,849 @@
+# =============================================================================
+# UKHLS POST-v4.2 FOLLOW-UP
+# DOES RELATIONSHIP DEVELOPMENT PREDICT SUBSEQUENT PROGRESSION OR DISSOLUTION?
+# Version 1.0
+# =============================================================================
+#
+# PURPOSE
+# -------
+# This script tests the prospective arrow:
+#
+#   earlier relationship functioning/development
+#        -> subsequent marriage or dissolution
+#
+# It is designed to complement, not replace, Analysis C in the v4.2 workflow.
+# Analysis C asks whether trajectories differ according to eventual outcome.
+# The present follow-up instead places the temporal ordering in the predictive
+# direction: RDAS information observed at a landmark is used to predict what
+# happens to the SAME cohabiting relationship over a FUTURE horizon.
+#
+# IMPORTANT INFERENTIAL STATUS
+# ----------------------------
+# This is a post-v4.2 explanatory analysis. It should NOT be described as
+# confirmatory unless it was independently preregistered before results were
+# inspected. The models estimate prospective associations, not causal effects.
+# Unmeasured commitment, compatibility, partner characteristics, fertility
+# plans, economic conditions, and other factors may affect both RDAS and the
+# subsequent relationship outcome.
+#
+# PRIMARY EXPLANATORY TEST
+# ------------------------
+# 24-month prospective landmark models using RECENT RDAS CHANGE as the focal
+# predictor, conditional on PRIOR RDAS LEVEL. This directly tests whether
+# recent relationship-quality development predicts subsequent progression or
+# dissolution beyond the starting level of relationship quality.
+#
+# COMPLEMENTARY TEST
+# ------------------
+# Current RDAS satisfaction/cohesion levels predicting the same outcomes.
+# These test prospective selection on relationship-quality LEVEL, but do not by
+# themselves demonstrate a developmental/change process.
+#
+# SENSITIVITY
+# -----------
+# 1. 12-month horizon.
+# 2. Equal-relationship weighting so long relationships with many landmarks do
+#    not contribute disproportionate weight.
+# 3. Optional psychological-history adjustment. This is deliberately secondary
+#    because psychological functioning may partly lie downstream of relationship
+#    quality; conditioning on it can therefore constitute overadjustment.
+#
+# COMPETING OUTCOMES
+# ------------------
+# Marriage and breakup are analyzed in separate cause-specific contrasts:
+#   marriage within H months vs observed continued cohabitation through H;
+#   breakup within H months vs observed continued cohabitation through H.
+# The competing event is excluded from each binary contrast rather than coded
+# as a non-event.
+#
+# RUNNING THE SCRIPT
+# ------------------
+# Preferred: source this file after UKHLS_revised_workflow_v4_2.R.txt in the
+# same R session. If primary_support is not in memory, the script attempts to
+# load the v4.2 cohabitation person-spell-wave RDS and reconstruct the v4.2
+# primary-support restriction.
+# =============================================================================
+
+# =============================================================================
+# 0. PACKAGES AND SETTINGS
+# =============================================================================
+
+required_packages <- c(
+  "dplyr", "readr", "tibble", "purrr", "fixest", "splines"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop("Please install: ", paste(missing_packages, collapse = ", "))
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(purrr)
+  library(fixest)
+  library(splines)
+})
+
+options(dplyr.summarise.inform = FALSE)
+fixest::setFixest_nthreads(0)
+
+# Main prospective horizon and shorter-horizon sensitivity.
+HORIZONS <- c(24L, 12L)
+PRIMARY_HORIZON <- 24L
+
+# Exact dates for events, matching the strict v4.2 primary timing logic.
+MARRIAGE_DATE_FLAGS_FOLLOWUP <- 0L
+BREAKUP_DATE_FLAGS_FOLLOWUP <- 0L
+
+# Same current-duration support used by v4.2.
+PRIMARY_DURATION_MIN_FOLLOWUP <- 0L
+PRIMARY_DURATION_MAX_FOLLOWUP <- 179L
+
+# Require the future event to occur after, not in, the landmark interview month.
+MIN_EVENT_LEAD_MONTHS <- 1L
+
+# Event-count warning threshold; models still run below this threshold.
+SPARSE_EVENT_WARNING_N <- 20L
+
+# =============================================================================
+# 1. INPUT DATA
+# =============================================================================
+
+V42_OUT_DIR <- file.path(
+  getwd(),
+  "UKHLS_REVISED_selection_development_proximity_v4_2"
+)
+
+FOLLOWUP_OUT_DIR <- file.path(
+  getwd(),
+  "UKHLS_relationship_development_predicts_progression_v1"
+)
+
+dir.create(FOLLOWUP_OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(FOLLOWUP_OUT_DIR, "tables"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(FOLLOWUP_OUT_DIR, "models"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(FOLLOWUP_OUT_DIR, "diagnostics"), recursive = TRUE, showWarnings = FALSE)
+
+if (exists("primary_support", inherits = TRUE)) {
+  analytic_base <- get("primary_support", inherits = TRUE)
+  input_mode <- "primary_support object inherited from v4.2 session"
+} else {
+  v42_rds <- file.path(
+    V42_OUT_DIR,
+    "data",
+    "03_cohabitation_person_spell_wave.rds"
+  )
+
+  if (!file.exists(v42_rds)) {
+    stop(
+      "Could not find primary_support in memory or the v4.2 RDS at:\n",
+      v42_rds,
+      "\nRun this script immediately after v4.2, or run v4.2 first."
+    )
+  }
+
+  cohab_panel_followup <- readRDS(v42_rds)
+  analytic_base <- cohab_panel_followup %>%
+    filter(
+      !ambiguous_active_cohab,
+      cohab_duration_months >= PRIMARY_DURATION_MIN_FOLLOWUP,
+      cohab_duration_months <= PRIMARY_DURATION_MAX_FOLLOWUP
+    )
+  input_mode <- "reconstructed primary_support from v4.2 cohabitation RDS"
+}
+
+required_columns <- c(
+  "pidp", "relationship_spell_id", "wave", "interview_ym",
+  "age", "sex", "cohab_duration_months",
+  "cohab_end_ym", "cohab_end_if", "cohab_ongoing", "cohend",
+  "spell_outcome", "marriage_start_ym", "marriage_start_if",
+  "months_remaining_in_cohab", "months_to_marriage",
+  "exact_marriage_date", "exact_breakup_date", "months_to_breakup",
+  "rdas_satisfaction", "rdas_cohesion",
+  "prior_rdas_satisfaction", "prior_rdas_cohesion",
+  "rdas_satisfaction_change", "rdas_cohesion_change",
+  "ghq", "life_satisfaction",
+  "prior_spell_ghq", "prior_spell_ls",
+  "spell_ghq_change", "spell_ls_change"
+)
+
+missing_columns <- setdiff(required_columns, names(analytic_base))
+if (length(missing_columns) > 0L) {
+  stop(
+    "Required v4.2 columns are missing: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+# =============================================================================
+# 2. HELPERS
+# =============================================================================
+
+zsafe_local <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  s <- stats::sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - mean(x, na.rm = TRUE)) / s
+}
+
+write_csv_local <- function(x, filename, subdir = "tables") {
+  path <- file.path(FOLLOWUP_OUT_DIR, subdir, filename)
+  readr::write_csv(x, path, na = "", progress = FALSE)
+  invisible(path)
+}
+
+# Define future state using only outcomes that occur AFTER the landmark.
+# "continued" means the same cohabiting spell is observed/known to remain intact
+# for the entire future horizon. Relationships marrying or breaking up AFTER
+# the horizon can therefore legitimately contribute as "continued" through H.
+derive_future_state <- function(data, horizon_months) {
+  data %>%
+    mutate(
+      horizon_months = as.integer(horizon_months),
+
+      marriage_in_horizon =
+        spell_outcome == "marriage" &
+        marriage_start_if %in% MARRIAGE_DATE_FLAGS_FOLLOWUP &
+        !is.na(months_to_marriage) &
+        months_to_marriage >= MIN_EVENT_LEAD_MONTHS &
+        months_to_marriage <= horizon_months,
+
+      breakup_in_horizon =
+        spell_outcome == "breakup" &
+        exact_breakup_date &
+        !is.na(months_to_breakup) &
+        months_to_breakup >= MIN_EVENT_LEAD_MONTHS &
+        months_to_breakup <= horizon_months,
+
+      # Evidence that the relationship remained cohabiting throughout H.
+      # For completed spells, require exact/month-imputed end timing as in the
+      # v4.2 continued-cohabitation control logic. Ongoing spells are permitted
+      # when subsequent observed follow-up spans the full horizon.
+      continued_through_horizon =
+        !marriage_in_horizon &
+        !breakup_in_horizon &
+        !is.na(months_remaining_in_cohab) &
+        months_remaining_in_cohab >= horizon_months &
+        (cohab_ongoing == 1 | cohab_end_if %in% c(0L, 1L)),
+
+      future_state = case_when(
+        marriage_in_horizon ~ "marriage",
+        breakup_in_horizon ~ "breakup",
+        continued_through_horizon ~ "continued",
+        TRUE ~ "insufficient_or_other"
+      ),
+      future_state = factor(
+        future_state,
+        levels = c("continued", "marriage", "breakup", "insufficient_or_other")
+      )
+    )
+}
+
+# Tidy a fixest model without requiring broom.
+tidy_fixest_local <- function(model, model_id, horizon, contrast,
+                               model_type, weighting, focal_terms) {
+  if (is.null(model)) return(tibble())
+
+  ct <- as.data.frame(fixest::coeftable(model))
+  if (nrow(ct) == 0L) return(tibble())
+  ct$term <- rownames(ct)
+  ci <- as.data.frame(stats::confint(model))
+  ci$term <- rownames(ci)
+
+  out <- tibble(
+    model_id = model_id,
+    horizon_months = horizon,
+    contrast = contrast,
+    model_type = model_type,
+    weighting = weighting,
+    term = ct$term,
+    estimate = ct[[1]],
+    std_error = ct[[2]],
+    statistic = ct[[3]],
+    p_value = ct[[4]]
+  ) %>%
+    left_join(
+      tibble(
+        term = ci$term,
+        conf_low = ci[[1]],
+        conf_high = ci[[2]]
+      ),
+      by = "term"
+    ) %>%
+    mutate(
+      odds_ratio = exp(estimate),
+      or_conf_low = exp(conf_low),
+      or_conf_high = exp(conf_high),
+      focal = term %in% focal_terms
+    )
+
+  out
+}
+
+# Joint Wald test of all focal RDAS terms in a model. This is useful because
+# relationship development is represented by satisfaction and cohesion jointly.
+joint_wald_local <- function(model, focal_terms, model_id, horizon, contrast,
+                             model_type, weighting) {
+  if (is.null(model)) return(tibble())
+
+  b <- stats::coef(model)
+  V <- stats::vcov(model)
+  present <- focal_terms[focal_terms %in% names(b)]
+
+  if (length(present) != length(focal_terms)) {
+    return(tibble(
+      model_id = model_id,
+      horizon_months = horizon,
+      contrast = contrast,
+      model_type = model_type,
+      weighting = weighting,
+      joint_terms = paste(focal_terms, collapse = " + "),
+      n_terms_requested = length(focal_terms),
+      n_terms_available = length(present),
+      chi_square = NA_real_,
+      df = NA_integer_,
+      p_value = NA_real_,
+      test_available = FALSE
+    ))
+  }
+
+  bb <- b[present]
+  VV <- V[present, present, drop = FALSE]
+  invV <- tryCatch(solve(VV), error = function(e) NULL)
+
+  if (is.null(invV)) {
+    return(tibble(
+      model_id = model_id,
+      horizon_months = horizon,
+      contrast = contrast,
+      model_type = model_type,
+      weighting = weighting,
+      joint_terms = paste(focal_terms, collapse = " + "),
+      n_terms_requested = length(focal_terms),
+      n_terms_available = length(present),
+      chi_square = NA_real_,
+      df = length(present),
+      p_value = NA_real_,
+      test_available = FALSE
+    ))
+  }
+
+  W <- as.numeric(t(bb) %*% invV %*% bb)
+  k <- length(bb)
+
+  tibble(
+    model_id = model_id,
+    horizon_months = horizon,
+    contrast = contrast,
+    model_type = model_type,
+    weighting = weighting,
+    joint_terms = paste(focal_terms, collapse = " + "),
+    n_terms_requested = length(focal_terms),
+    n_terms_available = length(present),
+    chi_square = W,
+    df = k,
+    p_value = stats::pchisq(W, df = k, lower.tail = FALSE),
+    test_available = TRUE
+  )
+}
+
+fit_logit_safe <- function(formula, data, model_id, weights_formula = NULL) {
+  model <- tryCatch(
+    {
+      if (is.null(weights_formula)) {
+        fixest::feglm(
+          formula,
+          data = data,
+          family = "binomial",
+          vcov = ~pidp
+        )
+      } else {
+        fixest::feglm(
+          formula,
+          data = data,
+          family = "binomial",
+          weights = weights_formula,
+          vcov = ~pidp
+        )
+      }
+    },
+    error = function(e) {
+      warning(model_id, " failed: ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  if (!is.null(model)) {
+    saveRDS(model, file.path(FOLLOWUP_OUT_DIR, "models", paste0(model_id, ".rds")))
+  }
+  model
+}
+
+# Build one cause-specific contrast. Competing event is excluded.
+make_contrast <- function(data_h, contrast) {
+  stopifnot(contrast %in% c("marriage", "breakup"))
+
+  data_h %>%
+    filter(future_state %in% c("continued", contrast)) %>%
+    mutate(
+      future_event = as.integer(as.character(future_state) == contrast)
+    )
+}
+
+# Model runner. The complete-case restriction is applied explicitly before
+# computing equal-relationship weights, so every relationship receives total
+# weight approximately 1 within that model sample.
+run_one_model <- function(data, formula, required_vars, focal_terms,
+                          horizon, contrast, model_type,
+                          equal_spell_weight = FALSE) {
+
+  d <- data %>%
+    filter(if_all(all_of(required_vars), ~ !is.na(.x))) %>%
+    group_by(relationship_spell_id) %>%
+    mutate(
+      n_landmarks_model_spell = n(),
+      equal_spell_weight = 1 / n_landmarks_model_spell
+    ) %>%
+    ungroup()
+
+  weighting <- if (equal_spell_weight) "equal_relationship" else "landmark"
+  model_id <- paste0(
+    "H", horizon, "_", contrast, "_", model_type, "_", weighting
+  )
+
+  n_events <- sum(d$future_event == 1, na.rm = TRUE)
+  n_controls <- sum(d$future_event == 0, na.rm = TRUE)
+
+  if (n_events < SPARSE_EVENT_WARNING_N) {
+    warning(model_id, ": only ", n_events, " events; interpret cautiously.")
+  }
+
+  sample_row <- tibble(
+    model_id = model_id,
+    horizon_months = horizon,
+    contrast = contrast,
+    model_type = model_type,
+    weighting = weighting,
+    n_landmarks = nrow(d),
+    n_events = n_events,
+    n_controls = n_controls,
+    n_relationship_spells = n_distinct(d$relationship_spell_id),
+    n_respondents = n_distinct(d$pidp)
+  )
+
+  if (nrow(d) == 0L || n_events == 0L || n_controls == 0L) {
+    warning(model_id, ": insufficient event/control variation; model skipped.")
+    return(list(model = NULL, tidy = tibble(), joint = tibble(), sample = sample_row))
+  }
+
+  m <- fit_logit_safe(
+    formula = formula,
+    data = d,
+    model_id = model_id,
+    weights_formula = if (equal_spell_weight) ~equal_spell_weight else NULL
+  )
+
+  tidy <- tidy_fixest_local(
+    m,
+    model_id = model_id,
+    horizon = horizon,
+    contrast = contrast,
+    model_type = model_type,
+    weighting = weighting,
+    focal_terms = focal_terms
+  )
+
+  joint <- joint_wald_local(
+    m,
+    focal_terms = focal_terms,
+    model_id = model_id,
+    horizon = horizon,
+    contrast = contrast,
+    model_type = model_type,
+    weighting = weighting
+  )
+
+  list(model = m, tidy = tidy, joint = joint, sample = sample_row)
+}
+
+# =============================================================================
+# 3. PREPARE LANDMARK EXPOSURES
+# =============================================================================
+
+# Standardization is performed once over the v4.2 primary-support landmark pool
+# so coefficients are on a common SD scale across horizons and contrasts.
+landmark_base <- analytic_base %>%
+  mutate(
+    rdas_sat_z = zsafe_local(rdas_satisfaction),
+    rdas_coh_z = zsafe_local(rdas_cohesion),
+    prior_rdas_sat_z = zsafe_local(prior_rdas_satisfaction),
+    prior_rdas_coh_z = zsafe_local(prior_rdas_cohesion),
+    rdas_sat_change_z = zsafe_local(rdas_satisfaction_change),
+    rdas_coh_change_z = zsafe_local(rdas_cohesion_change),
+
+    ghq_z_followup = zsafe_local(ghq),
+    ls_z_followup = zsafe_local(life_satisfaction),
+    prior_ghq_z_followup = zsafe_local(prior_spell_ghq),
+    prior_ls_z_followup = zsafe_local(prior_spell_ls),
+    ghq_change_z_followup = zsafe_local(spell_ghq_change),
+    ls_change_z_followup = zsafe_local(spell_ls_change)
+  )
+
+# Exposure missingness and correlations are exported before outcome restrictions.
+exposure_audit <- tibble(
+  variable = c(
+    "RDAS satisfaction current",
+    "RDAS cohesion current",
+    "RDAS satisfaction prior",
+    "RDAS cohesion prior",
+    "RDAS satisfaction recent change",
+    "RDAS cohesion recent change"
+  ),
+  n_observed = c(
+    sum(!is.na(landmark_base$rdas_satisfaction)),
+    sum(!is.na(landmark_base$rdas_cohesion)),
+    sum(!is.na(landmark_base$prior_rdas_satisfaction)),
+    sum(!is.na(landmark_base$prior_rdas_cohesion)),
+    sum(!is.na(landmark_base$rdas_satisfaction_change)),
+    sum(!is.na(landmark_base$rdas_cohesion_change))
+  ),
+  n_total = nrow(landmark_base)
+) %>%
+  mutate(prop_observed = n_observed / n_total)
+
+write_csv_local(exposure_audit, "01_exposure_availability.csv", "diagnostics")
+
+cor_audit <- landmark_base %>%
+  select(
+    rdas_sat_z, rdas_coh_z,
+    prior_rdas_sat_z, prior_rdas_coh_z,
+    rdas_sat_change_z, rdas_coh_change_z
+  ) %>%
+  stats::cor(use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  rownames_to_column("variable")
+
+write_csv_local(cor_audit, "02_exposure_correlations.csv", "diagnostics")
+
+# =============================================================================
+# 4. DERIVE PROSPECTIVE FUTURE STATES
+# =============================================================================
+
+landmarks_by_horizon <- map_dfr(
+  HORIZONS,
+  ~derive_future_state(landmark_base, .x)
+)
+
+state_counts <- landmarks_by_horizon %>%
+  group_by(horizon_months, future_state) %>%
+  summarise(
+    n_landmarks = n(),
+    n_relationship_spells = n_distinct(relationship_spell_id),
+    n_respondents = n_distinct(pidp),
+    .groups = "drop"
+  )
+
+write_csv_local(state_counts, "03_future_state_counts.csv", "diagnostics")
+
+# QA: future states must be mutually exclusive and event leads strictly positive.
+qa <- landmarks_by_horizon %>%
+  summarise(
+    n_rows = n(),
+    overlapping_marriage_breakup = sum(marriage_in_horizon & breakup_in_horizon, na.rm = TRUE),
+    marriage_nonpositive_lead = sum(marriage_in_horizon & months_to_marriage < 1, na.rm = TRUE),
+    breakup_nonpositive_lead = sum(breakup_in_horizon & months_to_breakup < 1, na.rm = TRUE),
+    continued_with_event = sum(
+      continued_through_horizon & (marriage_in_horizon | breakup_in_horizon),
+      na.rm = TRUE
+    )
+  ) %>%
+  mutate(
+    pass = overlapping_marriage_breakup == 0 &
+      marriage_nonpositive_lead == 0 &
+      breakup_nonpositive_lead == 0 &
+      continued_with_event == 0
+  )
+
+write_csv_local(qa, "04_temporal_ordering_QA.csv", "diagnostics")
+if (!all(qa$pass)) stop("Prospective-state QA failed; inspect diagnostics/04_temporal_ordering_QA.csv")
+
+# =============================================================================
+# 5. MODEL SPECIFICATIONS
+# =============================================================================
+
+# A. Current-level model: prospective relationship-quality level -> future outcome.
+# This is informative about selective progression/dissolution on current quality,
+# but it is NOT by itself a test of relationship-quality DEVELOPMENT.
+level_formula <-
+  future_event ~
+  rdas_sat_z + rdas_coh_z +
+  splines::ns(cohab_duration_months, df = 4) +
+  age + i(sex) | wave
+
+level_required <- c(
+  "future_event", "rdas_sat_z", "rdas_coh_z",
+  "cohab_duration_months", "age", "sex", "wave", "pidp",
+  "relationship_spell_id"
+)
+level_focal <- c("rdas_sat_z", "rdas_coh_z")
+
+# B. DEVELOPMENT/CHANGE model: prior RDAS level + recent RDAS change -> outcome.
+# This is the focal test of the arrow. A positive marriage coefficient for a
+# change variable means that greater improvement predicts higher odds of marriage
+# versus continued cohabitation over the future horizon. A negative breakup
+# coefficient means greater improvement predicts lower odds of breakup.
+change_formula <-
+  future_event ~
+  prior_rdas_sat_z + prior_rdas_coh_z +
+  rdas_sat_change_z + rdas_coh_change_z +
+  splines::ns(cohab_duration_months, df = 4) +
+  age + i(sex) | wave
+
+change_required <- c(
+  "future_event",
+  "prior_rdas_sat_z", "prior_rdas_coh_z",
+  "rdas_sat_change_z", "rdas_coh_change_z",
+  "cohab_duration_months", "age", "sex", "wave", "pidp",
+  "relationship_spell_id"
+)
+change_focal <- c("rdas_sat_change_z", "rdas_coh_change_z")
+
+# C. Secondary psychological-history-adjusted sensitivity.
+# This asks whether the RDAS-change association persists conditional on prior
+# psychological level and recent psychological change. Because psychological
+# functioning may partly be downstream of relationship development, this is a
+# sensitivity/conditional association, NOT the preferred causal specification.
+change_psych_formula <-
+  future_event ~
+  prior_rdas_sat_z + prior_rdas_coh_z +
+  rdas_sat_change_z + rdas_coh_change_z +
+  prior_ghq_z_followup + prior_ls_z_followup +
+  ghq_change_z_followup + ls_change_z_followup +
+  splines::ns(cohab_duration_months, df = 4) +
+  age + i(sex) | wave
+
+change_psych_required <- c(
+  "future_event",
+  "prior_rdas_sat_z", "prior_rdas_coh_z",
+  "rdas_sat_change_z", "rdas_coh_change_z",
+  "prior_ghq_z_followup", "prior_ls_z_followup",
+  "ghq_change_z_followup", "ls_change_z_followup",
+  "cohab_duration_months", "age", "sex", "wave", "pidp",
+  "relationship_spell_id"
+)
+
+# =============================================================================
+# 6. FIT ALL MODELS
+# =============================================================================
+
+all_results <- list()
+idx <- 1L
+
+for (H in HORIZONS) {
+  dH <- landmarks_by_horizon %>% filter(horizon_months == H)
+
+  for (contrast in c("marriage", "breakup")) {
+    dc <- make_contrast(dH, contrast)
+
+    # Unweighted/current landmark estimand.
+    all_results[[idx]] <- run_one_model(
+      dc, level_formula, level_required, level_focal,
+      horizon = H, contrast = contrast,
+      model_type = "current_RDAS_level",
+      equal_spell_weight = FALSE
+    )
+    idx <- idx + 1L
+
+    all_results[[idx]] <- run_one_model(
+      dc, change_formula, change_required, change_focal,
+      horizon = H, contrast = contrast,
+      model_type = "prior_RDAS_level_plus_recent_RDAS_change",
+      equal_spell_weight = FALSE
+    )
+    idx <- idx + 1L
+
+    # Equal-relationship weighting sensitivity for the focal change model.
+    all_results[[idx]] <- run_one_model(
+      dc, change_formula, change_required, change_focal,
+      horizon = H, contrast = contrast,
+      model_type = "prior_RDAS_level_plus_recent_RDAS_change",
+      equal_spell_weight = TRUE
+    )
+    idx <- idx + 1L
+
+    # Psychological-history-adjusted sensitivity.
+    all_results[[idx]] <- run_one_model(
+      dc, change_psych_formula, change_psych_required, change_focal,
+      horizon = H, contrast = contrast,
+      model_type = "RDAS_change_plus_psych_history_sensitivity",
+      equal_spell_weight = FALSE
+    )
+    idx <- idx + 1L
+  }
+}
+
+model_samples <- bind_rows(map(all_results, "sample"))
+model_terms <- bind_rows(map(all_results, "tidy"))
+joint_tests <- bind_rows(map(all_results, "joint"))
+
+write_csv_local(model_samples, "05_model_sample_counts.csv")
+write_csv_local(model_terms, "06_all_model_terms.csv")
+write_csv_local(joint_tests, "06b_joint_focal_Wald_tests.csv")
+
+# =============================================================================
+# 7. FOCAL RESULTS AND MULTIPLICITY
+# =============================================================================
+
+focal_results <- model_terms %>%
+  filter(focal) %>%
+  group_by(horizon_months, model_type, weighting) %>%
+  mutate(
+    # Four tests per family when both RDAS-change (or both level) predictors are
+    # available for marriage and breakup. Holm remains valid if fewer survive.
+    p_holm_family = p.adjust(p_value, method = "holm")
+  ) %>%
+  ungroup() %>%
+  arrange(horizon_months, model_type, weighting, contrast, term)
+
+write_csv_local(focal_results, "07_focal_predictor_results.csv")
+
+primary_change_results <- focal_results %>%
+  filter(
+    horizon_months == PRIMARY_HORIZON,
+    model_type == "prior_RDAS_level_plus_recent_RDAS_change",
+    weighting == "landmark"
+  )
+
+write_csv_local(
+  primary_change_results,
+  "08_PRIMARY_24m_RDAS_change_predicts_future_outcome.csv"
+)
+
+primary_change_joint <- joint_tests %>%
+  filter(
+    horizon_months == PRIMARY_HORIZON,
+    model_type == "prior_RDAS_level_plus_recent_RDAS_change",
+    weighting == "landmark"
+  ) %>%
+  mutate(p_holm_across_outcomes = p.adjust(p_value, method = "holm"))
+
+write_csv_local(
+  primary_change_joint,
+  "08b_PRIMARY_24m_joint_RDAS_change_Wald_tests.csv"
+)
+
+primary_level_results <- focal_results %>%
+  filter(
+    horizon_months == PRIMARY_HORIZON,
+    model_type == "current_RDAS_level",
+    weighting == "landmark"
+  )
+
+write_csv_local(
+  primary_level_results,
+  "09_24m_current_RDAS_level_predicts_future_outcome.csv"
+)
+
+sensitivity_12m <- focal_results %>%
+  filter(horizon_months == 12L)
+write_csv_local(sensitivity_12m, "10_12m_sensitivity_focal_results.csv")
+
+# =============================================================================
+# 8. INTERPRETATION FLAGS
+# =============================================================================
+
+# Direction expected under a simple "favorable development -> progression"
+# account:
+# - satisfaction/cohesion improvement should have OR > 1 for marriage;
+# - satisfaction/cohesion improvement should have OR < 1 for breakup.
+# These are descriptive direction flags, not one-sided significance tests.
+interpretation_flags <- primary_change_results %>%
+  mutate(
+    expected_direction = case_when(
+      contrast == "marriage" ~ "OR > 1",
+      contrast == "breakup" ~ "OR < 1",
+      TRUE ~ NA_character_
+    ),
+    direction_consistent = case_when(
+      contrast == "marriage" ~ odds_ratio > 1,
+      contrast == "breakup" ~ odds_ratio < 1,
+      TRUE ~ NA
+    ),
+    holm_significant_05 = p_holm_family < .05
+  ) %>%
+  select(
+    horizon_months, contrast, term,
+    estimate, std_error, conf_low, conf_high,
+    odds_ratio, or_conf_low, or_conf_high,
+    p_value, p_holm_family,
+    expected_direction, direction_consistent, holm_significant_05
+  )
+
+write_csv_local(
+  interpretation_flags,
+  "11_PRIMARY_24m_interpretation_flags.csv"
+)
+
+# =============================================================================
+# 9. README / DECISION GUIDE
+# =============================================================================
+
+readme <- c(
+  "UKHLS POST-v4.2: RELATIONSHIP DEVELOPMENT -> FUTURE PROGRESSION/DISSOLUTION",
+  "",
+  paste0("Input mode: ", input_mode),
+  paste0("Primary explanatory horizon: ", PRIMARY_HORIZON, " months"),
+  "Short-horizon sensitivity: 12 months",
+  "",
+  "PRIMARY TEST:",
+  "08_PRIMARY_24m_RDAS_change_predicts_future_outcome.csv",
+  "08b_PRIMARY_24m_joint_RDAS_change_Wald_tests.csv",
+  "Recent RDAS satisfaction/cohesion change predicts marriage or breakup over",
+  "the next 24 months, conditional on prior RDAS satisfaction/cohesion levels,",
+  "relationship duration, age, sex, and wave; SEs clustered by respondent.",
+  "",
+  "INTERPRETATION:",
+  "Evidence most consistent with relationship development contributing to later",
+  "sorting would be: RDAS improvement predicts higher odds of marriage and/or",
+  "lower odds of breakup, with temporally prior RDAS change and a future outcome.",
+  "A current-level association alone supports prospective sorting on relationship",
+  "quality but is weaker evidence for a developmental/change mechanism.",
+  "",
+  "CAUSALITY:",
+  "These models do not identify a causal effect of RDAS on marriage/dissolution.",
+  "Unmeasured relationship and partner characteristics may jointly affect RDAS",
+  "and subsequent outcomes. Use 'prospectively predicted', 'was associated with',",
+  "or 'consistent with selective progression/dissolution'; avoid 'caused'.",
+  "",
+  "COMPETING EVENTS:",
+  "Marriage models compare marriage within H with observed continued cohabitation",
+  "through H and exclude breakup within H. Breakup models analogously exclude",
+  "marriage within H.",
+  "",
+  "WEIGHTING:",
+  "Landmark models are primary. Equal-relationship weighting is a sensitivity to",
+  "long relationships contributing more eligible landmarks.",
+  "",
+  "PSYCHOLOGICAL ADJUSTMENT:",
+  "The psych-history model is secondary because psychological functioning may be",
+  "partly downstream of relationship quality; attenuation is not causal mediation.",
+  "",
+  "INFERENTIAL STATUS:",
+  "This follow-up analysis is explanatory/post-v4.2, not confirmatory unless it",
+  "was independently preregistered before results were examined."
+)
+
+writeLines(readme, file.path(FOLLOWUP_OUT_DIR, "00_READ_ME_FIRST.txt"))
+
+cat("\n============================================================\n")
+cat("Prospective relationship-development follow-up complete.\n")
+cat("Output directory:\n", FOLLOWUP_OUT_DIR, "\n", sep = "")
+cat("Primary result file:\n",
+    file.path(FOLLOWUP_OUT_DIR, "tables",
+              "08_PRIMARY_24m_RDAS_change_predicts_future_outcome.csv"),
+    "\n", sep = "")
+cat("============================================================\n")

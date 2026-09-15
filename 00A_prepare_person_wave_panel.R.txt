@@ -1,0 +1,3772 @@
+# =============================================================================
+# BHPS + UKHLS
+# FIRST-MARRIAGE PRE-TRANSITION STUDY
+# T-5 TO T0 ELIGIBILITY / COUNTING DIAGNOSTIC
+#
+# PURPOSE
+# -------
+# Reframe the study around marriage rather than requiring respondents to be
+# single throughout the five pre-event waves.
+#
+# T0 is the first interview wave in the focal event window at which the person
+# is observed as married. The actual marriage occurred between T-1 and T0.
+#
+# The key window-based eligibility rule is:
+#
+#     T-5:T-1 = any OBSERVED NON-MARRIED marital status
+#     T0      = married
+#
+# Thus, prior cohabitation is explicitly allowed. The pre-marriage window may
+# include:
+#     - single / never married
+#     - living as a couple / cohabiting
+#     - registered civil partnership
+#     - other non-married statuses
+#
+# Complete marital-status observation at all six waves T-5:T0 is required for
+# the eligibility diagnostic because the study explicitly characterises the
+# pre-marriage marital-status pathway.
+#
+#
+# THREE NESTED MARRIAGE DEFINITIONS ARE REPORTED
+# -----------------------------------------------
+# A. WINDOW-ONLY MARRIAGE TRANSITION
+#       non-married at every wave T-5:T-1 -> married at T0.
+#
+# B. FIRST OBSERVED MARRIAGE  [PLANNED PRIMARY]
+#       definition A +
+#       no earlier observed "married" status anywhere in the combined
+#       BHPS+UKHLS history before T0.
+#
+# C. STRICT FIRST-MARRIAGE PROXY  [DIAGNOSTIC / SENSITIVITY]
+#       definition B +
+#       no earlier observed status label indicating a prior marriage
+#       (e.g., divorced, widowed, or marital separation).
+#
+# Definition C is more conservative because panel observation may start after
+# a person's true first marriage. It is reported so that the cost of excluding
+# likely remarriages can be assessed empirically rather than assumed.
+#
+#
+# EXPLICIT PRE-MARRIAGE STATUS OUTPUTS
+# ------------------------------------
+# For first-observed marriers, the script reports at T-5,...,T-1:
+#
+#     n and % single
+#     n and % cohabiting
+#     n and % in civil partnership
+#     n and % other non-married
+#
+# It also reports:
+#
+#     - whether each future marrier ever cohabited in T-5:T-1;
+#     - whether they cohabited at T-1;
+#     - number of cohabiting pre-waves;
+#     - most common T-5:T-1 status sequences;
+#     - first observed cohabiting event-time within the five-wave window.
+#
+#
+# CONTEMPORANEOUS UNMARRIED RISK-SET CONTROLS
+# --------------------------------------------
+# The script constructs two control definitions for later analysis:
+#
+# 1. FIRST-MARRIAGE RISK-SET CONTROLS  [PLANNED PRIMARY]
+#       non-married at T-5:T0 in the same survey/event-wave cohort and no
+#       previously observed marriage by that focal T0.
+#
+# 2. ALL UNMARRIED RISK-SET CONTROLS  [SENSITIVITY]
+#       non-married at T-5:T0 regardless of earlier marriage history.
+#
+# Controls may marry after the focal T0 and may contribute to multiple risk
+# sets. No post-T0 condition is imposed.
+#
+#
+# OUTCOMES
+# --------
+# GHQ-12:
+#     BHPS + UKHLS
+#
+# Life satisfaction:
+#     BHPS variable lfsato
+#     UKHLS variable sclfsato
+#
+# Outcome completeness NEVER determines marital-status/event eligibility.
+# Outcome availability is diagnosed separately.
+#
+#
+# IMPORTANT INTERPRETATION
+# ------------------------
+# This diagnostic supports a study of WELL-BEING TRAJECTORIES LEADING UP TO
+# MARRIAGE. It does not by itself identify a causal effect of legal marriage.
+# Changes before T0 may reflect relationship formation, cohabitation,
+# engagement, marriage planning, selection, or other processes.
+#
+# =============================================================================
+
+
+# =============================================================================
+# 0. PACKAGES
+# =============================================================================
+
+required_packages <- c(
+  "haven",
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "stringr",
+  "readr",
+  "tibble"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following packages before running this script:\n",
+    paste(
+      missing_packages,
+      collapse = ", "
+    )
+  )
+}
+
+library(haven)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(readr)
+library(tibble)
+
+
+# =============================================================================
+# 1. PATHS
+# =============================================================================
+
+ukhls_dir <- "D:/Documenti/psicologia/big data/Understanding Society+BHPS/UKDA-6614-stata/stata/stata14_se/ukhls"
+
+bhps_dir <- "D:/Documenti/psicologia/big data/Understanding Society+BHPS/UKDA-6614-stata/stata/stata14_se/bhps"
+
+common_stata_dir <- dirname(
+  ukhls_dir
+)
+
+output_dir <- file.path(
+  common_stata_dir,
+  "first_marriage_Tminus5_T0_diagnostic"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# =============================================================================
+# 2. BASIC SETTINGS
+# =============================================================================
+
+N_BHPS  <- 18L
+N_UKHLS <- 15L
+
+# Need five preceding within-survey waves.
+EVENT_MIN <- 6L
+
+bhps_candidate_event_waves <-
+  EVENT_MIN:N_BHPS
+
+ukhls_candidate_event_waves <-
+  EVENT_MIN:N_UKHLS
+
+event_times <- -5:0
+
+
+# =============================================================================
+# 3. FILE / VARIABLE UTILITIES
+# =============================================================================
+
+read_data_file <- function(
+    path
+) {
+
+  ext <- tolower(
+    tools::file_ext(
+      path
+    )
+  )
+
+  if (ext == "dta") {
+    return(
+      haven::read_dta(
+        path
+      )
+    )
+  }
+
+  if (ext == "sav") {
+    return(
+      haven::read_sav(
+        path
+      )
+    )
+  }
+
+  stop(
+    "Unsupported file extension: ",
+    ext
+  )
+}
+
+
+# BHPS files may use:
+#   a_indresp.dta
+# or:
+#   ba_indresp.dta
+#
+# UKHLS files normally use:
+#   a_indresp.dta, b_indresp.dta, ...
+
+find_indresp_file <- function(
+    root,
+    survey,
+    wave_letter
+) {
+
+  survey <- match.arg(
+    survey,
+    c(
+      "BHPS",
+      "UKHLS"
+    )
+  )
+
+  prefixes <- if (
+    survey == "BHPS"
+  ) {
+    c(
+      wave_letter,
+      paste0(
+        "b",
+        wave_letter
+      )
+    )
+  } else {
+    wave_letter
+  }
+
+  patterns <- paste0(
+    "^",
+    prefixes,
+    "_indresp\\.(dta|sav)$"
+  )
+
+  all_files <- list.files(
+    root,
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+
+  hits <- all_files[
+    Reduce(
+      `|`,
+      lapply(
+        patterns,
+        function(p) {
+          grepl(
+            p,
+            basename(
+              all_files
+            ),
+            ignore.case = TRUE
+          )
+        }
+      )
+    )
+  ]
+
+  if (length(hits) == 0L) {
+    stop(
+      "No individual-response file found for ",
+      survey,
+      " wave ",
+      wave_letter,
+      " under:\n",
+      root
+    )
+  }
+
+  if (length(hits) > 1L) {
+    stop(
+      "More than one possible individual-response file found for ",
+      survey,
+      " wave ",
+      wave_letter,
+      ":\n",
+      paste(
+        hits,
+        collapse = "\n"
+      )
+    )
+  }
+
+  hits
+}
+
+
+prefix_from_indresp_filename <- function(
+    path
+) {
+
+  nm <- basename(
+    path
+  )
+
+  stringr::str_match(
+    nm,
+    "^(.+?)_indresp\\.(dta|sav)$"
+  )[, 2]
+}
+
+
+find_variable <- function(
+    dat,
+    file_prefix,
+    basenames,
+    required = TRUE
+) {
+
+  candidates <- unique(
+    unlist(
+      lapply(
+        basenames,
+        function(v) {
+          c(
+            paste0(
+              file_prefix,
+              "_",
+              v
+            ),
+            v
+          )
+        }
+      )
+    )
+  )
+
+  hit <- candidates[
+    candidates %in%
+      names(
+        dat
+      )
+  ]
+
+  if (length(hit) == 0L) {
+
+    if (required) {
+      stop(
+        "Could not find any of these variables:\n",
+        paste(
+          candidates,
+          collapse = ", "
+        )
+      )
+    }
+
+    return(
+      NA_character_
+    )
+  }
+
+  hit[1L]
+}
+
+
+clean_numeric <- function(
+    x
+) {
+
+  z <- suppressWarnings(
+    as.numeric(
+      x
+    )
+  )
+
+  z[
+    !is.na(z) &
+      z < 0
+  ] <- NA_real_
+
+  z
+}
+
+
+label_or_numeric_character <- function(
+    x
+) {
+
+  if (
+    inherits(
+      x,
+      "haven_labelled"
+    )
+  ) {
+
+    lab <- as.character(
+      haven::as_factor(
+        x,
+        levels = "labels"
+      )
+    )
+
+    if (
+      any(
+        !is.na(
+          lab
+        )
+      )
+    ) {
+      return(
+        lab
+      )
+    }
+  }
+
+  as.character(
+    x
+  )
+}
+
+
+# =============================================================================
+# 4. MARITAL-STATUS HARMONISATION
+# =============================================================================
+
+clean_label <- function(
+    x
+) {
+
+  z <- as.character(
+    haven::as_factor(
+      x,
+      levels = "labels"
+    )
+  )
+
+  z |>
+    stringr::str_squish() |>
+    stringr::str_to_lower() |>
+    stringr::str_replace_all(
+      "[’`]",
+      "'"
+    )
+}
+
+
+is_survey_missing_label <- function(
+    x
+) {
+
+  is.na(x) |
+    stringr::str_detect(
+      x,
+      paste0(
+        "^-[0-9]+$|",
+        "^missing$|",
+        "inapplicable|",
+        "not applicable|",
+        "not asked|",
+        "^proxy$|",
+        "refus|",
+        "don't know|",
+        "dont know|",
+        "unable|",
+        "no answer|",
+        "child under|",
+        "under 16"
+      )
+    )
+}
+
+
+classify_status <- function(
+    x,
+    survey
+) {
+
+  survey <- match.arg(
+    survey,
+    c(
+      "BHPS",
+      "UKHLS"
+    )
+  )
+
+  raw_label <- as.character(
+    haven::as_factor(
+      x,
+      levels = "labels"
+    )
+  )
+
+  clean <- clean_label(
+    x
+  )
+
+  missing_flag <- is_survey_missing_label(
+    clean
+  )
+
+  status <- if (
+    survey == "BHPS"
+  ) {
+
+    dplyr::case_when(
+
+      missing_flag ~
+        NA_character_,
+
+      clean == "married" ~
+        "married",
+
+      clean == "living as couple" ~
+        "cohab",
+
+      clean == "civil partnership" ~
+        "civil_partner",
+
+      clean == "never married" ~
+        "single",
+
+      TRUE ~
+        "other"
+    )
+
+  } else {
+
+    dplyr::case_when(
+
+      missing_flag ~
+        NA_character_,
+
+      clean == "married" ~
+        "married",
+
+      clean == "living as couple" ~
+        "cohab",
+
+      stringr::str_detect(
+        clean,
+        "^in a registered.*civil partnership$"
+      ) ~
+        "civil_partner",
+
+      stringr::str_detect(
+        clean,
+        "^single.*never married"
+      ) ~
+        "single",
+
+      TRUE ~
+        "other"
+    )
+  }
+
+  tibble(
+    raw_status_label =
+      raw_label,
+    status =
+      status
+  )
+}
+
+
+# =============================================================================
+# 5. AGE / SEX HARMONISATION
+# =============================================================================
+
+clean_sex <- function(
+    x
+) {
+
+  if (is.null(x)) {
+    return(
+      character(0)
+    )
+  }
+
+  lab <- label_or_numeric_character(
+    x
+  ) |>
+    stringr::str_squish() |>
+    stringr::str_to_lower()
+
+  num <- suppressWarnings(
+    as.numeric(
+      x
+    )
+  )
+
+  dplyr::case_when(
+
+    stringr::str_detect(
+      lab,
+      "^male$|^man$"
+    ) ~
+      "male",
+
+    stringr::str_detect(
+      lab,
+      "^female$|^woman$"
+    ) ~
+      "female",
+
+    !is.na(num) &
+      num == 1 ~
+      "male",
+
+    !is.na(num) &
+      num == 2 ~
+      "female",
+
+    TRUE ~
+      NA_character_
+  )
+}
+
+
+clean_age <- function(
+    x
+) {
+
+  z <- clean_numeric(
+    x
+  )
+
+  # Conservative plausibility bounds.
+  z[
+    !is.na(z) &
+      (
+        z < 16 |
+          z > 100
+      )
+  ] <- NA_real_
+
+  z
+}
+
+
+# =============================================================================
+# 6. READ ONE BHPS WAVE
+# =============================================================================
+
+read_bhps_wave <- function(
+    wave_num
+) {
+
+  wave_letter <- letters[
+    wave_num
+  ]
+
+  f <- find_indresp_file(
+    root = bhps_dir,
+    survey = "BHPS",
+    wave_letter = wave_letter
+  )
+
+  file_prefix <- prefix_from_indresp_filename(
+    f
+  )
+
+  message(
+    "Reading BHPS wave ",
+    wave_num,
+    " (",
+    wave_letter,
+    "; prefix ",
+    file_prefix,
+    "): ",
+    basename(
+      f
+    )
+  )
+
+  dat <- read_data_file(
+    f
+  )
+
+  pidp_var <- find_variable(
+    dat,
+    file_prefix,
+    "pidp"
+  )
+
+  mastat_var <- find_variable(
+    dat,
+    file_prefix,
+    "mastat"
+  )
+
+  ghq_var <- find_variable(
+    dat,
+    file_prefix,
+    "scghq1_dv",
+    required = FALSE
+  )
+
+  life_var <- find_variable(
+    dat,
+    file_prefix,
+    "lfsato",
+    required = FALSE
+  )
+
+  age_var <- find_variable(
+    dat,
+    file_prefix,
+    c(
+      "age_dv",
+      "age"
+    ),
+    required = FALSE
+  )
+
+  sex_var <- find_variable(
+    dat,
+    file_prefix,
+    c(
+      "sex_dv",
+      "sex"
+    ),
+    required = FALSE
+  )
+
+  st <- classify_status(
+    dat[[mastat_var]],
+    survey = "BHPS"
+  )
+
+  n <- nrow(
+    dat
+  )
+
+  tibble(
+    pidp =
+      dat[[pidp_var]],
+
+    survey =
+      "BHPS",
+
+    wave_num =
+      wave_num,
+
+    wave_letter =
+      wave_letter,
+
+    file_prefix =
+      file_prefix,
+
+    raw_status_label =
+      st$raw_status_label,
+
+    status =
+      st$status,
+
+    ghq12 =
+      if (
+        !is.na(
+          ghq_var
+        )
+      ) {
+        clean_numeric(
+          dat[[ghq_var]]
+        )
+      } else {
+        rep(
+          NA_real_,
+          n
+        )
+      },
+
+    life_sat =
+      if (
+        !is.na(
+          life_var
+        )
+      ) {
+        clean_numeric(
+          dat[[life_var]]
+        )
+      } else {
+        rep(
+          NA_real_,
+          n
+        )
+      },
+
+    age =
+      if (
+        !is.na(
+          age_var
+        )
+      ) {
+        clean_age(
+          dat[[age_var]]
+        )
+      } else {
+        rep(
+          NA_real_,
+          n
+        )
+      },
+
+    sex =
+      if (
+        !is.na(
+          sex_var
+        )
+      ) {
+        clean_sex(
+          dat[[sex_var]]
+        )
+      } else {
+        rep(
+          NA_character_,
+          n
+        )
+      },
+
+    ghq_var_found =
+      ifelse(
+        is.na(
+          ghq_var
+        ),
+        NA_character_,
+        ghq_var
+      ),
+
+    life_var_found =
+      ifelse(
+        is.na(
+          life_var
+        ),
+        NA_character_,
+        life_var
+      ),
+
+    age_var_found =
+      ifelse(
+        is.na(
+          age_var
+        ),
+        NA_character_,
+        age_var
+      ),
+
+    sex_var_found =
+      ifelse(
+        is.na(
+          sex_var
+        ),
+        NA_character_,
+        sex_var
+      )
+  )
+}
+
+
+# =============================================================================
+# 7. READ ONE UKHLS WAVE
+# =============================================================================
+
+read_ukhls_wave <- function(
+    wave_num
+) {
+
+  wave_letter <- letters[
+    wave_num
+  ]
+
+  f <- find_indresp_file(
+    root = ukhls_dir,
+    survey = "UKHLS",
+    wave_letter = wave_letter
+  )
+
+  file_prefix <- prefix_from_indresp_filename(
+    f
+  )
+
+  message(
+    "Reading UKHLS wave ",
+    wave_num,
+    " (",
+    wave_letter,
+    "; prefix ",
+    file_prefix,
+    "): ",
+    basename(
+      f
+    )
+  )
+
+  dat <- read_data_file(
+    f
+  )
+
+  pidp_var <- find_variable(
+    dat,
+    file_prefix,
+    "pidp"
+  )
+
+  mastat_var <- find_variable(
+    dat,
+    file_prefix,
+    "mastat_dv"
+  )
+
+  ghq_var <- find_variable(
+    dat,
+    file_prefix,
+    "scghq1_dv",
+    required = FALSE
+  )
+
+  life_var <- find_variable(
+    dat,
+    file_prefix,
+    "sclfsato",
+    required = FALSE
+  )
+
+  age_var <- find_variable(
+    dat,
+    file_prefix,
+    c(
+      "age_dv",
+      "age"
+    ),
+    required = FALSE
+  )
+
+  sex_var <- find_variable(
+    dat,
+    file_prefix,
+    c(
+      "sex_dv",
+      "sex"
+    ),
+    required = FALSE
+  )
+
+  st <- classify_status(
+    dat[[mastat_var]],
+    survey = "UKHLS"
+  )
+
+  n <- nrow(
+    dat
+  )
+
+  tibble(
+    pidp =
+      dat[[pidp_var]],
+
+    survey =
+      "UKHLS",
+
+    wave_num =
+      wave_num,
+
+    wave_letter =
+      wave_letter,
+
+    file_prefix =
+      file_prefix,
+
+    raw_status_label =
+      st$raw_status_label,
+
+    status =
+      st$status,
+
+    ghq12 =
+      if (
+        !is.na(
+          ghq_var
+        )
+      ) {
+        clean_numeric(
+          dat[[ghq_var]]
+        )
+      } else {
+        rep(
+          NA_real_,
+          n
+        )
+      },
+
+    life_sat =
+      if (
+        !is.na(
+          life_var
+        )
+      ) {
+        clean_numeric(
+          dat[[life_var]]
+        )
+      } else {
+        rep(
+          NA_real_,
+          n
+        )
+      },
+
+    age =
+      if (
+        !is.na(
+          age_var
+        )
+      ) {
+        clean_age(
+          dat[[age_var]]
+        )
+      } else {
+        rep(
+          NA_real_,
+          n
+        )
+      },
+
+    sex =
+      if (
+        !is.na(
+          sex_var
+        )
+      ) {
+        clean_sex(
+          dat[[sex_var]]
+        )
+      } else {
+        rep(
+          NA_character_,
+          n
+        )
+      },
+
+    ghq_var_found =
+      ifelse(
+        is.na(
+          ghq_var
+        ),
+        NA_character_,
+        ghq_var
+      ),
+
+    life_var_found =
+      ifelse(
+        is.na(
+          life_var
+        ),
+        NA_character_,
+        life_var
+      ),
+
+    age_var_found =
+      ifelse(
+        is.na(
+          age_var
+        ),
+        NA_character_,
+        age_var
+      ),
+
+    sex_var_found =
+      ifelse(
+        is.na(
+          sex_var
+        ),
+        NA_character_,
+        sex_var
+      )
+  )
+}
+
+
+# =============================================================================
+# 8. READ ALL WAVES
+# =============================================================================
+
+bhps_long <- purrr::map_dfr(
+  1:N_BHPS,
+  read_bhps_wave
+)
+
+ukhls_long <- purrr::map_dfr(
+  1:N_UKHLS,
+  read_ukhls_wave
+)
+
+combined_long <- bind_rows(
+  bhps_long,
+  ukhls_long
+) |>
+  mutate(
+    survey_order =
+      if_else(
+        survey == "BHPS",
+        1L,
+        2L
+      )
+  ) |>
+  arrange(
+    pidp,
+    survey_order,
+    wave_num
+  )
+
+
+# =============================================================================
+# 9. DUPLICATE CHECK
+# =============================================================================
+
+dups <- combined_long |>
+  count(
+    survey,
+    wave_num,
+    pidp
+  ) |>
+  filter(
+    n > 1L
+  )
+
+if (nrow(dups) > 0L) {
+  stop(
+    "Duplicate person-wave records detected. Inspect object 'dups'."
+  )
+}
+
+
+# =============================================================================
+# 10. VARIABLE AVAILABILITY
+# =============================================================================
+
+variable_availability <- combined_long |>
+  group_by(
+    survey,
+    wave_num,
+    wave_letter,
+    file_prefix
+  ) |>
+  summarise(
+
+    ghq_variable =
+      first(
+        na.omit(
+          ghq_var_found
+        ),
+        default = NA_character_
+      ),
+
+    life_satisfaction_variable =
+      first(
+        na.omit(
+          life_var_found
+        ),
+        default = NA_character_
+      ),
+
+    age_variable =
+      first(
+        na.omit(
+          age_var_found
+        ),
+        default = NA_character_
+      ),
+
+    sex_variable =
+      first(
+        na.omit(
+          sex_var_found
+        ),
+        default = NA_character_
+      ),
+
+    n_person_records =
+      n(),
+
+    n_ghq_nonmissing =
+      sum(
+        !is.na(
+          ghq12
+        )
+      ),
+
+    n_life_sat_nonmissing =
+      sum(
+        !is.na(
+          life_sat
+        )
+      ),
+
+    n_age_nonmissing =
+      sum(
+        !is.na(
+          age
+        )
+      ),
+
+    n_sex_nonmissing =
+      sum(
+        !is.na(
+          sex
+        )
+      ),
+
+    .groups =
+      "drop"
+  )
+
+write_csv(
+  variable_availability,
+  file.path(
+    output_dir,
+    "variable_availability_by_wave.csv"
+  )
+)
+
+
+# =============================================================================
+# 11. STATUS DICTIONARY / CORRECTED HARMONISATION CHECK
+# =============================================================================
+
+status_dictionary <- combined_long |>
+  count(
+    survey,
+    wave_num,
+    raw_status_label,
+    status,
+    name = "n"
+  ) |>
+  arrange(
+    survey,
+    wave_num,
+    status,
+    raw_status_label
+  )
+
+write_csv(
+  status_dictionary,
+  file.path(
+    output_dir,
+    "status_labels_by_survey_wave.csv"
+  )
+)
+
+
+# =============================================================================
+# 12. PERSON x WAVE STATUS FILES
+# =============================================================================
+
+make_status_wide <- function(
+    dat,
+    n_waves
+) {
+
+  out <- dat |>
+    select(
+      pidp,
+      wave_num,
+      status
+    ) |>
+    pivot_wider(
+      names_from = wave_num,
+      values_from = status,
+      names_prefix = "w"
+    )
+
+  needed <- paste0(
+    "w",
+    1:n_waves
+  )
+
+  for (v in needed) {
+    if (!v %in% names(out)) {
+      out[[v]] <- NA_character_
+    }
+  }
+
+  out |>
+    select(
+      pidp,
+      all_of(
+        needed
+      )
+    )
+}
+
+
+bhps_status_wide <- make_status_wide(
+  bhps_long,
+  N_BHPS
+)
+
+ukhls_status_wide <- make_status_wide(
+  ukhls_long,
+  N_UKHLS
+)
+
+
+# =============================================================================
+# 13. ROW-WISE STATUS HELPERS
+# =============================================================================
+
+row_all_equal <- function(
+    dat,
+    cols,
+    allowed_values
+) {
+
+  z <- as.matrix(
+    dat[
+      ,
+      cols,
+      drop = FALSE
+    ]
+  )
+
+  rowSums(
+    !is.na(
+      z
+    ) &
+      z %in%
+      allowed_values
+  ) ==
+    length(
+      cols
+    )
+}
+
+
+row_all_nonmissing <- function(
+    dat,
+    cols
+) {
+
+  z <- as.matrix(
+    dat[
+      ,
+      cols,
+      drop = FALSE
+    ]
+  )
+
+  rowSums(
+    !is.na(
+      z
+    )
+  ) ==
+    length(
+      cols
+    )
+}
+
+
+
+# =============================================================================
+# 14. FIRST-MARRIAGE HISTORY HELPERS
+# =============================================================================
+
+event_time_order <- function(
+    survey,
+    wave_num
+) {
+
+  ifelse(
+    survey == "BHPS",
+    wave_num,
+    N_BHPS + wave_num
+  )
+}
+
+
+# "Prior marriage evidence" is deliberately conservative.
+#
+# We flag:
+#   - observed married status;
+#   - divorced;
+#   - widowed;
+#   - separated, unless the label clearly refers to civil partnership.
+#
+# Former/dissolved civil partnership alone is NOT treated as evidence of
+# prior marriage.
+
+marriage_history_evidence <- function(
+    status,
+    raw_status_label
+) {
+
+  clean <- raw_status_label |>
+    stringr::str_squish() |>
+    stringr::str_to_lower()
+
+  observed_married <-
+    !is.na(status) &
+    status == "married"
+
+  divorced_or_widowed <-
+    !is.na(clean) &
+    stringr::str_detect(
+      clean,
+      "divorc|widow"
+    )
+
+  marital_separation <-
+    !is.na(clean) &
+    stringr::str_detect(
+      clean,
+      "separat"
+    ) &
+    !stringr::str_detect(
+      clean,
+      "civil partner|civil partnership"
+    )
+
+  observed_married |
+    divorced_or_widowed |
+    marital_separation
+}
+
+
+combined_history <- combined_long |>
+  mutate(
+    hist_order =
+      event_time_order(
+        survey,
+        wave_num
+      ),
+
+    prior_marriage_evidence =
+      marriage_history_evidence(
+        status,
+        raw_status_label
+      )
+  )
+
+
+marriage_evidence_dictionary <- combined_history |>
+  count(
+    survey,
+    raw_status_label,
+    status,
+    prior_marriage_evidence,
+    name =
+      "n_person_wave_records"
+  ) |>
+  arrange(
+    survey,
+    desc(
+      prior_marriage_evidence
+    ),
+    status,
+    raw_status_label
+  )
+
+write_csv(
+  marriage_evidence_dictionary,
+  file.path(
+    output_dir,
+    "marriage_history_evidence_dictionary.csv"
+  )
+)
+
+
+first_observed_married <- combined_history |>
+  filter(
+    status == "married"
+  ) |>
+  group_by(
+    pidp
+  ) |>
+  summarise(
+    first_observed_married_order =
+      min(
+        hist_order
+      ),
+    .groups =
+      "drop"
+  )
+
+
+first_observed_marriage_evidence <- combined_history |>
+  filter(
+    prior_marriage_evidence
+  ) |>
+  group_by(
+    pidp
+  ) |>
+  summarise(
+    first_marriage_evidence_order =
+      min(
+        hist_order
+      ),
+    .groups =
+      "drop"
+  )
+
+
+# =============================================================================
+# 15. BUILD WINDOW-BASED MARRIAGE CANDIDATES
+# =============================================================================
+
+row_all_nonmarried <- function(
+    dat,
+    cols
+) {
+
+  z <- as.matrix(
+    dat[
+      ,
+      cols,
+      drop = FALSE
+    ]
+  )
+
+  rowSums(
+    !is.na(
+      z
+    ) &
+      z != "married"
+  ) ==
+    length(
+      cols
+    )
+}
+
+
+build_marriage_candidates <- function(
+    status_wide,
+    survey_name,
+    candidate_t0
+) {
+
+  purrr::map_dfr(
+    candidate_t0,
+    function(
+        t0
+    ) {
+
+      pre_cols <- paste0(
+        "w",
+        (t0 - 5L):(t0 - 1L)
+      )
+
+      full_cols <- paste0(
+        "w",
+        (t0 - 5L):t0
+      )
+
+      missing_cols <- setdiff(
+        full_cols,
+        names(
+          status_wide
+        )
+      )
+
+      if (length(
+        missing_cols
+      ) > 0L) {
+        stop(
+          "Missing wave columns for ",
+          survey_name,
+          " T0=",
+          t0,
+          ": ",
+          paste(
+            missing_cols,
+            collapse = ", "
+          )
+        )
+      }
+
+      status_0 <-
+        status_wide[[
+          paste0(
+            "w",
+            t0
+          )
+        ]]
+
+      married_T0 <-
+        !is.na(
+          status_0
+        ) &
+        status_0 == "married"
+
+      complete_window <-
+        row_all_nonmissing(
+          status_wide,
+          full_cols
+        )
+
+      pre_all_nonmarried <-
+        row_all_nonmarried(
+          status_wide,
+          pre_cols
+        )
+
+      tibble(
+        pidp =
+          status_wide$pidp,
+
+        survey =
+          survey_name,
+
+        event_wave =
+          t0,
+
+        event_order =
+          event_time_order(
+            survey_name,
+            t0
+          ),
+
+        stage1_married_T0 =
+          married_T0,
+
+        stage2_complete_Tminus5_T0_status =
+          married_T0 &
+            complete_window,
+
+        stage3_nonmarried_Tminus5_Tminus1 =
+          married_T0 &
+            complete_window &
+            pre_all_nonmarried,
+
+        window_eligible =
+          married_T0 &
+            complete_window &
+            pre_all_nonmarried
+      )
+    }
+  ) |>
+    left_join(
+      first_observed_married,
+      by =
+        "pidp",
+      relationship =
+        "many-to-one"
+    ) |>
+    left_join(
+      first_observed_marriage_evidence,
+      by =
+        "pidp",
+      relationship =
+        "many-to-one"
+    ) |>
+    mutate(
+
+      first_observed_marriage =
+        window_eligible &
+          !is.na(
+            first_observed_married_order
+          ) &
+          event_order ==
+            first_observed_married_order,
+
+      strict_first_marriage_proxy =
+        first_observed_marriage &
+          !is.na(
+            first_marriage_evidence_order
+          ) &
+          event_order ==
+            first_marriage_evidence_order
+    )
+}
+
+
+bhps_marriage_candidates <- build_marriage_candidates(
+  bhps_status_wide,
+  survey_name =
+    "BHPS",
+  candidate_t0 =
+    bhps_candidate_event_waves
+)
+
+ukhls_marriage_candidates <- build_marriage_candidates(
+  ukhls_status_wide,
+  survey_name =
+    "UKHLS",
+  candidate_t0 =
+    ukhls_candidate_event_waves
+)
+
+marriage_candidates <- bind_rows(
+  bhps_marriage_candidates,
+  ukhls_marriage_candidates
+)
+
+
+# =============================================================================
+# 16. ELIGIBILITY ATTRITION
+# =============================================================================
+
+make_first_marriage_attrition <- function(
+    dat,
+    survey_name
+) {
+
+  x <- dat |>
+    filter(
+      survey ==
+        .env$survey_name
+    )
+
+  stages <- c(
+    "stage1_married_T0",
+    "stage2_complete_Tminus5_T0_status",
+    "stage3_nonmarried_Tminus5_Tminus1",
+    "first_observed_marriage",
+    "strict_first_marriage_proxy"
+  )
+
+  stage_labels <- c(
+    "Married at T0",
+    "Married at T0 + complete status T-5:T0",
+    "Window-only: non-married T-5:T-1 -> married T0",
+    "FIRST OBSERVED MARRIAGE: window-only + no earlier observed married status",
+    "STRICT FIRST-MARRIAGE PROXY: first observed + no earlier marriage evidence"
+  )
+
+  map2_dfr(
+    stages,
+    stage_labels,
+    function(
+        v,
+        lab
+    ) {
+
+      keep <- x[[
+        v
+      ]]
+
+      tibble(
+        survey =
+          survey_name,
+        stage =
+          lab,
+        eligible_event_episodes =
+          sum(
+            keep,
+            na.rm =
+              TRUE
+          ),
+        unique_people =
+          n_distinct(
+            x$pidp[
+              !is.na(
+                keep
+              ) &
+                keep
+            ]
+          )
+      )
+    }
+  )
+}
+
+
+eligibility_attrition <- bind_rows(
+  make_first_marriage_attrition(
+    marriage_candidates,
+    "BHPS"
+  ),
+  make_first_marriage_attrition(
+    marriage_candidates,
+    "UKHLS"
+  )
+)
+
+write_csv(
+  eligibility_attrition,
+  file.path(
+    output_dir,
+    "first_marriage_eligibility_attrition.csv"
+  )
+)
+
+
+# =============================================================================
+# 17. EXTRACT THE THREE NESTED TREATED DEFINITIONS
+# =============================================================================
+
+extract_marriage_definition <- function(
+    flag_name,
+    definition_label
+) {
+
+  marriage_candidates |>
+    filter(
+      .data[[
+        flag_name
+      ]]
+    ) |>
+    transmute(
+      pidp,
+      survey,
+      event_wave,
+      event_order,
+      definition =
+        definition_label
+    ) |>
+    distinct()
+}
+
+
+marriage_window_only <- extract_marriage_definition(
+  "window_eligible",
+  "Window-only marriage transition"
+)
+
+marriage_first_observed <- extract_marriage_definition(
+  "first_observed_marriage",
+  "First observed marriage"
+)
+
+marriage_strict_first_proxy <- extract_marriage_definition(
+  "strict_first_marriage_proxy",
+  "Strict first-marriage proxy"
+)
+
+
+treated_definition_counts <- bind_rows(
+
+  marriage_window_only |>
+    summarise(
+      definition =
+        "Window-only marriage transition",
+      episodes =
+        n(),
+      unique_people =
+        n_distinct(
+          pidp
+        )
+    ),
+
+  marriage_first_observed |>
+    summarise(
+      definition =
+        "First observed marriage",
+      episodes =
+        n(),
+      unique_people =
+        n_distinct(
+          pidp
+        )
+    ),
+
+  marriage_strict_first_proxy |>
+    summarise(
+      definition =
+        "Strict first-marriage proxy",
+      episodes =
+        n(),
+      unique_people =
+        n_distinct(
+          pidp
+        )
+    )
+)
+
+write_csv(
+  treated_definition_counts,
+  file.path(
+    output_dir,
+    "first_marriage_definition_counts.csv"
+  )
+)
+
+
+treated_counts_by_survey <- bind_rows(
+
+  marriage_window_only |>
+    count(
+      survey,
+      name =
+        "episodes"
+    ) |>
+    mutate(
+      definition =
+        "Window-only marriage transition",
+      .before =
+        1
+    ),
+
+  marriage_first_observed |>
+    count(
+      survey,
+      name =
+        "episodes"
+    ) |>
+    mutate(
+      definition =
+        "First observed marriage",
+      .before =
+        1
+    ),
+
+  marriage_strict_first_proxy |>
+    count(
+      survey,
+      name =
+        "episodes"
+    ) |>
+    mutate(
+      definition =
+        "Strict first-marriage proxy",
+      .before =
+        1
+    )
+)
+
+write_csv(
+  treated_counts_by_survey,
+  file.path(
+    output_dir,
+    "first_marriage_definition_counts_by_survey.csv"
+  )
+)
+
+
+treated_counts_by_event_cohort <- marriage_first_observed |>
+  count(
+    survey,
+    event_wave,
+    name =
+      "first_observed_marriages"
+  ) |>
+  arrange(
+    survey,
+    event_wave
+  )
+
+write_csv(
+  treated_counts_by_event_cohort,
+  file.path(
+    output_dir,
+    "first_observed_marriage_counts_by_event_cohort.csv"
+  )
+)
+
+
+# =============================================================================
+# 18. BUILD EXACT T-5:T0 EVENT ROWS
+# =============================================================================
+
+build_exact_event_rows <- function(
+    event_keys,
+    condition_label
+) {
+
+  keys <- event_keys |>
+    select(
+      pidp,
+      survey,
+      event_wave
+    ) |>
+    distinct() |>
+    mutate(
+      condition =
+        condition_label
+    )
+
+  expanded <- keys |>
+    tidyr::crossing(
+      event_time =
+        -5:0
+    ) |>
+    mutate(
+      wave_num =
+        event_wave +
+        event_time
+    )
+
+  expanded |>
+    left_join(
+      combined_long |>
+        select(
+          pidp,
+          survey,
+          wave_num,
+          status,
+          raw_status_label,
+          ghq12,
+          life_sat,
+          age,
+          sex
+        ),
+      by = c(
+        "pidp",
+        "survey",
+        "wave_num"
+      ),
+      relationship =
+        "many-to-one"
+    ) |>
+    arrange(
+      survey,
+      event_wave,
+      pidp,
+      event_time
+    )
+}
+
+
+first_observed_marriage_rows <- build_exact_event_rows(
+  marriage_first_observed,
+  "treated"
+)
+
+
+strict_first_marriage_rows <- build_exact_event_rows(
+  marriage_strict_first_proxy,
+  "treated"
+)
+
+
+# Verify exactly six event-time rows per treated event.
+treated_row_check <- first_observed_marriage_rows |>
+  count(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  summarise(
+    treated_events =
+      n(),
+    min_rows =
+      min(
+        n
+      ),
+    max_rows =
+      max(
+        n
+      ),
+    all_have_six_rows =
+      all(
+        n == 6L
+      )
+  )
+
+if (
+  nrow(
+    treated_row_check
+  ) > 0L &&
+    !treated_row_check$all_have_six_rows
+) {
+  stop(
+    "First-observed marriage event rows do not all contain exactly six waves."
+  )
+}
+
+write_csv(
+  treated_row_check,
+  file.path(
+    output_dir,
+    "first_observed_marriage_six_row_check.csv"
+  )
+)
+
+
+# =============================================================================
+# 19. EXPLICIT PRE-MARRIAGE STATUS DISTRIBUTION: T-5,...,T-1
+# =============================================================================
+
+pre_marriage_rows <- first_observed_marriage_rows |>
+  filter(
+    event_time %in%
+      -5:-1
+  ) |>
+  mutate(
+    pre_status =
+      factor(
+        status,
+        levels =
+          c(
+            "single",
+            "cohab",
+            "civil_partner",
+            "other"
+          )
+      )
+  )
+
+
+make_status_distribution <- function(
+    dat,
+    group_label
+) {
+
+  dat |>
+    count(
+      event_time,
+      pre_status,
+      .drop =
+        FALSE,
+      name =
+        "n"
+    ) |>
+    group_by(
+      event_time
+    ) |>
+    mutate(
+      total_future_marriers =
+        sum(
+          n
+        ),
+      percent =
+        100 *
+          n /
+          total_future_marriers
+    ) |>
+    ungroup() |>
+    mutate(
+      survey_group =
+        group_label,
+      .before =
+        1
+    )
+}
+
+
+prestatus_long <- bind_rows(
+
+  make_status_distribution(
+    pre_marriage_rows,
+    "BHPS+UKHLS"
+  ),
+
+  make_status_distribution(
+    pre_marriage_rows |>
+      filter(
+        survey == "BHPS"
+      ),
+    "BHPS"
+  ),
+
+  make_status_distribution(
+    pre_marriage_rows |>
+      filter(
+        survey == "UKHLS"
+      ),
+    "UKHLS"
+  )
+)
+
+write_csv(
+  prestatus_long,
+  file.path(
+    output_dir,
+    "future_marriers_prestatus_distribution_long.csv"
+  )
+)
+
+
+prestatus_wide <- prestatus_long |>
+  select(
+    survey_group,
+    event_time,
+    pre_status,
+    n,
+    percent
+  ) |>
+  mutate(
+    pre_status =
+      as.character(
+        pre_status
+      )
+  ) |>
+  pivot_wider(
+    names_from =
+      pre_status,
+    values_from =
+      c(
+        n,
+        percent
+      ),
+    values_fill =
+      0
+  ) |>
+  arrange(
+    factor(
+      survey_group,
+      levels =
+        c(
+          "BHPS+UKHLS",
+          "BHPS",
+          "UKHLS"
+        )
+    ),
+    event_time
+  )
+
+write_csv(
+  prestatus_wide,
+  file.path(
+    output_dir,
+    "future_marriers_single_vs_cohab_by_event_time.csv"
+  )
+)
+
+
+# =============================================================================
+# 20. INDIVIDUAL PRE-MARRIAGE PATHWAY CLASSIFICATION
+# =============================================================================
+
+pre_pathways <- pre_marriage_rows |>
+  select(
+    pidp,
+    survey,
+    event_wave,
+    event_time,
+    status
+  ) |>
+  mutate(
+    event_col =
+      paste0(
+        "T",
+        if_else(
+          event_time < 0,
+          paste0(
+            "m",
+            abs(
+              event_time
+            )
+          ),
+          as.character(
+            event_time
+          )
+        )
+      )
+  ) |>
+  select(
+    -event_time
+  ) |>
+  pivot_wider(
+    names_from =
+      event_col,
+    values_from =
+      status
+  ) |>
+  mutate(
+
+    ever_cohab_pre =
+      if_any(
+        all_of(
+          c(
+            "Tm5",
+            "Tm4",
+            "Tm3",
+            "Tm2",
+            "Tm1"
+          )
+        ),
+        ~ .x == "cohab"
+      ),
+
+    ever_single_pre =
+      if_any(
+        all_of(
+          c(
+            "Tm5",
+            "Tm4",
+            "Tm3",
+            "Tm2",
+            "Tm1"
+          )
+        ),
+        ~ .x == "single"
+      ),
+
+    all_single_pre =
+      if_all(
+        all_of(
+          c(
+            "Tm5",
+            "Tm4",
+            "Tm3",
+            "Tm2",
+            "Tm1"
+          )
+        ),
+        ~ .x == "single"
+      ),
+
+    all_cohab_pre =
+      if_all(
+        all_of(
+          c(
+            "Tm5",
+            "Tm4",
+            "Tm3",
+            "Tm2",
+            "Tm1"
+          )
+        ),
+        ~ .x == "cohab"
+      ),
+
+    cohab_at_Tminus1 =
+      Tm1 == "cohab",
+
+    single_at_Tminus1 =
+      Tm1 == "single",
+
+    n_cohab_pre_waves =
+      rowSums(
+        cbind(
+          Tm5 == "cohab",
+          Tm4 == "cohab",
+          Tm3 == "cohab",
+          Tm2 == "cohab",
+          Tm1 == "cohab"
+        ),
+        na.rm =
+          TRUE
+      ),
+
+    status_sequence =
+      paste(
+        Tm5,
+        Tm4,
+        Tm3,
+        Tm2,
+        Tm1,
+        sep =
+          " > "
+      )
+  )
+
+
+first_cohab_time <- pre_marriage_rows |>
+  filter(
+    status == "cohab"
+  ) |>
+  group_by(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  summarise(
+    first_cohab_event_time_in_window =
+      min(
+        event_time
+      ),
+    .groups =
+      "drop"
+  )
+
+pre_pathways <- pre_pathways |>
+  left_join(
+    first_cohab_time,
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  )
+
+
+write_csv(
+  pre_pathways,
+  file.path(
+    output_dir,
+    "future_marriers_pre_marriage_pathway_classification.csv"
+  )
+)
+
+
+summarise_pathways <- function(
+    dat,
+    group_label
+) {
+
+  tibble(
+    survey_group =
+      group_label,
+
+    future_marriers =
+      nrow(
+        dat
+      ),
+
+    ever_cohab_Tminus5_Tminus1_n =
+      sum(
+        dat$ever_cohab_pre
+      ),
+
+    ever_cohab_Tminus5_Tminus1_pct =
+      100 *
+        mean(
+          dat$ever_cohab_pre
+        ),
+
+    cohab_at_Tminus1_n =
+      sum(
+        dat$cohab_at_Tminus1
+      ),
+
+    cohab_at_Tminus1_pct =
+      100 *
+        mean(
+          dat$cohab_at_Tminus1
+        ),
+
+    single_at_Tminus1_n =
+      sum(
+        dat$single_at_Tminus1
+      ),
+
+    single_at_Tminus1_pct =
+      100 *
+        mean(
+          dat$single_at_Tminus1
+        ),
+
+    all_single_Tminus5_Tminus1_n =
+      sum(
+        dat$all_single_pre
+      ),
+
+    all_single_Tminus5_Tminus1_pct =
+      100 *
+        mean(
+          dat$all_single_pre
+        ),
+
+    all_cohab_Tminus5_Tminus1_n =
+      sum(
+        dat$all_cohab_pre
+      ),
+
+    all_cohab_Tminus5_Tminus1_pct =
+      100 *
+        mean(
+          dat$all_cohab_pre
+        ),
+
+    median_number_cohab_pre_waves =
+      median(
+        dat$n_cohab_pre_waves
+      ),
+
+    mean_number_cohab_pre_waves =
+      mean(
+        dat$n_cohab_pre_waves
+      )
+  )
+}
+
+
+pre_marriage_pathway_summary <- bind_rows(
+
+  summarise_pathways(
+    pre_pathways,
+    "BHPS+UKHLS"
+  ),
+
+  summarise_pathways(
+    pre_pathways |>
+      filter(
+        survey == "BHPS"
+      ),
+    "BHPS"
+  ),
+
+  summarise_pathways(
+    pre_pathways |>
+      filter(
+        survey == "UKHLS"
+      ),
+    "UKHLS"
+  )
+)
+
+write_csv(
+  pre_marriage_pathway_summary,
+  file.path(
+    output_dir,
+    "future_marriers_pre_marriage_pathway_summary.csv"
+  )
+)
+
+
+status_sequence_counts <- bind_rows(
+
+  pre_pathways |>
+    count(
+      status_sequence,
+      name =
+        "n"
+    ) |>
+    mutate(
+      survey_group =
+        "BHPS+UKHLS",
+      .before =
+        1
+    ),
+
+  pre_pathways |>
+    filter(
+      survey == "BHPS"
+    ) |>
+    count(
+      status_sequence,
+      name =
+        "n"
+    ) |>
+    mutate(
+      survey_group =
+        "BHPS",
+      .before =
+        1
+    ),
+
+  pre_pathways |>
+    filter(
+      survey == "UKHLS"
+    ) |>
+    count(
+      status_sequence,
+      name =
+        "n"
+    ) |>
+    mutate(
+      survey_group =
+        "UKHLS",
+      .before =
+        1
+    )
+) |>
+  group_by(
+    survey_group
+  ) |>
+  mutate(
+    percent =
+      100 *
+        n /
+        sum(
+          n
+        )
+  ) |>
+  ungroup() |>
+  arrange(
+    survey_group,
+    desc(
+      n
+    )
+  )
+
+write_csv(
+  status_sequence_counts,
+  file.path(
+    output_dir,
+    "future_marriers_prestatus_sequence_counts.csv"
+  )
+)
+
+
+first_cohab_time_distribution <- pre_pathways |>
+  mutate(
+    first_cohab_event_time_label =
+      if_else(
+        is.na(
+          first_cohab_event_time_in_window
+        ),
+        "No cohabitation observed T-5:T-1",
+        paste0(
+          "T",
+          first_cohab_event_time_in_window
+        )
+      )
+  ) |>
+  count(
+    survey,
+    first_cohab_event_time_label,
+    name =
+      "n"
+  ) |>
+  group_by(
+    survey
+  ) |>
+  mutate(
+    percent =
+      100 *
+        n /
+        sum(
+          n
+        )
+  ) |>
+  ungroup()
+
+write_csv(
+  first_cohab_time_distribution,
+  file.path(
+    output_dir,
+    "future_marriers_first_cohab_time_in_pre_window.csv"
+  )
+)
+
+
+# =============================================================================
+# 21. CONTEMPORANEOUS UNMARRIED RISK-SET CONTROLS
+# =============================================================================
+
+build_unmarried_controls <- function(
+    status_wide,
+    survey_name,
+    treated_events,
+    require_no_prior_observed_marriage = TRUE
+) {
+
+  survey_events <- treated_events |>
+    filter(
+      survey ==
+        .env$survey_name
+    )
+
+  cohorts <- sort(
+    unique(
+      survey_events$event_wave
+    )
+  )
+
+  if (length(
+    cohorts
+  ) == 0L) {
+    return(
+      tibble(
+        pidp =
+          status_wide$pidp[0],
+        survey =
+          character(0),
+        event_wave =
+          integer(0)
+      )
+    )
+  }
+
+  purrr::map_dfr(
+    cohorts,
+    function(
+        t0
+    ) {
+
+      full_cols <- paste0(
+        "w",
+        (t0 - 5L):t0
+      )
+
+      missing_cols <- setdiff(
+        full_cols,
+        names(
+          status_wide
+        )
+      )
+
+      if (length(
+        missing_cols
+      ) > 0L) {
+        stop(
+          "Requested control wave columns do not exist for ",
+          survey_name,
+          " at event wave ",
+          t0,
+          ": ",
+          paste(
+            missing_cols,
+            collapse = ", "
+          )
+        )
+      }
+
+      complete_window <-
+        row_all_nonmissing(
+          status_wide,
+          full_cols
+        )
+
+      all_nonmarried <-
+        row_all_nonmarried(
+          status_wide,
+          full_cols
+        )
+
+      out <- tibble(
+        pidp =
+          status_wide$pidp,
+        survey =
+          survey_name,
+        event_wave =
+          t0,
+        event_order =
+          event_time_order(
+            survey_name,
+            t0
+          ),
+        complete_window =
+          complete_window,
+        all_nonmarried =
+          all_nonmarried
+      ) |>
+        filter(
+          complete_window,
+          all_nonmarried
+        )
+
+      if (
+        require_no_prior_observed_marriage
+      ) {
+
+        out <- out |>
+          left_join(
+            first_observed_married,
+            by =
+              "pidp",
+            relationship =
+              "many-to-one"
+          ) |>
+          filter(
+            is.na(
+              first_observed_married_order
+            ) |
+              first_observed_married_order >
+                event_order
+          ) |>
+          select(
+            -first_observed_married_order
+          )
+      }
+
+      out |>
+        select(
+          pidp,
+          survey,
+          event_wave
+        )
+    }
+  )
+}
+
+
+first_marriage_risk_controls <- bind_rows(
+
+  build_unmarried_controls(
+    bhps_status_wide,
+    "BHPS",
+    marriage_first_observed,
+    require_no_prior_observed_marriage =
+      TRUE
+  ),
+
+  build_unmarried_controls(
+    ukhls_status_wide,
+    "UKHLS",
+    marriage_first_observed,
+    require_no_prior_observed_marriage =
+      TRUE
+  )
+)
+
+
+all_unmarried_controls <- bind_rows(
+
+  build_unmarried_controls(
+    bhps_status_wide,
+    "BHPS",
+    marriage_first_observed,
+    require_no_prior_observed_marriage =
+      FALSE
+  ),
+
+  build_unmarried_controls(
+    ukhls_status_wide,
+    "UKHLS",
+    marriage_first_observed,
+    require_no_prior_observed_marriage =
+      FALSE
+  )
+)
+
+
+control_counts_by_cohort <- treated_counts_by_event_cohort |>
+  left_join(
+    first_marriage_risk_controls |>
+      count(
+        survey,
+        event_wave,
+        name =
+          "first_marriage_risk_controls"
+      ),
+    by = c(
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  ) |>
+  left_join(
+    all_unmarried_controls |>
+      count(
+        survey,
+        event_wave,
+        name =
+          "all_unmarried_controls"
+      ),
+    by = c(
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  ) |>
+  mutate(
+    first_marriage_risk_control_to_treated_ratio =
+      first_marriage_risk_controls /
+        first_observed_marriages,
+
+    all_unmarried_control_to_treated_ratio =
+      all_unmarried_controls /
+        first_observed_marriages
+  )
+
+write_csv(
+  control_counts_by_cohort,
+  file.path(
+    output_dir,
+    "first_marriage_control_counts_by_event_cohort.csv"
+  )
+)
+
+
+# =============================================================================
+# 22. EVENT ROWS FOR PRIMARY FIRST-MARRIAGE RISK SET
+# =============================================================================
+
+primary_control_rows <- build_exact_event_rows(
+  first_marriage_risk_controls,
+  "unmarried control"
+)
+
+primary_event_rows <- bind_rows(
+  first_observed_marriage_rows,
+  primary_control_rows
+) |>
+  arrange(
+    survey,
+    event_wave,
+    condition,
+    pidp,
+    event_time
+  )
+
+
+primary_six_row_check <- primary_event_rows |>
+  count(
+    condition,
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  group_by(
+    condition
+  ) |>
+  summarise(
+    person_stack_episodes =
+      n(),
+    min_rows =
+      min(
+        n
+      ),
+    max_rows =
+      max(
+        n
+      ),
+    all_have_six_rows =
+      all(
+        n == 6L
+      ),
+    .groups =
+      "drop"
+  )
+
+if (
+  any(
+    !primary_six_row_check$all_have_six_rows
+  )
+) {
+  stop(
+    "At least one primary treated/control person-stack does not contain exactly six event-time rows."
+  )
+}
+
+write_csv(
+  primary_six_row_check,
+  file.path(
+    output_dir,
+    "primary_first_marriage_risk_set_six_row_check.csv"
+  )
+)
+
+
+# =============================================================================
+# 23. AGE / SEX AT T0
+# =============================================================================
+
+T0_demo <- primary_event_rows |>
+  filter(
+    event_time == 0L
+  ) |>
+  transmute(
+    pidp,
+    survey,
+    event_wave,
+    condition,
+    age_T0 =
+      age,
+    sex_T0 =
+      sex
+  )
+
+
+age_sex_summary <- T0_demo |>
+  group_by(
+    survey,
+    condition
+  ) |>
+  summarise(
+    person_stack_episodes =
+      n(),
+    age_nonmissing =
+      sum(
+        !is.na(
+          age_T0
+        )
+      ),
+    mean_age =
+      mean(
+        age_T0,
+        na.rm =
+          TRUE
+      ),
+    sd_age =
+      sd(
+        age_T0,
+        na.rm =
+          TRUE
+      ),
+    median_age =
+      median(
+        age_T0,
+        na.rm =
+          TRUE
+      ),
+    age_p10 =
+      quantile(
+        age_T0,
+        0.10,
+        na.rm =
+          TRUE
+      ),
+    age_p90 =
+      quantile(
+        age_T0,
+        0.90,
+        na.rm =
+          TRUE
+      ),
+    sex_nonmissing =
+      sum(
+        !is.na(
+          sex_T0
+        )
+      ),
+    proportion_female =
+      mean(
+        sex_T0 == "female",
+        na.rm =
+          TRUE
+      ),
+    .groups =
+      "drop"
+  )
+
+write_csv(
+  age_sex_summary,
+  file.path(
+    output_dir,
+    "first_marriage_age_sex_summary_at_T0.csv"
+  )
+)
+
+
+# =============================================================================
+# 24. SAME-SEX AGE-CALIPER CONTROL AVAILABILITY
+# =============================================================================
+
+age_caliper_diagnostic <- function(
+    demo_dat
+) {
+
+  treated <- demo_dat |>
+    filter(
+      condition == "treated"
+    ) |>
+    transmute(
+      treated_id =
+        row_number(),
+      treated_pidp =
+        pidp,
+      survey,
+      event_wave,
+      treated_age =
+        age_T0,
+      treated_sex =
+        sex_T0
+    )
+
+  controls_by_age <- demo_dat |>
+    filter(
+      condition == "unmarried control",
+      !is.na(
+        age_T0
+      ),
+      !is.na(
+        sex_T0
+      )
+    ) |>
+    count(
+      survey,
+      event_wave,
+      control_sex =
+        sex_T0,
+      control_age =
+        age_T0,
+      name =
+        "n_controls_at_age"
+    )
+
+  candidates <- treated |>
+    filter(
+      !is.na(
+        treated_age
+      ),
+      !is.na(
+        treated_sex
+      )
+    ) |>
+    tidyr::crossing(
+      age_shift =
+        -5:5
+    ) |>
+    mutate(
+      control_age =
+        treated_age +
+        age_shift
+    ) |>
+    left_join(
+      controls_by_age,
+      by = c(
+        "survey",
+        "event_wave",
+        "treated_sex" =
+          "control_sex",
+        "control_age"
+      ),
+      relationship =
+        "many-to-one"
+    ) |>
+    mutate(
+      n_controls_at_age =
+        coalesce(
+          n_controls_at_age,
+          0L
+        ),
+      age_distance =
+        abs(
+          age_shift
+        )
+    )
+
+  counts_with_demo <- candidates |>
+    group_by(
+      treated_id,
+      treated_pidp,
+      survey,
+      event_wave,
+      treated_age,
+      treated_sex
+    ) |>
+    summarise(
+      n_same_sex_age_pm1 =
+        sum(
+          n_controls_at_age[
+            age_distance <= 1
+          ]
+        ),
+      n_same_sex_age_pm2 =
+        sum(
+          n_controls_at_age[
+            age_distance <= 2
+          ]
+        ),
+      n_same_sex_age_pm3 =
+        sum(
+          n_controls_at_age[
+            age_distance <= 3
+          ]
+        ),
+      n_same_sex_age_pm5 =
+        sum(
+          n_controls_at_age[
+            age_distance <= 5
+          ]
+        ),
+      .groups =
+        "drop"
+    )
+
+  missing_demo <- treated |>
+    filter(
+      is.na(
+        treated_age
+      ) |
+        is.na(
+          treated_sex
+        )
+    ) |>
+    transmute(
+      treated_id,
+      treated_pidp,
+      survey,
+      event_wave,
+      treated_age,
+      treated_sex,
+      n_same_sex_age_pm1 =
+        0L,
+      n_same_sex_age_pm2 =
+        0L,
+      n_same_sex_age_pm3 =
+        0L,
+      n_same_sex_age_pm5 =
+        0L
+    )
+
+  per_treated <- bind_rows(
+    counts_with_demo,
+    missing_demo
+  ) |>
+    arrange(
+      survey,
+      event_wave,
+      treated_pidp
+    )
+
+  summary <- per_treated |>
+    summarise(
+      treated_events =
+        n(),
+      treated_with_observed_age_sex =
+        sum(
+          !is.na(
+            treated_age
+          ) &
+            !is.na(
+              treated_sex
+            )
+        ),
+      zero_matches_pm1 =
+        sum(
+          n_same_sex_age_pm1 == 0L
+        ),
+      zero_matches_pm2 =
+        sum(
+          n_same_sex_age_pm2 == 0L
+        ),
+      zero_matches_pm3 =
+        sum(
+          n_same_sex_age_pm3 == 0L
+        ),
+      zero_matches_pm5 =
+        sum(
+          n_same_sex_age_pm5 == 0L
+        ),
+      median_matches_pm1 =
+        median(
+          n_same_sex_age_pm1
+        ),
+      median_matches_pm2 =
+        median(
+          n_same_sex_age_pm2
+        ),
+      median_matches_pm3 =
+        median(
+          n_same_sex_age_pm3
+        ),
+      median_matches_pm5 =
+        median(
+          n_same_sex_age_pm5
+        )
+    )
+
+  list(
+    per_treated =
+      per_treated,
+    summary =
+      summary
+  )
+}
+
+
+age_caliper <- age_caliper_diagnostic(
+  T0_demo
+)
+
+write_csv(
+  age_caliper$per_treated,
+  file.path(
+    output_dir,
+    "first_marriage_age_sex_caliper_matches_per_treated.csv"
+  )
+)
+
+write_csv(
+  age_caliper$summary,
+  file.path(
+    output_dir,
+    "first_marriage_age_sex_caliper_match_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 25. OUTCOME AVAILABILITY BY EVENT TIME
+# =============================================================================
+
+outcome_availability_one <- function(
+    dat,
+    outcome
+) {
+
+  dat |>
+    group_by(
+      survey,
+      condition,
+      event_time
+    ) |>
+    summarise(
+      outcome =
+        outcome,
+      person_stack_rows =
+        n(),
+      unique_people =
+        n_distinct(
+          pidp
+        ),
+      observed_rows =
+        sum(
+          !is.na(
+            .data[[
+              outcome
+            ]]
+          )
+        ),
+      observed_unique_people =
+        n_distinct(
+          pidp[
+            !is.na(
+              .data[[
+                outcome
+              ]]
+            )
+          ]
+        ),
+      percent_observed =
+        100 *
+          observed_rows /
+          person_stack_rows,
+      .groups =
+        "drop"
+    )
+}
+
+
+outcome_availability <- bind_rows(
+
+  outcome_availability_one(
+    primary_event_rows,
+    "ghq12"
+  ),
+
+  outcome_availability_one(
+    primary_event_rows,
+    "life_sat"
+  )
+)
+
+write_csv(
+  outcome_availability,
+  file.path(
+    output_dir,
+    "first_marriage_outcome_availability_by_event_time.csv"
+  )
+)
+
+
+# =============================================================================
+# 26. OUTCOME SAMPLE FLOW
+# =============================================================================
+
+outcome_sample_flow_one <- function(
+    dat,
+    outcome
+) {
+
+  person_stack <- dat |>
+    group_by(
+      pidp,
+      survey,
+      event_wave,
+      condition
+    ) |>
+    summarise(
+      observed_Tminus5 =
+        any(
+          event_time == -5L &
+            !is.na(
+              .data[[
+                outcome
+              ]]
+            )
+        ),
+      observed_Tminus1 =
+        any(
+          event_time == -1L &
+            !is.na(
+              .data[[
+                outcome
+              ]]
+            )
+        ),
+      n_observed =
+        sum(
+          !is.na(
+            .data[[
+              outcome
+            ]]
+          )
+        ),
+      .groups =
+        "drop"
+    )
+
+  make_stage <- function(
+      keep,
+      label
+  ) {
+
+    person_stack |>
+      filter(
+        {{ keep }}
+      ) |>
+      group_by(
+        survey,
+        condition
+      ) |>
+      summarise(
+        outcome =
+          outcome,
+        stage =
+          label,
+        person_stack_episodes =
+          n(),
+        unique_people =
+          n_distinct(
+            pidp
+          ),
+        .groups =
+          "drop"
+      )
+  }
+
+  bind_rows(
+
+    person_stack |>
+      group_by(
+        survey,
+        condition
+      ) |>
+      summarise(
+        outcome =
+          outcome,
+        stage =
+          "Status-eligible first-marriage risk-set episode",
+        person_stack_episodes =
+          n(),
+        unique_people =
+          n_distinct(
+            pidp
+          ),
+        .groups =
+          "drop"
+      ),
+
+    make_stage(
+      observed_Tminus5,
+      "Outcome observed at T-5"
+    ),
+
+    make_stage(
+      observed_Tminus1,
+      "Outcome observed at T-1"
+    ),
+
+    make_stage(
+      observed_Tminus5 &
+        observed_Tminus1,
+      "Outcome observed at both T-5 and T-1"
+    ),
+
+    make_stage(
+      observed_Tminus5 &
+        n_observed >= 2L,
+      "T-5 observed + >=1 additional outcome"
+    ),
+
+    make_stage(
+      n_observed == 6L,
+      "All six outcome occasions observed"
+    )
+  )
+}
+
+
+outcome_sample_flow <- bind_rows(
+
+  outcome_sample_flow_one(
+    primary_event_rows,
+    "ghq12"
+  ),
+
+  outcome_sample_flow_one(
+    primary_event_rows,
+    "life_sat"
+  )
+)
+
+write_csv(
+  outcome_sample_flow,
+  file.path(
+    output_dir,
+    "first_marriage_outcome_sample_flow.csv"
+  )
+)
+
+
+# =============================================================================
+# 27. PRE-MARRIAGE STATUS AND OUTCOME AVAILABILITY TOGETHER
+# =============================================================================
+#
+# This diagnostic asks whether outcome observation differs materially between
+# future marriers who are single vs cohabiting at each pre-event wave.
+# It can reveal whether the observed pre-marriage trajectory may be affected
+# by differential outcome missingness across relationship pathways.
+# =============================================================================
+
+prestatus_outcome_availability <- first_observed_marriage_rows |>
+  filter(
+    event_time %in%
+      -5:-1
+  ) |>
+  pivot_longer(
+    cols =
+      c(
+        ghq12,
+        life_sat
+      ),
+    names_to =
+      "outcome",
+    values_to =
+      "outcome_value"
+  ) |>
+  group_by(
+    survey,
+    event_time,
+    status,
+    outcome
+  ) |>
+  summarise(
+    future_marrier_rows =
+      n(),
+    outcome_observed =
+      sum(
+        !is.na(
+          outcome_value
+        )
+      ),
+    percent_observed =
+      100 *
+        outcome_observed /
+        future_marrier_rows,
+    .groups =
+      "drop"
+  )
+
+write_csv(
+  prestatus_outcome_availability,
+  file.path(
+    output_dir,
+    "future_marriers_prestatus_outcome_availability.csv"
+  )
+)
+
+
+# =============================================================================
+# 28. SAVE ANALYSIS-READY RDS OBJECTS
+# =============================================================================
+
+saveRDS(
+  combined_long,
+  file.path(
+    output_dir,
+    "combined_person_wave_panel.rds"
+  )
+)
+
+saveRDS(
+  marriage_candidates,
+  file.path(
+    output_dir,
+    "first_marriage_candidate_episodes.rds"
+  )
+)
+
+saveRDS(
+  marriage_window_only,
+  file.path(
+    output_dir,
+    "marriage_treated_window_only.rds"
+  )
+)
+
+saveRDS(
+  marriage_first_observed,
+  file.path(
+    output_dir,
+    "marriage_treated_first_observed.rds"
+  )
+)
+
+saveRDS(
+  marriage_strict_first_proxy,
+  file.path(
+    output_dir,
+    "marriage_treated_strict_first_marriage_proxy.rds"
+  )
+)
+
+saveRDS(
+  first_marriage_risk_controls,
+  file.path(
+    output_dir,
+    "first_marriage_risk_set_unmarried_controls.rds"
+  )
+)
+
+saveRDS(
+  all_unmarried_controls,
+  file.path(
+    output_dir,
+    "all_unmarried_risk_set_controls.rds"
+  )
+)
+
+saveRDS(
+  first_observed_marriage_rows,
+  file.path(
+    output_dir,
+    "first_observed_marriage_Tminus5_T0_treated_rows.rds"
+  )
+)
+
+saveRDS(
+  primary_event_rows,
+  file.path(
+    output_dir,
+    "first_marriage_Tminus5_T0_primary_event_rows.rds"
+  )
+)
+
+saveRDS(
+  pre_pathways,
+  file.path(
+    output_dir,
+    "first_marriage_pre_pathways.rds"
+  )
+)
+
+
+# =============================================================================
+# 29. FINAL FILE-EXISTENCE CHECK
+# =============================================================================
+
+expected_rds <- c(
+  "combined_person_wave_panel.rds",
+  "first_marriage_candidate_episodes.rds",
+  "marriage_treated_window_only.rds",
+  "marriage_treated_first_observed.rds",
+  "marriage_treated_strict_first_marriage_proxy.rds",
+  "first_marriage_risk_set_unmarried_controls.rds",
+  "all_unmarried_risk_set_controls.rds",
+  "first_observed_marriage_Tminus5_T0_treated_rows.rds",
+  "first_marriage_Tminus5_T0_primary_event_rows.rds",
+  "first_marriage_pre_pathways.rds"
+)
+
+rds_check <- tibble(
+  file =
+    expected_rds,
+  exists =
+    file.exists(
+      file.path(
+        output_dir,
+        expected_rds
+      )
+    )
+)
+
+write_csv(
+  rds_check,
+  file.path(
+    output_dir,
+    "first_marriage_rds_file_check.csv"
+  )
+)
+
+if (
+  any(
+    !rds_check$exists
+  )
+) {
+  stop(
+    "One or more expected RDS outputs were not created. Inspect first_marriage_rds_file_check.csv."
+  )
+}
+
+
+# =============================================================================
+# 30. CONSOLE SUMMARY
+# =============================================================================
+
+cat(
+  "\n\n============================================================\n"
+)
+
+cat(
+  "FIRST-MARRIAGE T-5:T0 ELIGIBILITY DIAGNOSTIC COMPLETE\n"
+)
+
+cat(
+  "============================================================\n\n"
+)
+
+cat(
+  "TREATED DEFINITIONS\n\n"
+)
+
+print(
+  treated_definition_counts,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nPRE-MARRIAGE PATHWAY SUMMARY\n\n"
+)
+
+print(
+  pre_marriage_pathway_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nSINGLE VS COHABITING AT EACH PRE-EVENT WAVE\n\n"
+)
+
+print(
+  prestatus_wide |>
+    filter(
+      survey_group ==
+        "BHPS+UKHLS"
+    ),
+  n =
+    Inf
+)
+
+cat(
+  "\n\nAGE/SEX CALIPER CONTROL AVAILABILITY\n\n"
+)
+
+print(
+  age_caliper$summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nOUTPUT DIRECTORY:\n",
+  normalizePath(
+    output_dir,
+    winslash =
+      "/",
+    mustWork =
+      FALSE
+  ),
+  "\n\n"
+)
+
+cat(
+  "Most important CSV files to inspect/upload:\n",
+  "  1. first_marriage_definition_counts.csv\n",
+  "  2. first_marriage_definition_counts_by_survey.csv\n",
+  "  3. first_marriage_eligibility_attrition.csv\n",
+  "  4. future_marriers_single_vs_cohab_by_event_time.csv\n",
+  "  5. future_marriers_pre_marriage_pathway_summary.csv\n",
+  "  6. future_marriers_prestatus_sequence_counts.csv\n",
+  "  7. first_marriage_control_counts_by_event_cohort.csv\n",
+  "  8. first_marriage_age_sex_caliper_match_summary.csv\n",
+  "  9. first_marriage_outcome_availability_by_event_time.csv\n",
+  " 10. first_marriage_outcome_sample_flow.csv\n"
+)
+
+cat(
+  "\nInterpretation reminder:\n",
+  "T-5:T-1 is a pre-marriage trajectory, not a causal effect of legal marriage.\n",
+  "T0 is the first observed married interview; marriage occurred between T-1 and T0.\n"
+)
+
+cat(
+  "============================================================\n"
+)

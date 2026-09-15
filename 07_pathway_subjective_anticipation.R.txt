@@ -1,0 +1,2831 @@
+################################################################################
+# UKHLS PATHWAY-BASED ANTICIPATION ADD-ON V1.2 (PIDP TYPE FIX)
+#
+# PURPOSE
+# -------
+# This stand-alone add-on implements pathway-based tests of psychological
+# anticipation without replacing or modifying the validated upstream workflows.
+#
+# CONCEPTUAL DESIGN
+# -----------------
+# A. COHABITATION PATHWAY TEST
+#    Clean incident LAT formation -> future pathway within 36 months:
+#      (1) probable LAT -> cohabitation,
+#      (2) remains LAT through the fixed horizon,
+#      (3) observed LAT exit/no partner through the fixed horizon.
+#    Future cohabiters are matched to incident LAT relationships that remain LAT.
+#    Psychological trajectories are followed from the pre-LAT period through
+#    post-LAT relationship-duration stages. The primary estimand is differential
+#    within-person psychological change after LAT formation.
+#
+# B. BALANCED LAT TARGET-BIN SENSITIVITIES
+#    Re-estimate the future-cohabitation vs stable-LAT contrast separately for
+#    12-23 and 24-35 months, requiring outcome-complete observations at both the
+#    first-LAT reference and the target stage within each retained matched set.
+#
+# C. SUBJECTIVE COHABITATION ANTICIPATION (NCRR11 CHANGE)
+#    Test whether within-LAT strengthening of intention to live together
+#    (previous interview -> current interview) predicts subsequent psychological
+#    change (current interview -> next interview), preserving temporal order.
+#
+# D. SUBJECTIVE MARRIAGE ANTICIPATION (NCRR12 CHANGE)
+#    Audit repeated within-LAT variation in marriage likelihood and test whether
+#    strengthening marriage expectation predicts subsequent psychological change.
+#    NCRR12 is explicitly treated as LAT-stage marriage expectation, NOT as a
+#    cohabiter-specific marriage-expectation measure.
+#
+# E. FIXED-HORIZON MARRIAGE PATHWAY TEST
+#    Cohabitation onset -> pathway within 36 months:
+#      (1) marriage within 36 months,
+#      (2) remains cohabiting/unmarried through 36 months,
+#      (3) breakup within 36 months.
+#    Future marriers are matched to cohabitations stable through the horizon.
+#    Psychological trajectories are compared across cohabitation-duration stages.
+#
+# INTERPRETIVE RULE
+# -----------------
+# Favorable post-relationship-formation trajectory divergence among future
+# progressors is CONSISTENT WITH a transition-bound developmental/anticipatory
+# process, but it is not a causal effect of anticipation. Subjective expectation
+# change provides complementary evidence more specific to anticipation.
+#
+# IMPORTANT
+# ---------
+# * Objective time-to-event proximity is NOT the primary anticipation test here.
+# * Controls are fixed-horizon stable nonprogressors, not "never transitioners."
+# * Breakup pathways are kept separate and are not pooled with stable controls.
+# * All primary pathway models estimate CHANGE relative to relationship onset;
+#   psychological level differences alone are not treated as anticipation.
+################################################################################
+
+
+# ==============================================================================
+# 0. PACKAGES
+# ==============================================================================
+
+required_packages <- c(
+  "dplyr", "tidyr", "purrr", "tibble", "readr", "stringr",
+  "fixest", "splines"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install these package(s) before running the add-on: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(fixest)
+  library(splines)
+})
+
+options(dplyr.summarise.inform = FALSE)
+fixest::setFixest_nthreads(0)
+
+
+# ==============================================================================
+# 1. PATHS AND USER-EDITABLE OPTIONS
+# ==============================================================================
+
+UKHLS_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se/ukhls"
+)
+
+# Executed validated workflow is v4.1, not v4.2.
+V41_OUT_DIR <- file.path(
+  getwd(),
+  "UKHLS_REVISED_selection_development_proximity_v4_1"
+)
+
+PANEL_RDS <- file.path(V41_OUT_DIR, "data", "01_panel_person_wave.rds")
+PHISTORY_RDS <- file.path(V41_OUT_DIR, "data", "02_phistory_clean.rds")
+COHAB_PANEL_RDS <- file.path(
+  V41_OUT_DIR, "data", "03_cohabitation_person_spell_wave.rds"
+)
+
+# Actual output directory from the executed incident-LAT workflow.
+# Forward slashes are used because they are portable in R on Windows.
+INCIDENT_LAT_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se/incident_LAT_psychological_trajectory_v1"
+)
+
+INCIDENT_EVENTS_RDS <- file.path(
+  INCIDENT_LAT_DIR,
+  "primary_incident_LAT_events.rds"
+)
+
+INCIDENT_TREATED_STACK_RDS <- file.path(
+  INCIDENT_LAT_DIR,
+  "treated_only_LAT_event_stack.rds"
+)
+
+OUT_DIR <- file.path(
+  getwd(),
+  "UKHLS_PATHWAY_BASED_anticipation_addon_v1_6_EPOCHFIX"
+)
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "tables"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "diagnostics"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "models"), recursive = TRUE, showWarnings = FALSE)
+
+required_inputs <- c(
+  PANEL_RDS,
+  PHISTORY_RDS,
+  COHAB_PANEL_RDS,
+  INCIDENT_EVENTS_RDS,
+  INCIDENT_TREATED_STACK_RDS
+)
+
+missing_inputs <- required_inputs[!file.exists(required_inputs)]
+if (length(missing_inputs) > 0L) {
+  stop(
+    "Missing required upstream file(s):\n",
+    paste(missing_inputs, collapse = "\n"),
+    "\n\nRun the validated v4.1 workflow and the incident-LAT workflow first."
+  )
+}
+
+# Fixed pathway horizon. This is deliberately distinct from objective proximity.
+PATHWAY_HORIZON_MONTHS <- 36L
+
+# LAT episode construction, retained from the validated anticipation workflow.
+MAX_LAT_START_DATE_SHIFT_MONTHS <- 6L
+MAX_GAP_WITHIN_LAT_EPISODE_MONTHS <- 18L
+
+# Probable LAT -> cohabitation linkage.
+LAT_COHAB_MAX_LAST_LAT_GAP <- 18L
+LAT_COHAB_START_FLAGS <- 0L
+
+# A stable LAT episode must be observed close to the end of the 36-month horizon.
+# The 30-month lower bound allows approximately annual interview timing jitter.
+STABLE_LAT_MIN_OBSERVED_MONTH <- 30L
+STABLE_LAT_MAX_OBSERVED_MONTH <- 42L
+
+# Approximately annual psychological intervals.
+PSYCH_MIN_GAP_MONTHS <- 6L
+PSYCH_MAX_GAP_MONTHS <- 18L
+
+# Matching at relationship onset.
+MATCH_AGE_CALIPER <- 1
+MATCH_BASELINE_MONTH_CALIPER <- 3L
+MATCH_FOLLOWUP_INTERVAL_CALIPER <- 3L
+MATCH_COHAB_START_CALIPER <- 12L
+MIN_CONTROLS_PER_SET <- 1L
+
+# LAT stages. first_LAT is the exact first observed positive NCRR1 interview from
+# the clean incident-LAT workflow. Later stages use relationship duration.
+LAT_TARGET_WINDOWS <- tibble::tribble(
+  ~stage,       ~lower, ~upper, ~target,
+  "LAT_12_23",    12L,    23L,    17.5,
+  "LAT_24_35",    24L,    35L,    29.5
+)
+
+LAT_STAGE_ORDER <- c(
+  "pre25_36",
+  "last_unpartnered",
+  "first_LAT",
+  "LAT_12_23",
+  "LAT_24_35"
+)
+
+COHAB_STAGE_WINDOWS <- tibble::tribble(
+  ~stage,          ~lower, ~upper, ~target,
+  "COHAB_0_11",       0L,    11L,     5.5,
+  "COHAB_12_23",     12L,    23L,    17.5,
+  "COHAB_24_35",     24L,    35L,    29.5
+)
+
+COHAB_STAGE_ORDER <- c(
+  "COHAB_0_11",
+  "COHAB_12_23",
+  "COHAB_24_35"
+)
+
+
+# ==============================================================================
+# 2. HELPERS
+# ==============================================================================
+
+write_csv_quiet <- function(x, filename, subdir = "tables") {
+  path <- file.path(OUT_DIR, subdir, filename)
+  readr::write_csv(x, path, na = "", progress = FALSE)
+  invisible(path)
+}
+
+write_txt <- function(x, filename, subdir = "tables") {
+  path <- file.path(OUT_DIR, subdir, filename)
+  writeLines(as.character(x), path, useBytes = TRUE)
+  invisible(path)
+}
+
+safe_sd <- function(x) {
+  z <- suppressWarnings(as.numeric(x))
+  z <- z[is.finite(z)]
+  if (length(z) < 2L) return(NA_real_)
+  stats::sd(z)
+}
+
+safe_mean <- function(x) {
+  z <- suppressWarnings(as.numeric(x))
+  z <- z[is.finite(z)]
+  if (length(z) == 0L) return(NA_real_)
+  mean(z)
+}
+
+safe_nobs <- function(model) {
+  if (is.null(model)) return(NA_integer_)
+  out <- tryCatch(stats::nobs(model), error = function(e) NA_integer_)
+  suppressWarnings(as.integer(out))
+}
+
+save_model_bundle <- function(model, name) {
+  if (is.null(model)) return(invisible(NULL))
+
+  saveRDS(model, file.path(OUT_DIR, "models", paste0(name, ".rds")))
+
+  b <- stats::coef(model)
+  if (length(b) > 0L) {
+    se <- fixest::se(model)
+    pv <- fixest::pvalue(model)
+    ci <- stats::confint(model)
+
+    tab <- tibble::tibble(
+      term = names(b),
+      estimate = as.numeric(b),
+      std_error = as.numeric(se[names(b)]),
+      conf_low = as.numeric(ci[names(b), 1]),
+      conf_high = as.numeric(ci[names(b), 2]),
+      p_value = as.numeric(pv[names(b)]),
+      nobs = safe_nobs(model)
+    )
+
+    write_csv_quiet(tab, paste0(name, "_coefficients.csv"))
+  }
+
+  write_txt(capture.output(summary(model)), paste0(name, "_summary.txt"))
+  invisible(model)
+}
+
+safe_feols <- function(formula, data, name, ...) {
+  fit <- tryCatch(
+    fixest::feols(formula, data = data, ...),
+    error = function(e) e
+  )
+
+  if (inherits(fit, "error")) {
+    write_txt(
+      c("MODEL FAILED", "", conditionMessage(fit)),
+      paste0(name, "_ERROR.txt")
+    )
+    return(NULL)
+  }
+
+  save_model_bundle(fit, name)
+  fit
+}
+
+safe_feglm <- function(formula, data, family, name, ...) {
+  fit <- tryCatch(
+    fixest::feglm(formula, data = data, family = family, ...),
+    error = function(e) e
+  )
+
+  if (inherits(fit, "error")) {
+    write_txt(
+      c("MODEL FAILED", "", conditionMessage(fit)),
+      paste0(name, "_ERROR.txt")
+    )
+    return(NULL)
+  }
+
+  save_model_bundle(fit, name)
+  fit
+}
+
+extract_term <- function(
+    model,
+    term,
+    analysis,
+    outcome,
+    contrast = NA_character_
+) {
+  out <- tibble::tibble(
+    analysis = analysis,
+    outcome = outcome,
+    contrast = contrast,
+    term = term,
+    estimate = NA_real_,
+    std_error = NA_real_,
+    conf_low = NA_real_,
+    conf_high = NA_real_,
+    p_value = NA_real_,
+    nobs = if (is.null(model)) NA_integer_ else safe_nobs(model),
+    status = if (is.null(model)) "model_missing" else "term_missing"
+  )
+
+  if (is.null(model)) return(out)
+
+  b <- stats::coef(model)
+  if (!term %in% names(b)) return(out)
+
+  se <- fixest::se(model)
+  pv <- fixest::pvalue(model)
+  ci <- stats::confint(model)
+
+  tibble::tibble(
+    analysis = analysis,
+    outcome = outcome,
+    contrast = contrast,
+    term = term,
+    estimate = as.numeric(b[term]),
+    std_error = as.numeric(se[term]),
+    conf_low = as.numeric(ci[term, 1]),
+    conf_high = as.numeric(ci[term, 2]),
+    p_value = as.numeric(pv[term]),
+    nobs = safe_nobs(model),
+    status = "estimated"
+  )
+}
+
+extract_first_matching_term <- function(
+    model,
+    required_substrings,
+    analysis,
+    outcome,
+    contrast
+) {
+  if (is.null(model)) {
+    return(extract_term(NULL, NA_character_, analysis, outcome, contrast))
+  }
+
+  nm <- names(stats::coef(model))
+  keep <- rep(TRUE, length(nm))
+  for (s in required_substrings) {
+    keep <- keep & grepl(s, nm, fixed = TRUE)
+  }
+  hits <- nm[keep]
+
+  if (length(hits) == 0L) {
+    return(extract_term(model, "__NO_MATCH__", analysis, outcome, contrast))
+  }
+
+  extract_term(model, hits[[1L]], analysis, outcome, contrast)
+}
+
+wald_terms <- function(model, terms, analysis, outcome, test) {
+  base <- tibble::tibble(
+    analysis = analysis,
+    outcome = outcome,
+    test = test,
+    statistic = NA_real_,
+    df = NA_integer_,
+    p_value = NA_real_,
+    n_terms = length(terms),
+    matched_terms = paste(terms, collapse = " | "),
+    nobs = if (is.null(model)) NA_integer_ else safe_nobs(model),
+    status = if (is.null(model)) "model_missing" else "not_estimated"
+  )
+
+  if (is.null(model) || length(terms) == 0L) return(base)
+
+  b_all <- stats::coef(model)
+  V_all <- stats::vcov(model)
+  terms <- intersect(terms, names(b_all))
+  if (length(terms) == 0L) return(base)
+
+  b <- as.numeric(b_all[terms])
+  V <- as.matrix(V_all[terms, terms, drop = FALSE])
+
+  if (any(!is.finite(b)) || any(!is.finite(V))) {
+    base$status <- "nonfinite_coef_or_vcov"
+    return(base)
+  }
+
+  qrV <- qr(V)
+  rankV <- qrV$rank
+  if (rankV == 0L) {
+    base$status <- "vcov_rank_zero"
+    return(base)
+  }
+
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(dim(V)) * max(abs(ee$values), 1) * .Machine$double.eps * 100
+  idx <- which(ee$values > tol)
+  if (length(idx) == 0L) {
+    base$status <- "generalized_inverse_failed"
+    return(base)
+  }
+  Q <- ee$vectors[, idx, drop = FALSE]
+  Vinv <- Q %*% diag(1 / ee$values[idx], nrow = length(idx)) %*% t(Q)
+  rankV <- length(idx)
+
+  W <- as.numeric(t(b) %*% Vinv %*% b)
+  p <- stats::pchisq(W, df = rankV, lower.tail = FALSE)
+
+  tibble::tibble(
+    analysis = analysis,
+    outcome = outcome,
+    test = test,
+    statistic = W,
+    df = as.integer(rankV),
+    p_value = p,
+    n_terms = length(terms),
+    matched_terms = paste(terms, collapse = " | "),
+    nobs = safe_nobs(model),
+    status = ifelse(rankV == length(terms), "estimated", "estimated_reduced_rank")
+  )
+}
+
+find_terms_all <- function(model, required_substrings) {
+  if (is.null(model)) return(character(0))
+  nm <- names(stats::coef(model))
+  keep <- rep(TRUE, length(nm))
+  for (s in required_substrings) {
+    keep <- keep & grepl(s, nm, fixed = TRUE)
+  }
+  nm[keep]
+}
+
+choose_one_in_window <- function(data, id_var, time_var, lower, upper, target) {
+  data %>%
+    dplyr::filter(
+      .data[[time_var]] >= lower,
+      .data[[time_var]] <= upper
+    ) %>%
+    dplyr::mutate(.distance_to_target = abs(.data[[time_var]] - target)) %>%
+    dplyr::group_by(.data[[id_var]]) %>%
+    dplyr::arrange(.distance_to_target, .data[[time_var]], .by_group = TRUE) %>%
+    dplyr::slice_head(n = 1L) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-.distance_to_target)
+}
+
+
+empty_match_index <- function() {
+  tibble::tibble(
+    comparison = character(),
+    match_set_id = character(),
+    unit_pidp = character(),
+    unit_episode_id = character(),
+    condition = character(),
+    treated = numeric(),
+    weight = numeric(),
+    n_controls = integer()
+  )
+}
+
+# Robust summary used for both LAT and cohabitation matching.
+# It explicitly returns a zero-match row rather than evaluating min()/max()
+# on an empty treated subset. This prevents Inf/-Inf diagnostic values and
+# makes failed matching immediately visible in the exported summary.
+summarise_match_index <- function(match_index, comparison_label) {
+  if (nrow(match_index) == 0L) {
+    return(tibble::tibble(
+      comparison = comparison_label,
+      matched_sets = 0L,
+      treated_people = 0L,
+      control_people = 0L,
+      median_controls_per_set = NA_real_,
+      min_controls_per_set = NA_integer_,
+      max_controls_per_set = NA_integer_,
+      match_status = "NO_MATCHED_SETS"
+    ))
+  }
+
+  treated_rows <- match_index %>%
+    dplyr::filter(condition == "treated")
+  control_rows <- match_index %>%
+    dplyr::filter(condition == "control")
+
+  if (nrow(treated_rows) == 0L) {
+    return(tibble::tibble(
+      comparison = comparison_label,
+      matched_sets = 0L,
+      treated_people = 0L,
+      control_people = dplyr::n_distinct(control_rows$unit_pidp),
+      median_controls_per_set = NA_real_,
+      min_controls_per_set = NA_integer_,
+      max_controls_per_set = NA_integer_,
+      match_status = "INVALID_NO_TREATED_ROWS"
+    ))
+  }
+
+  controls_per_set <- treated_rows$n_controls
+  controls_per_set <- controls_per_set[!is.na(controls_per_set)]
+
+  tibble::tibble(
+    comparison = comparison_label,
+    matched_sets = dplyr::n_distinct(treated_rows$match_set_id),
+    treated_people = dplyr::n_distinct(treated_rows$unit_pidp),
+    control_people = dplyr::n_distinct(control_rows$unit_pidp),
+    median_controls_per_set = if (length(controls_per_set) > 0L)
+      stats::median(controls_per_set) else NA_real_,
+    min_controls_per_set = if (length(controls_per_set) > 0L)
+      min(controls_per_set) else NA_integer_,
+    max_controls_per_set = if (length(controls_per_set) > 0L)
+      max(controls_per_set) else NA_integer_,
+    match_status = if (nrow(control_rows) == 0L)
+      "INVALID_NO_CONTROL_ROWS" else "MATCHED"
+  )
+}
+
+match_index_condition_audit <- function(match_index, comparison_label) {
+  if (nrow(match_index) == 0L) {
+    return(tibble::tibble(
+      comparison = comparison_label,
+      condition = "NO_ROWS",
+      rows = 0L,
+      people = 0L,
+      matched_sets = 0L
+    ))
+  }
+
+  match_index %>%
+    dplyr::count(condition, name = "rows") %>%
+    dplyr::left_join(
+      match_index %>%
+        dplyr::group_by(condition) %>%
+        dplyr::summarise(
+          people = dplyr::n_distinct(unit_pidp),
+          matched_sets = dplyr::n_distinct(match_set_id),
+          .groups = "drop"
+        ),
+      by = "condition"
+    ) %>%
+    dplyr::mutate(comparison = comparison_label, .before = 1)
+}
+
+build_simple_match_index <- function(
+    event_data,
+    treated_path,
+    control_path,
+    comparison_label,
+    onset_type = c("LAT", "COHAB")
+) {
+  onset_type <- match.arg(onset_type)
+
+  treated <- event_data %>%
+    dplyr::filter(path_group == treated_path) %>%
+    dplyr::arrange(pidp, onset_ym)
+
+  controls <- event_data %>%
+    dplyr::filter(path_group == control_path)
+
+  if (nrow(treated) == 0L || nrow(controls) == 0L) return(empty_match_index())
+
+  tr <- treated %>%
+    dplyr::rename_with(~ paste0("tr_", .x)) %>%
+    dplyr::mutate(match_set_id = paste0(comparison_label, "_", dplyr::row_number()))
+
+  ct <- controls %>% dplyr::rename_with(~ paste0("ct_", .x))
+
+  if (onset_type == "LAT") {
+    candidates <- tr %>%
+      dplyr::inner_join(
+        ct,
+        by = c(
+          "tr_sex" = "ct_sex",
+          "tr_positive_wave" = "ct_positive_wave"
+        ),
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::filter(
+        abs(tr_age - ct_age) <= MATCH_AGE_CALIPER,
+        abs(tr_baseline_month - ct_baseline_month) <= MATCH_BASELINE_MONTH_CALIPER,
+        abs(tr_baseline_to_positive_months - ct_baseline_to_positive_months) <=
+          MATCH_FOLLOWUP_INTERVAL_CALIPER
+      )
+  } else {
+    candidates <- tr %>%
+      dplyr::inner_join(
+        ct,
+        by = c(
+          "tr_sex" = "ct_sex",
+          "tr_baseline_wave" = "ct_baseline_wave"
+        ),
+        relationship = "many-to-many"
+      ) %>%
+      dplyr::filter(
+        abs(tr_age - ct_age) <= MATCH_AGE_CALIPER,
+        abs(tr_onset_ym - ct_onset_ym) <= MATCH_COHAB_START_CALIPER
+      )
+  }
+
+  retained <- candidates %>%
+    dplyr::count(match_set_id, name = "n_controls") %>%
+    dplyr::filter(n_controls >= MIN_CONTROLS_PER_SET)
+
+  candidates <- candidates %>%
+    dplyr::inner_join(retained, by = "match_set_id")
+
+  if (nrow(candidates) == 0L) return(empty_match_index())
+
+  treated_index <- candidates %>%
+    dplyr::distinct(
+      match_set_id,
+      tr_pidp,
+      tr_episode_id,
+      tr_onset_ym,
+      n_controls
+    ) %>%
+    dplyr::transmute(
+      comparison = comparison_label,
+      match_set_id,
+      unit_pidp = tr_pidp,
+      unit_episode_id = tr_episode_id,
+      condition = "treated",
+      treated = 1,
+      weight = 1,
+      n_controls
+    )
+
+  control_index <- candidates %>%
+    dplyr::distinct(
+      match_set_id,
+      ct_pidp,
+      ct_episode_id,
+      ct_onset_ym,
+      n_controls
+    ) %>%
+    dplyr::transmute(
+      comparison = comparison_label,
+      match_set_id,
+      unit_pidp = ct_pidp,
+      unit_episode_id = ct_episode_id,
+      condition = "control",
+      treated = 0,
+      weight = 1 / n_controls,
+      n_controls
+    )
+
+  dplyr::bind_rows(treated_index, control_index)
+}
+
+make_matched_stage_stack <- function(match_index, stage_data) {
+  if (nrow(match_index) == 0L) return(tibble::tibble())
+
+  match_index %>%
+    dplyr::inner_join(
+      stage_data,
+      by = c(
+        "unit_pidp" = "pidp",
+        "unit_episode_id" = "episode_id"
+      ),
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::mutate(
+      match_person_fe = paste(match_set_id, unit_pidp, sep = "__P__"),
+      match_stage_fe = paste(match_set_id, stage, sep = "__S__")
+    )
+}
+
+onset_balance_audit <- function(match_index, event_data, variables, label) {
+  if (nrow(match_index) == 0L) {
+    return(tibble::tibble(
+      comparison = label, variable = variables,
+      mean_abs_set_difference = NA_real_,
+      median_abs_set_difference = NA_real_,
+      max_abs_set_difference = NA_real_,
+      matched_sets = 0L
+    ))
+  }
+
+  dat <- match_index %>%
+    dplyr::inner_join(
+      event_data,
+      by = c(
+        "unit_pidp" = "pidp",
+        "unit_episode_id" = "episode_id"
+      ),
+      relationship = "many-to-one"
+    )
+
+  purrr::map_dfr(variables, function(v) {
+    sm <- dat %>%
+      dplyr::filter(!is.na(.data[[v]])) %>%
+      dplyr::group_by(match_set_id, condition) %>%
+      dplyr::summarise(
+        m = stats::weighted.mean(.data[[v]], w = weight, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      tidyr::pivot_wider(names_from = condition, values_from = m) %>%
+      dplyr::filter(!is.na(treated), !is.na(control)) %>%
+      dplyr::mutate(abs_difference = abs(treated - control))
+
+    tibble::tibble(
+      comparison = label,
+      variable = v,
+      mean_abs_set_difference = if (nrow(sm) == 0L) NA_real_ else mean(sm$abs_difference),
+      median_abs_set_difference = if (nrow(sm) == 0L) NA_real_ else stats::median(sm$abs_difference),
+      max_abs_set_difference = if (nrow(sm) == 0L) NA_real_ else max(sm$abs_difference),
+      matched_sets = nrow(sm)
+    )
+  })
+}
+
+# Matched event-study model. Matched-set x person fixed effects absorb stable
+# unit differences; matched-set x stage fixed effects absorb common stage shocks.
+fit_matched_trajectory_direct <- function(
+    stack,
+    outcome_var,
+    stage_reference,
+    model_name
+) {
+  if (nrow(stack) == 0L || !outcome_var %in% names(stack)) return(NULL)
+
+  dat <- stack %>%
+    dplyr::filter(!is.na(.data[[outcome_var]])) %>%
+    dplyr::mutate(stage = stats::relevel(factor(as.character(stage)), ref = stage_reference))
+
+  if (nrow(dat) == 0L) return(NULL)
+
+  fml <- stats::as.formula(
+    paste0(
+      outcome_var,
+      " ~ i(stage, treated, ref = '", stage_reference,
+      "') | match_person_fe + match_stage_fe"
+    )
+  )
+
+  safe_feols(
+    fml,
+    data = dat,
+    name = model_name,
+    weights = ~weight,
+    vcov = ~unit_pidp
+  )
+}
+
+fit_balanced_target <- function(
+    match_index,
+    stage_data,
+    target_stage,
+    outcome_var,
+    outcome_label,
+    comparison_label,
+    model_stub,
+    reference_stage
+) {
+  two_stage <- stage_data %>%
+    dplyr::filter(stage %in% c(reference_stage, target_stage)) %>%
+    dplyr::filter(!is.na(.data[[outcome_var]]))
+
+  tmp <- match_index %>%
+    dplyr::inner_join(
+      two_stage,
+      by = c(
+        "unit_pidp" = "pidp",
+        "unit_episode_id" = "episode_id"
+      ),
+      relationship = "many-to-many"
+    )
+
+  if (nrow(tmp) == 0L) {
+    empty_result <- extract_term(
+      NULL, NA_character_, comparison_label, outcome_label,
+      paste0(target_stage, " vs ", reference_stage, " differential change")
+    ) %>%
+      dplyr::mutate(
+        target_stage = target_stage,
+        matched_sets = 0L,
+        treated_people = 0L,
+        control_people = 0L
+      )
+    return(list(result = empty_result, model = NULL, sample = tibble::tibble()))
+  }
+
+  availability <- tmp %>%
+    dplyr::distinct(match_set_id, unit_pidp, condition, stage) %>%
+    dplyr::count(match_set_id, unit_pidp, condition, name = "n_stage") %>%
+    dplyr::filter(n_stage == 2L)
+
+  tmp <- tmp %>%
+    dplyr::inner_join(
+      availability %>% dplyr::select(match_set_id, unit_pidp, condition),
+      by = c("match_set_id", "unit_pidp", "condition")
+    )
+
+  # Recalculate the number of outcome-complete controls within each balanced
+  # two-stage matched set. Use distinct names because match_index already carries
+  # an upstream n_controls column; joining another column with the same name would
+  # create n_controls.x/n_controls.y and leave no plain n_controls variable.
+  set_ok <- tmp %>%
+    dplyr::distinct(match_set_id, unit_pidp, condition) %>%
+    dplyr::group_by(match_set_id) %>%
+    dplyr::summarise(
+      n_treated_balanced = sum(condition == "treated"),
+      n_controls_balanced = sum(condition == "control"),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(
+      n_treated_balanced == 1L,
+      n_controls_balanced >= 1L
+    )
+
+  tmp <- tmp %>%
+    dplyr::inner_join(set_ok, by = "match_set_id") %>%
+    dplyr::mutate(
+      weight_balanced = dplyr::if_else(
+        condition == "treated", 1, 1 / n_controls_balanced
+      ),
+      match_person_fe = paste(match_set_id, unit_pidp, sep = "__P__"),
+      match_stage_fe = paste(match_set_id, stage, sep = "__S__"),
+      stage = stats::relevel(factor(as.character(stage)), ref = reference_stage)
+    )
+
+  if (nrow(tmp) == 0L) {
+    empty_result <- extract_term(
+      NULL, NA_character_, comparison_label, outcome_label,
+      paste0(target_stage, " vs ", reference_stage, " differential change")
+    ) %>%
+      dplyr::mutate(
+        target_stage = target_stage,
+        matched_sets = 0L,
+        treated_people = 0L,
+        control_people = 0L
+      )
+    return(list(result = empty_result, model = NULL, sample = tmp))
+  }
+
+  fml <- stats::as.formula(
+    paste0(
+      outcome_var,
+      " ~ i(stage, treated, ref = '", reference_stage,
+      "') | match_person_fe + match_stage_fe"
+    )
+  )
+
+  model <- safe_feols(
+    fml,
+    data = tmp,
+    name = paste0(model_stub, "_", target_stage, "_", outcome_label),
+    weights = ~weight_balanced,
+    vcov = ~unit_pidp
+  )
+
+  result <- extract_first_matching_term(
+    model,
+    required_substrings = c(target_stage),
+    analysis = comparison_label,
+    outcome = outcome_label,
+    contrast = paste0(target_stage, " vs ", reference_stage, " differential change")
+  ) %>%
+    dplyr::mutate(
+      target_stage = target_stage,
+      matched_sets = dplyr::n_distinct(tmp$match_set_id),
+      treated_people = dplyr::n_distinct(tmp$unit_pidp[tmp$condition == "treated"]),
+      control_people = dplyr::n_distinct(tmp$unit_pidp[tmp$condition == "control"])
+    )
+
+  list(result = result, model = model, sample = tmp)
+}
+
+
+# ==============================================================================
+# 2B. IDENTIFIER NORMALIZATION
+# ==============================================================================
+
+# UKHLS pidp is sometimes stored as a labelled/numeric value and sometimes as
+# character in saved analytic objects. All person identifiers are normalized to
+# plain character strings before any joins. For numeric IDs, format(...,
+# scientific = FALSE) avoids scientific notation and preserves the integer-like
+# identifier representation used in the incident-LAT objects.
+id_chr <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (inherits(x, "haven_labelled")) x <- unclass(x)
+  if (is.numeric(x) || is.integer(x)) {
+    return(format(x, scientific = FALSE, trim = TRUE, digits = 22))
+  }
+  as.character(x)
+}
+
+# Normalize categorical codes that are stored as numeric in some upstream RDS
+# objects and as character in others. In the validated v4.1 panel, sex is coded
+# numerically (1/2), whereas the incident-LAT workflow converts it to character.
+# Unclass haven-labelled vectors before conversion so the underlying 1/2 codes are
+# preserved rather than mixing value labels with numeric codes.
+code_chr <- function(x) {
+  if (is.factor(x)) return(as.character(x))
+  if (inherits(x, "haven_labelled")) x <- unclass(x)
+  if (is.numeric(x) || is.integer(x)) {
+    return(format(x, scientific = FALSE, trim = TRUE, digits = 22))
+  }
+  as.character(x)
+}
+
+# ==============================================================================
+# 3. LOAD VALIDATED DATA OBJECTS
+# ==============================================================================
+
+panel <- readRDS(PANEL_RDS)
+ph <- readRDS(PHISTORY_RDS)
+cohab_panel <- readRDS(COHAB_PANEL_RDS)
+incident_events <- readRDS(INCIDENT_EVENTS_RDS)
+incident_treated_stack <- readRDS(INCIDENT_TREATED_STACK_RDS)
+
+# Normalize person identifiers ONCE, before any reconstruction or joins.
+panel <- panel %>%
+  dplyr::mutate(
+    pidp = id_chr(pidp),
+    sex = code_chr(sex)
+  )
+
+ph <- ph %>%
+  dplyr::mutate(pidp = id_chr(pidp))
+
+cohab_panel <- cohab_panel %>%
+  dplyr::mutate(
+    pidp = id_chr(pidp),
+    sex = code_chr(sex)
+  )
+
+# IMPORTANT TIME-ORIGIN HARMONIZATION
+# ---------------------------------
+# The incident-LAT workflow stores month indices in Stata monthly-date units:
+#   (year - 1960) * 12 + (month - 1).
+# The validated v4.1 objects use:
+#   year * 12 + month - 1.
+# Therefore incident month indices must be shifted by exactly 1960 * 12 = 23520
+# before they are compared or combined with v4.1 interview_ym/start_ym variables.
+# Differences measured wholly within the incident workflow are unchanged by this
+# additive shift. The shift is applied once here to every incident absolute-month
+# field used downstream.
+V41_YM_OFFSET_FROM_STATA_MONTH <- 1960L * 12L
+
+incident_events <- incident_events %>%
+  dplyr::mutate(
+    treated_pidp = id_chr(treated_pidp),
+    treated_sex = code_chr(treated_sex),
+    dplyr::across(
+      dplyr::any_of(c("baseline_month", "positive_month", "event_month")),
+      ~ as.numeric(.x) + V41_YM_OFFSET_FROM_STATA_MONTH
+    )
+  )
+
+incident_treated_stack <- incident_treated_stack %>%
+  dplyr::mutate(
+    unit_pidp = id_chr(unit_pidp),
+    sex = code_chr(sex),
+    dplyr::across(
+      dplyr::any_of(c(
+        "interview_month_index", "event_month",
+        "baseline_month", "endpoint_month"
+      )),
+      ~ as.numeric(.x) + V41_YM_OFFSET_FROM_STATA_MONTH
+    )
+  )
+
+required_panel <- c(
+  "pidp", "wave", "wave_n", "interview_ym", "interview_year",
+  "interview_month", "age", "sex", "ghq", "life_satisfaction",
+  "ncrr1", "ncrr11", "ncrr12", "lat_relationship_start_ym"
+)
+
+missing_panel <- setdiff(required_panel, names(panel))
+if (length(missing_panel) > 0L) {
+  stop("v4.1 panel is missing: ", paste(missing_panel, collapse = ", "))
+}
+
+required_ph <- c(
+  "pidp", "status", "start_ym", "end_ym", "start_if", "end_if",
+  "spellno", "partner", "ongoing", "cohend", "next_status",
+  "next_partner", "next_start_ym", "next_start_if", "same_partner_next"
+)
+missing_ph <- setdiff(required_ph, names(ph))
+if (length(missing_ph) > 0L) {
+  stop("v4.1 PHISTORY object is missing: ", paste(missing_ph, collapse = ", "))
+}
+
+required_incident <- c(
+  "match_set_id", "treated_pidp", "baseline_wave", "positive_wave",
+  "baseline_month", "positive_month", "event_month", "treated_age",
+  "treated_sex", "baseline_to_positive_months"
+)
+missing_incident <- setdiff(required_incident, names(incident_events))
+if (length(missing_incident) > 0L) {
+  stop(
+    "incident LAT event object is missing: ",
+    paste(missing_incident, collapse = ", ")
+  )
+}
+
+required_incident_stack <- c(
+  "match_set_id", "unit_pidp", "period", "wave_num",
+  "age", "sex", "interview_month_index",
+  "life_sat", "ghq_wb"
+)
+missing_incident_stack <- setdiff(required_incident_stack, names(incident_treated_stack))
+if (length(missing_incident_stack) > 0L) {
+  stop(
+    "incident treated stack is missing: ",
+    paste(missing_incident_stack, collapse = ", ")
+  )
+}
+
+type_audit <- tibble::tibble(
+  object = c(
+    "panel$pidp",
+    "ph$pidp",
+    "cohab_panel$pidp",
+    "incident_events$treated_pidp",
+    "incident_treated_stack$unit_pidp",
+    "panel$sex",
+    "cohab_panel$sex",
+    "incident_events$treated_sex",
+    "incident_treated_stack$sex"
+  ),
+  storage_class_after_normalization = c(
+    paste(class(panel$pidp), collapse = "/"),
+    paste(class(ph$pidp), collapse = "/"),
+    paste(class(cohab_panel$pidp), collapse = "/"),
+    paste(class(incident_events$treated_pidp), collapse = "/"),
+    paste(class(incident_treated_stack$unit_pidp), collapse = "/"),
+    paste(class(panel$sex), collapse = "/"),
+    paste(class(cohab_panel$sex), collapse = "/"),
+    paste(class(incident_events$treated_sex), collapse = "/"),
+    paste(class(incident_treated_stack$sex), collapse = "/")
+  )
+)
+write_csv_quiet(type_audit, "00b_identifier_and_sex_type_audit.csv", "diagnostics")
+
+# Verify that the two time systems now occupy the same calendar-month scale.
+# A correct harmonization should put both sets of values around 24,000--25,000
+# for contemporary UKHLS interviews rather than leaving an approximately 23,520
+# month offset between them.
+month_origin_audit <- tibble::tibble(
+  object = c(
+    "panel$interview_ym",
+    "incident_events$event_month_harmonized",
+    "incident_events$positive_month_harmonized",
+    "incident_treated_stack$interview_month_index_harmonized"
+  ),
+  min_month = c(
+    suppressWarnings(min(panel$interview_ym, na.rm = TRUE)),
+    suppressWarnings(min(incident_events$event_month, na.rm = TRUE)),
+    suppressWarnings(min(incident_events$positive_month, na.rm = TRUE)),
+    suppressWarnings(min(incident_treated_stack$interview_month_index, na.rm = TRUE))
+  ),
+  median_month = c(
+    suppressWarnings(stats::median(panel$interview_ym, na.rm = TRUE)),
+    suppressWarnings(stats::median(incident_events$event_month, na.rm = TRUE)),
+    suppressWarnings(stats::median(incident_events$positive_month, na.rm = TRUE)),
+    suppressWarnings(stats::median(incident_treated_stack$interview_month_index, na.rm = TRUE))
+  ),
+  max_month = c(
+    suppressWarnings(max(panel$interview_ym, na.rm = TRUE)),
+    suppressWarnings(max(incident_events$event_month, na.rm = TRUE)),
+    suppressWarnings(max(incident_events$positive_month, na.rm = TRUE)),
+    suppressWarnings(max(incident_treated_stack$interview_month_index, na.rm = TRUE))
+  )
+)
+write_csv_quiet(month_origin_audit, "00c_month_origin_harmonization_audit.csv", "diagnostics")
+
+panel <- panel %>%
+  dplyr::mutate(
+    ghq_wb = dplyr::if_else(!is.na(ghq), -ghq, NA_real_),
+    ncrr11_clean = dplyr::if_else(
+      ncrr11 %in% c(1, 2), as.integer(ncrr11), NA_integer_
+    ),
+    ncrr11_intend_yes = dplyr::case_when(
+      ncrr11_clean == 1L ~ 1,
+      ncrr11_clean == 2L ~ 0,
+      TRUE ~ NA_real_
+    ),
+    ncrr12_clean = dplyr::if_else(
+      ncrr12 %in% 1:5, as.integer(ncrr12), NA_integer_
+    ),
+    # Higher score = stronger expectation of marriage.
+    ncrr12_likelihood_score = dplyr::if_else(
+      ncrr12_clean %in% 1:5,
+      6 - as.numeric(ncrr12_clean),
+      NA_real_
+    )
+  )
+
+input_audit <- tibble::tibble(
+  metric = c(
+    "v4.1 panel rows",
+    "v4.1 panel persons",
+    "PHISTORY rows",
+    "cohabitation panel rows",
+    "clean incident LAT events",
+    "incident LAT treated-stack rows",
+    "LAT rows with NCRR11 yes/no",
+    "LAT rows with substantive NCRR12"
+  ),
+  value = c(
+    nrow(panel),
+    dplyr::n_distinct(panel$pidp),
+    nrow(ph),
+    nrow(cohab_panel),
+    nrow(incident_events),
+    nrow(incident_treated_stack),
+    sum(panel$ncrr1 == 1 & !is.na(panel$ncrr11_clean), na.rm = TRUE),
+    sum(panel$ncrr1 == 1 & !is.na(panel$ncrr12_clean), na.rm = TRUE)
+  )
+)
+write_csv_quiet(input_audit, "00_input_audit.csv", "diagnostics")
+
+
+# ==============================================================================
+# 4. RECONSTRUCT OBSERVED LAT EPISODES FROM THE V4.1 PANEL
+# ==============================================================================
+
+valid_ncrr <- panel %>%
+  dplyr::filter(ncrr1 %in% c(1, 2)) %>%
+  dplyr::arrange(pidp, interview_ym, wave_n) %>%
+  dplyr::group_by(pidp) %>%
+  dplyr::mutate(
+    prev_valid_ncrr1 = dplyr::lag(ncrr1),
+    prev_valid_ym = dplyr::lag(interview_ym),
+    prev_valid_lat_start = dplyr::lag(lat_relationship_start_ym),
+    valid_gap = interview_ym - prev_valid_ym,
+    start_date_shift = abs(lat_relationship_start_ym - prev_valid_lat_start),
+    new_lat_episode = ncrr1 == 1 & (
+      is.na(prev_valid_ncrr1) |
+        prev_valid_ncrr1 != 1 |
+        is.na(valid_gap) |
+        valid_gap > MAX_GAP_WITHIN_LAT_EPISODE_MONTHS |
+        (
+          !is.na(lat_relationship_start_ym) &
+            !is.na(prev_valid_lat_start) &
+            start_date_shift > MAX_LAT_START_DATE_SHIFT_MONTHS
+        )
+    ),
+    lat_episode_number = cumsum(dplyr::coalesce(new_lat_episode, FALSE)),
+    lat_episode_id = dplyr::if_else(
+      ncrr1 == 1,
+      paste0(pidp, "_LAT_", lat_episode_number),
+      NA_character_
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    pidp, interview_ym, lat_episode_id, new_lat_episode, start_date_shift,
+    ncrr1
+  )
+
+panel_ep <- panel %>%
+  dplyr::left_join(
+    valid_ncrr %>% dplyr::select(-ncrr1),
+    by = c("pidp", "interview_ym"),
+    relationship = "one-to-one"
+  )
+
+lat_rows <- panel_ep %>%
+  dplyr::filter(ncrr1 == 1, !is.na(lat_episode_id)) %>%
+  dplyr::arrange(pidp, lat_episode_id, interview_ym) %>%
+  dplyr::group_by(lat_episode_id) %>%
+  dplyr::mutate(
+    lat_first_observed_ym = min(interview_ym, na.rm = TRUE),
+    reported_start_median = {
+      z <- lat_relationship_start_ym[!is.na(lat_relationship_start_ym)]
+      if (length(z) == 0L) NA_real_ else stats::median(z)
+    },
+    episode_reference_start_ym = dplyr::if_else(
+      !is.na(reported_start_median) & reported_start_median <= lat_first_observed_ym,
+      reported_start_median,
+      as.numeric(lat_first_observed_ym)
+    ),
+    lat_duration_months = interview_ym - episode_reference_start_ym
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(!is.na(lat_duration_months), lat_duration_months >= 0) %>%
+  dplyr::mutate(lat_row_id = dplyr::row_number())
+
+lat_episode_audit <- lat_rows %>%
+  dplyr::group_by(pidp, lat_episode_id) %>%
+  dplyr::summarise(
+    episode_reference_start_ym = dplyr::first(episode_reference_start_ym),
+    first_lat_interview_ym = min(interview_ym),
+    last_lat_interview_ym = max(interview_ym),
+    n_lat_interviews = dplyr::n(),
+    first_lat_wave = dplyr::first(wave[order(interview_ym)]),
+    first_lat_wave_n = dplyr::first(wave_n[order(interview_ym)]),
+    first_lat_age = dplyr::first(age[order(interview_ym)]),
+    first_lat_sex = dplyr::first(sex[order(interview_ym)]),
+    has_LAT_obs_near_36 = any(
+      lat_duration_months >= STABLE_LAT_MIN_OBSERVED_MONTH &
+        lat_duration_months <= STABLE_LAT_MAX_OBSERVED_MONTH
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(pidp, first_lat_interview_ym) %>%
+  dplyr::group_by(pidp) %>%
+  dplyr::mutate(next_lat_episode_first_ym = dplyr::lead(first_lat_interview_ym)) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(
+  lat_episode_audit %>%
+    dplyr::summarise(
+      lat_episodes = dplyr::n(),
+      people = dplyr::n_distinct(pidp),
+      median_lat_interviews = stats::median(n_lat_interviews),
+      episodes_with_2plus_interviews = sum(n_lat_interviews >= 2),
+      episodes_with_3plus_interviews = sum(n_lat_interviews >= 3)
+    ),
+  "01_LAT_episode_summary.csv",
+  "diagnostics"
+)
+
+# Outcome SDs among all observed LAT rows. Positive values are favorable for
+# both standardized outcomes because GHQ is reversed to well-being.
+lat_ls_sd <- safe_sd(lat_rows$life_satisfaction)
+lat_ghqwb_sd <- safe_sd(lat_rows$ghq_wb)
+lat_ls_mean <- safe_mean(lat_rows$life_satisfaction)
+lat_ghqwb_mean <- safe_mean(lat_rows$ghq_wb)
+
+if (!is.finite(lat_ls_sd) || lat_ls_sd <= 0 ||
+    !is.finite(lat_ghqwb_sd) || lat_ghqwb_sd <= 0) {
+  stop("Could not compute valid LAT psychological outcome SDs.")
+}
+
+lat_rows <- lat_rows %>%
+  dplyr::mutate(
+    ls_z = (life_satisfaction - lat_ls_mean) / lat_ls_sd,
+    ghqwb_z = (ghq_wb - lat_ghqwb_mean) / lat_ghqwb_sd
+  )
+
+write_csv_quiet(
+  tibble::tibble(
+    outcome = c("Life satisfaction", "GHQ well-being (-GHQ12)"),
+    mean = c(lat_ls_mean, lat_ghqwb_mean),
+    sd = c(lat_ls_sd, lat_ghqwb_sd),
+    n = c(
+      sum(!is.na(lat_rows$life_satisfaction)),
+      sum(!is.na(lat_rows$ghq_wb))
+    )
+  ),
+  "02_LAT_outcome_standardization.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 5. LAT EPISODE OUTCOMES WITHIN THE FIXED 36-MONTH HORIZON
+# ==============================================================================
+
+cohab_spells <- ph %>%
+  dplyr::filter(status == 10, !is.na(start_ym), !is.na(end_ym)) %>%
+  dplyr::mutate(
+    relationship_spell_id = paste0(
+      format(pidp, scientific = FALSE, trim = TRUE), "_COHAB_", spellno
+    ),
+    marriage_link_ok =
+      next_status == 2 &
+      (same_partner_next | is.na(partner) | partner <= 0 |
+         is.na(next_partner) | next_partner <= 0),
+    marriage_start_ym = dplyr::if_else(
+      marriage_link_ok, next_start_ym, NA_real_
+    ),
+    marriage_start_if = dplyr::if_else(
+      marriage_link_ok, next_start_if, NA_real_
+    ),
+    spell_outcome = dplyr::case_when(
+      ongoing == 0 & cohend == 1 ~ "breakup",
+      ongoing == 0 & cohend == 2 ~ "marriage",
+      ongoing == 1 ~ "ongoing",
+      TRUE ~ "other"
+    )
+  ) %>%
+  dplyr::transmute(
+    pidp,
+    cohab_spellno = spellno,
+    relationship_spell_id,
+    cohab_partner = partner,
+    cohab_start_ym = start_ym,
+    cohab_end_ym = end_ym,
+    cohab_start_if = start_if,
+    cohab_end_if = end_if,
+    spell_outcome,
+    marriage_start_ym,
+    marriage_start_if
+  )
+
+# Probable LAT -> cohabitation linkage, matching the validated conservative logic.
+lat_cohab_candidates <- lat_episode_audit %>%
+  dplyr::inner_join(cohab_spells, by = "pidp", relationship = "many-to-many") %>%
+  dplyr::mutate(
+    gap_last_lat_to_cohab = cohab_start_ym - last_lat_interview_ym,
+    before_next_observed_lat_episode =
+      is.na(next_lat_episode_first_ym) |
+      cohab_start_ym < next_lat_episode_first_ym
+  ) %>%
+  dplyr::filter(
+    cohab_start_if %in% LAT_COHAB_START_FLAGS,
+    gap_last_lat_to_cohab > 0,
+    gap_last_lat_to_cohab <= LAT_COHAB_MAX_LAST_LAT_GAP,
+    before_next_observed_lat_episode
+  ) %>%
+  dplyr::group_by(pidp, lat_episode_id) %>%
+  dplyr::arrange(cohab_start_ym, cohab_spellno, .by_group = TRUE) %>%
+  dplyr::slice_head(n = 1L) %>%
+  dplyr::ungroup()
+
+# First valid NCRR observation after the episode ends.
+next_valid_after_episode <- lat_episode_audit %>%
+  dplyr::select(
+    pidp, lat_episode_id, first_lat_interview_ym, last_lat_interview_ym
+  ) %>%
+  dplyr::inner_join(
+    panel %>%
+      dplyr::filter(ncrr1 %in% c(1, 2)) %>%
+      dplyr::select(
+        pidp, next_valid_ym = interview_ym,
+        next_valid_ncrr1 = ncrr1,
+        next_valid_wave = wave
+      ),
+    by = "pidp",
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::filter(next_valid_ym > last_lat_interview_ym) %>%
+  dplyr::group_by(lat_episode_id) %>%
+  dplyr::arrange(next_valid_ym, .by_group = TRUE) %>%
+  dplyr::slice_head(n = 1L) %>%
+  dplyr::ungroup()
+
+lat_pathways <- lat_episode_audit %>%
+  dplyr::left_join(
+    lat_cohab_candidates %>%
+      dplyr::select(
+        lat_episode_id,
+        linked_cohab_start_ym = cohab_start_ym,
+        linked_cohab_spell_id = relationship_spell_id,
+        linked_cohab_spell_outcome = spell_outcome,
+        linked_marriage_start_ym = marriage_start_ym,
+        gap_last_lat_to_cohab
+      ),
+    by = "lat_episode_id",
+    relationship = "one-to-one"
+  ) %>%
+  dplyr::left_join(
+    next_valid_after_episode %>%
+      dplyr::select(
+        lat_episode_id, next_valid_ym, next_valid_ncrr1,
+        next_valid_wave
+      ),
+    by = "lat_episode_id",
+    relationship = "one-to-one"
+  ) %>%
+  dplyr::mutate(
+    months_LATstart_to_cohab = linked_cohab_start_ym - episode_reference_start_ym,
+    months_LATstart_to_exit = next_valid_ym - episode_reference_start_ym,
+    observed_LAT_duration_from_start =
+      last_lat_interview_ym - episode_reference_start_ym,
+
+    cohab_within_36 =
+      !is.na(months_LATstart_to_cohab) &
+      months_LATstart_to_cohab > 0 &
+      months_LATstart_to_cohab <= PATHWAY_HORIZON_MONTHS,
+
+    observed_exit_within_36 =
+      !is.na(months_LATstart_to_exit) &
+      months_LATstart_to_exit > 0 &
+      months_LATstart_to_exit <= PATHWAY_HORIZON_MONTHS &
+      next_valid_ncrr1 == 2,
+
+    observed_stable_LAT_near_36 = has_LAT_obs_near_36,
+
+    path_group = dplyr::case_when(
+      cohab_within_36 ~ "future_cohab_36",
+      !cohab_within_36 & observed_exit_within_36 ~ "future_breakup_36",
+      !cohab_within_36 & !observed_exit_within_36 &
+        observed_stable_LAT_near_36 ~ "stable_LAT_36",
+      TRUE ~ "other_or_censored"
+    )
+  )
+
+write_csv_quiet(
+  lat_pathways %>%
+    dplyr::count(path_group, name = "LAT_episodes") %>%
+    dplyr::mutate(percent = 100 * LAT_episodes / sum(LAT_episodes)),
+  "03_LAT_fixed_horizon_pathway_counts.csv",
+  "diagnostics"
+)
+
+write_csv_quiet(
+  lat_pathways %>%
+    dplyr::group_by(path_group) %>%
+    dplyr::summarise(
+      episodes = dplyr::n(),
+      people = dplyr::n_distinct(pidp),
+      median_observed_LAT_months = stats::median(
+        observed_LAT_duration_from_start, na.rm = TRUE
+      ),
+      median_LATstart_to_cohab = stats::median(
+        months_LATstart_to_cohab, na.rm = TRUE
+      ),
+      median_LATstart_to_exit = stats::median(
+        months_LATstart_to_exit, na.rm = TRUE
+      ),
+      .groups = "drop"
+    ),
+  "04_LAT_pathway_timing_audit.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 6. LINK CLEAN INCIDENT LAT EVENTS TO RECONSTRUCTED LAT EPISODES
+# ==============================================================================
+
+incident_episode_candidates <- incident_events %>%
+  dplyr::transmute(
+    match_set_id,
+    pidp = treated_pidp,
+    baseline_wave,
+    positive_wave,
+    baseline_month,
+    positive_month,
+    event_month,
+    age = treated_age,
+    sex = treated_sex,
+    baseline_to_positive_months
+  ) %>%
+  dplyr::inner_join(
+    lat_pathways %>%
+      dplyr::select(
+        pidp, lat_episode_id, episode_reference_start_ym,
+        first_lat_interview_ym, path_group
+      ),
+    by = "pidp",
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::mutate(
+    event_start_difference = abs(event_month - episode_reference_start_ym),
+    positive_interview_difference = abs(positive_month - first_lat_interview_ym)
+  ) %>%
+  dplyr::filter(
+    event_start_difference <= MAX_LAT_START_DATE_SHIFT_MONTHS,
+    positive_interview_difference <= MAX_GAP_WITHIN_LAT_EPISODE_MONTHS
+  ) %>%
+  dplyr::group_by(match_set_id) %>%
+  dplyr::arrange(
+    event_start_difference,
+    positive_interview_difference,
+    .by_group = TRUE
+  ) %>%
+  dplyr::slice_head(n = 1L) %>%
+  dplyr::ungroup()
+
+incident_episode_map <- incident_episode_candidates %>%
+  dplyr::transmute(
+    original_incident_match_set_id = match_set_id,
+    pidp,
+    episode_id = lat_episode_id,
+    onset_ym = episode_reference_start_ym,
+    baseline_wave,
+    positive_wave,
+    baseline_month,
+    positive_month,
+    age,
+    sex,
+    baseline_to_positive_months,
+    path_group,
+    event_start_difference,
+    positive_interview_difference
+  )
+
+incident_link_audit <- tibble::tibble(
+  metric = c(
+    "clean incident LAT events",
+    "incident events linked to reconstructed LAT episode",
+    "incident-link rate percent",
+    "linked future cohabitation within 36m",
+    "linked stable LAT through 36m",
+    "linked future breakup within 36m"
+  ),
+  value = c(
+    nrow(incident_events),
+    nrow(incident_episode_map),
+    100 * nrow(incident_episode_map) / nrow(incident_events),
+    sum(incident_episode_map$path_group == "future_cohab_36"),
+    sum(incident_episode_map$path_group == "stable_LAT_36"),
+    sum(incident_episode_map$path_group == "future_breakup_36")
+  )
+)
+write_csv_quiet(
+  incident_link_audit,
+  "05_incident_LAT_episode_link_audit.csv",
+  "diagnostics"
+)
+
+if (nrow(incident_episode_map) == 0L) {
+  stop(
+    "No clean incident LAT events linked to reconstructed LAT episodes after ",
+    "month-origin harmonization. Inspect diagnostics/00c_month_origin_harmonization_audit.csv ",
+    "and diagnostics/05_incident_LAT_episode_link_audit.csv before interpreting Section A."
+  )
+}
+
+if (nrow(incident_episode_map) / nrow(incident_events) < 0.25) {
+  warning(
+    "Fewer than 25% of clean incident LAT events linked to reconstructed LAT episodes. ",
+    "Section A should be treated as support-limited until the linkage audit is reviewed."
+  )
+}
+
+
+# ==============================================================================
+# 7. BUILD INCIDENT-LAT STAGE DATA: PRE-RELATIONSHIP -> LAT DEVELOPMENT
+# ==============================================================================
+
+# Baseline SDs are calculated at the exact last-unpartnered interview among all
+# clean incident LAT formers, preserving the original incident-LAT scale.
+incident_ls_sd <- incident_treated_stack %>%
+  dplyr::filter(period == "last_unpartnered") %>%
+  dplyr::summarise(sd = safe_sd(life_sat)) %>%
+  dplyr::pull(sd)
+
+incident_ghqwb_sd <- incident_treated_stack %>%
+  dplyr::filter(period == "last_unpartnered") %>%
+  dplyr::summarise(sd = safe_sd(ghq_wb)) %>%
+  dplyr::pull(sd)
+
+if (!is.finite(incident_ls_sd) || incident_ls_sd <= 0 ||
+    !is.finite(incident_ghqwb_sd) || incident_ghqwb_sd <= 0) {
+  stop("Could not recover valid incident-LAT last-unpartnered SDs.")
+}
+
+pre_stage <- incident_treated_stack %>%
+  dplyr::filter(period %in% c("pre25_36", "last_unpartnered", "first_LAT")) %>%
+  dplyr::inner_join(
+    incident_episode_map %>%
+      dplyr::select(
+        original_incident_match_set_id, episode_id, pidp, path_group
+      ),
+    by = c(
+      "match_set_id" = "original_incident_match_set_id",
+      "unit_pidp" = "pidp"
+    ),
+    relationship = "many-to-one"
+  ) %>%
+  dplyr::transmute(
+    pidp = unit_pidp,
+    episode_id,
+    path_group,
+    stage = as.character(period),
+    wave = as.character(wave_num),
+    age,
+    sex = code_chr(sex),
+    life_sat_z = life_sat / incident_ls_sd,
+    ghqwb_z = ghq_wb / incident_ghqwb_sd,
+    observed_ym = interview_month_index
+  )
+
+post_stage <- purrr::map_dfr(seq_len(nrow(LAT_TARGET_WINDOWS)), function(i) {
+  w <- LAT_TARGET_WINDOWS[i, ]
+
+  choose_one_in_window(
+    lat_rows %>%
+      dplyr::inner_join(
+        incident_episode_map %>%
+          dplyr::select(episode_id, pidp, path_group),
+        by = c("lat_episode_id" = "episode_id", "pidp" = "pidp"),
+        relationship = "many-to-one"
+      ),
+    id_var = "lat_episode_id",
+    time_var = "lat_duration_months",
+    lower = w$lower[[1]],
+    upper = w$upper[[1]],
+    target = w$target[[1]]
+  ) %>%
+    dplyr::transmute(
+      pidp,
+      episode_id = lat_episode_id,
+      path_group,
+      stage = w$stage[[1]],
+      wave = as.character(wave_n),
+      age,
+      sex = code_chr(sex),
+      life_sat_z = life_satisfaction / incident_ls_sd,
+      ghqwb_z = ghq_wb / incident_ghqwb_sd,
+      observed_ym = interview_ym
+    )
+})
+
+lat_stage_data <- dplyr::bind_rows(pre_stage, post_stage) %>%
+  dplyr::mutate(
+    stage = factor(stage, levels = LAT_STAGE_ORDER, ordered = TRUE)
+  ) %>%
+  dplyr::arrange(pidp, episode_id, stage)
+
+write_csv_quiet(
+  lat_stage_data %>%
+    dplyr::count(path_group, stage, name = "rows") %>%
+    dplyr::group_by(path_group, stage) %>%
+    dplyr::mutate(people = rows) %>%
+    dplyr::ungroup(),
+  "A00_LAT_pathway_stage_sample_counts.csv",
+  "diagnostics"
+)
+
+write_csv_quiet(
+  lat_stage_data %>%
+    tidyr::pivot_longer(
+      cols = c(life_sat_z, ghqwb_z),
+      names_to = "outcome",
+      values_to = "value_sd"
+    ) %>%
+    dplyr::filter(!is.na(value_sd)) %>%
+    dplyr::group_by(path_group, stage, outcome) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      people = dplyr::n_distinct(pidp),
+      mean_sd = mean(value_sd),
+      sd = stats::sd(value_sd),
+      se = sd / sqrt(n),
+      conf_low = mean_sd - 1.96 * se,
+      conf_high = mean_sd + 1.96 * se,
+      .groups = "drop"
+    ),
+  "A01_LAT_pathway_stage_descriptives.csv"
+)
+
+
+# ==============================================================================
+# 8. PRIMARY MATCHED LAT-PATHWAY TRAJECTORY: FUTURE COHAB VS STABLE LAT
+# ==============================================================================
+
+lat_match_event_data <- incident_episode_map %>%
+  dplyr::transmute(
+    pidp,
+    episode_id,
+    onset_ym,
+    path_group,
+    positive_wave,
+    baseline_wave,
+    baseline_month,
+    positive_month,
+    age,
+    sex,
+    baseline_to_positive_months
+  )
+
+A_cohab_match_index <- build_simple_match_index(
+  lat_match_event_data,
+  treated_path = "future_cohab_36",
+  control_path = "stable_LAT_36",
+  comparison_label = "LAT_future_cohab_vs_stable36",
+  onset_type = "LAT"
+)
+
+A_breakup_match_index <- build_simple_match_index(
+  lat_match_event_data,
+  treated_path = "future_breakup_36",
+  control_path = "stable_LAT_36",
+  comparison_label = "LAT_future_breakup_vs_stable36",
+  onset_type = "LAT"
+)
+
+A_match_summary <- dplyr::bind_rows(
+  summarise_match_index(
+    A_cohab_match_index,
+    "LAT_future_cohab_vs_stable36"
+  ),
+  summarise_match_index(
+    A_breakup_match_index,
+    "LAT_future_breakup_vs_stable36"
+  )
+)
+write_csv_quiet(A_match_summary, "A02_LAT_pathway_matching_summary.csv", "diagnostics")
+
+A_match_condition_audit <- dplyr::bind_rows(
+  match_index_condition_audit(
+    A_cohab_match_index,
+    "LAT_future_cohab_vs_stable36"
+  ),
+  match_index_condition_audit(
+    A_breakup_match_index,
+    "LAT_future_breakup_vs_stable36"
+  )
+)
+write_csv_quiet(
+  A_match_condition_audit,
+  "A02c_LAT_pathway_match_condition_audit.csv",
+  "diagnostics"
+)
+
+A_onset_balance <- dplyr::bind_rows(
+  onset_balance_audit(
+    A_cohab_match_index, lat_match_event_data,
+    c("age", "baseline_month", "baseline_to_positive_months", "onset_ym"),
+    "LAT future cohabitation vs stable LAT"
+  ),
+  onset_balance_audit(
+    A_breakup_match_index, lat_match_event_data,
+    c("age", "baseline_month", "baseline_to_positive_months", "onset_ym"),
+    "LAT future breakup vs stable LAT"
+  )
+)
+write_csv_quiet(A_onset_balance, "A02b_LAT_pathway_onset_balance.csv", "diagnostics")
+
+A_cohab_stack <- make_matched_stage_stack(A_cohab_match_index, lat_stage_data)
+A_breakup_stack <- make_matched_stage_stack(A_breakup_match_index, lat_stage_data)
+
+A_LS_COHAB <- fit_matched_trajectory_direct(
+  A_cohab_stack,
+  "life_sat_z",
+  "first_LAT",
+  "A_LAT_future_cohab_vs_stable_LS"
+)
+
+A_GHQ_COHAB <- fit_matched_trajectory_direct(
+  A_cohab_stack,
+  "ghqwb_z",
+  "first_LAT",
+  "A_LAT_future_cohab_vs_stable_GHQwb"
+)
+
+A_LS_BREAKUP <- fit_matched_trajectory_direct(
+  A_breakup_stack,
+  "life_sat_z",
+  "first_LAT",
+  "A_LAT_future_breakup_vs_stable_LS"
+)
+
+A_GHQ_BREAKUP <- fit_matched_trajectory_direct(
+  A_breakup_stack,
+  "ghqwb_z",
+  "first_LAT",
+  "A_LAT_future_breakup_vs_stable_GHQwb"
+)
+
+# Joint post-LAT divergence tests. first_LAT is the reference.
+A_joint_tests <- dplyr::bind_rows(
+  wald_terms(
+    A_LS_COHAB,
+    c(
+      find_terms_all(A_LS_COHAB, c("LAT_12_23")),
+      find_terms_all(A_LS_COHAB, c("LAT_24_35"))
+    ) %>% unique(),
+    "LAT future cohabitation vs stable LAT",
+    "Life satisfaction",
+    "Joint post-LAT differential trajectory: 12-35 months"
+  ),
+  wald_terms(
+    A_GHQ_COHAB,
+    c(
+      find_terms_all(A_GHQ_COHAB, c("LAT_12_23")),
+      find_terms_all(A_GHQ_COHAB, c("LAT_24_35"))
+    ) %>% unique(),
+    "LAT future cohabitation vs stable LAT",
+    "GHQ well-being (-GHQ12)",
+    "Joint post-LAT differential trajectory: 12-35 months"
+  ),
+  wald_terms(
+    A_LS_BREAKUP,
+    c(
+      find_terms_all(A_LS_BREAKUP, c("LAT_12_23")),
+      find_terms_all(A_LS_BREAKUP, c("LAT_24_35"))
+    ) %>% unique(),
+    "LAT future breakup vs stable LAT",
+    "Life satisfaction",
+    "Joint post-LAT differential trajectory: 12-35 months"
+  ),
+  wald_terms(
+    A_GHQ_BREAKUP,
+    c(
+      find_terms_all(A_GHQ_BREAKUP, c("LAT_12_23")),
+      find_terms_all(A_GHQ_BREAKUP, c("LAT_24_35"))
+    ) %>% unique(),
+    "LAT future breakup vs stable LAT",
+    "GHQ well-being (-GHQ12)",
+    "Joint post-LAT differential trajectory: 12-35 months"
+  )
+) %>%
+  dplyr::group_by(analysis) %>%
+  dplyr::mutate(p_holm_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(A_joint_tests, "A03_LAT_pathway_joint_postformation_tests.csv")
+
+# Pre-LAT/formation diagnostic: do the future pathways already differ in change
+# before or across formation relative to first_LAT?
+A_pre_tests <- dplyr::bind_rows(
+  wald_terms(
+    A_LS_COHAB,
+    c(
+      find_terms_all(A_LS_COHAB, c("pre25_36")),
+      find_terms_all(A_LS_COHAB, c("last_unpartnered"))
+    ) %>% unique(),
+    "LAT future cohabitation vs stable LAT",
+    "Life satisfaction",
+    "Joint pre-LAT/formation differential trajectory"
+  ),
+  wald_terms(
+    A_GHQ_COHAB,
+    c(
+      find_terms_all(A_GHQ_COHAB, c("pre25_36")),
+      find_terms_all(A_GHQ_COHAB, c("last_unpartnered"))
+    ) %>% unique(),
+    "LAT future cohabitation vs stable LAT",
+    "GHQ well-being (-GHQ12)",
+    "Joint pre-LAT/formation differential trajectory"
+  )
+) %>%
+  dplyr::mutate(p_holm_2_outcomes = p.adjust(p_value, method = "holm"))
+
+write_csv_quiet(A_pre_tests, "A04_LAT_pathway_preformation_diagnostic_tests.csv")
+
+
+# ==============================================================================
+# 9. BALANCED LAT TARGET-BIN SENSITIVITIES
+# ==============================================================================
+
+A_balanced_results <- list()
+
+for (target_stage in c("LAT_12_23", "LAT_24_35")) {
+  for (outcome in c("life_sat_z", "ghqwb_z")) {
+    outcome_label <- ifelse(
+      outcome == "life_sat_z",
+      "Life satisfaction",
+      "GHQ well-being (-GHQ12)"
+    )
+
+    res <- fit_balanced_target(
+      match_index = A_cohab_match_index,
+      stage_data = lat_stage_data,
+      target_stage = target_stage,
+      outcome_var = outcome,
+      outcome_label = outcome_label,
+      comparison_label = "LAT future cohabitation vs stable LAT",
+      model_stub = "A_BAL_LAT_future_cohab_vs_stable",
+      reference_stage = "first_LAT"
+    )
+
+    A_balanced_results[[paste(target_stage, outcome, sep = "_")]] <- res$result
+  }
+}
+
+A_balanced_table <- dplyr::bind_rows(A_balanced_results) %>%
+  dplyr::group_by(target_stage) %>%
+  dplyr::mutate(p_holm_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(A_balanced_table, "A05_LAT_balanced_target_bin_sensitivities.csv")
+
+
+# ==============================================================================
+# 10. NCRR11 CHANGE -> SUBSEQUENT PSYCHOLOGICAL CHANGE
+# ==============================================================================
+
+lat_subjective <- lat_rows %>%
+  dplyr::arrange(lat_episode_id, interview_ym) %>%
+  dplyr::group_by(lat_episode_id) %>%
+  dplyr::mutate(
+    prev_interview_ym = dplyr::lag(interview_ym),
+    next_interview_ym = dplyr::lead(interview_ym),
+    prev_gap = interview_ym - prev_interview_ym,
+    next_gap = next_interview_ym - interview_ym,
+
+    prev_ncrr11 = dplyr::lag(ncrr11_intend_yes),
+    next_ncrr11 = dplyr::lead(ncrr11_intend_yes),
+    delta_ncrr11 = dplyr::if_else(
+      !is.na(ncrr11_intend_yes) & !is.na(prev_ncrr11) &
+        prev_gap >= PSYCH_MIN_GAP_MONTHS & prev_gap <= PSYCH_MAX_GAP_MONTHS,
+      ncrr11_intend_yes - prev_ncrr11,
+      NA_real_
+    ),
+
+    next_ls = dplyr::lead(life_satisfaction),
+    next_ghqwb = dplyr::lead(ghq_wb),
+    next_ls_change_z = dplyr::if_else(
+      !is.na(life_satisfaction) & !is.na(next_ls) &
+        next_gap >= PSYCH_MIN_GAP_MONTHS & next_gap <= PSYCH_MAX_GAP_MONTHS,
+      (next_ls - life_satisfaction) / lat_ls_sd,
+      NA_real_
+    ),
+    next_ghqwb_change_z = dplyr::if_else(
+      !is.na(ghq_wb) & !is.na(next_ghqwb) &
+        next_gap >= PSYCH_MIN_GAP_MONTHS & next_gap <= PSYCH_MAX_GAP_MONTHS,
+      (next_ghqwb - ghq_wb) / lat_ghqwb_sd,
+      NA_real_
+    ),
+
+    ncrr11_switch = dplyr::case_when(
+      prev_ncrr11 == 0 & ncrr11_intend_yes == 1 ~ "no_to_yes",
+      prev_ncrr11 == 1 & ncrr11_intend_yes == 0 ~ "yes_to_no",
+      prev_ncrr11 == 0 & ncrr11_intend_yes == 0 ~ "stable_no",
+      prev_ncrr11 == 1 & ncrr11_intend_yes == 1 ~ "stable_yes",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::ungroup()
+
+B_ncrr11_audit <- lat_subjective %>%
+  dplyr::filter(!is.na(ncrr11_intend_yes)) %>%
+  dplyr::group_by(lat_episode_id) %>%
+  dplyr::summarise(
+    pidp = dplyr::first(pidp),
+    n_ncrr11 = dplyr::n(),
+    n_distinct_ncrr11 = dplyr::n_distinct(ncrr11_intend_yes),
+    has_upward_switch = any(delta_ncrr11 == 1, na.rm = TRUE),
+    has_downward_switch = any(delta_ncrr11 == -1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::summarise(
+    episodes = dplyr::n(),
+    people = dplyr::n_distinct(pidp),
+    episodes_2plus = sum(n_ncrr11 >= 2),
+    episodes_3plus = sum(n_ncrr11 >= 3),
+    episodes_with_any_change = sum(n_distinct_ncrr11 >= 2),
+    episodes_with_upward_switch = sum(has_upward_switch),
+    episodes_with_downward_switch = sum(has_downward_switch)
+  )
+write_csv_quiet(B_ncrr11_audit, "B00_NCRR11_change_variation_audit.csv", "diagnostics")
+
+write_csv_quiet(
+  lat_subjective %>%
+    dplyr::filter(!is.na(ncrr11_switch)) %>%
+    dplyr::count(ncrr11_switch, name = "rows"),
+  "B01_NCRR11_switch_pattern_counts.csv",
+  "diagnostics"
+)
+
+B_change_analysis_counts <- dplyr::bind_rows(
+  lat_subjective %>%
+    dplyr::filter(!is.na(delta_ncrr11), !is.na(next_ls_change_z)) %>%
+    dplyr::summarise(
+      outcome = "Life satisfaction", rows = dplyr::n(),
+      episodes = dplyr::n_distinct(lat_episode_id),
+      people = dplyr::n_distinct(pidp),
+      upward = sum(delta_ncrr11 > 0), zero = sum(delta_ncrr11 == 0),
+      downward = sum(delta_ncrr11 < 0)
+    ),
+  lat_subjective %>%
+    dplyr::filter(!is.na(delta_ncrr11), !is.na(next_ghqwb_change_z)) %>%
+    dplyr::summarise(
+      outcome = "GHQ well-being (-GHQ12)", rows = dplyr::n(),
+      episodes = dplyr::n_distinct(lat_episode_id),
+      people = dplyr::n_distinct(pidp),
+      upward = sum(delta_ncrr11 > 0), zero = sum(delta_ncrr11 == 0),
+      downward = sum(delta_ncrr11 < 0)
+    )
+)
+write_csv_quiet(B_change_analysis_counts, "B01b_NCRR11_change_analysis_counts.csv", "diagnostics")
+
+B_ls_change <- safe_feols(
+  next_ls_change_z ~
+    delta_ncrr11 + ncrr11_intend_yes + ls_z +
+    splines::ns(lat_duration_months, df = 3) |
+    lat_episode_id + wave,
+  data = lat_subjective %>%
+    dplyr::filter(!is.na(delta_ncrr11), !is.na(next_ls_change_z)),
+  name = "B_NCRR11_change_to_next_LS_change",
+  vcov = ~pidp
+)
+
+B_ghq_change <- safe_feols(
+  next_ghqwb_change_z ~
+    delta_ncrr11 + ncrr11_intend_yes + ghqwb_z +
+    splines::ns(lat_duration_months, df = 3) |
+    lat_episode_id + wave,
+  data = lat_subjective %>%
+    dplyr::filter(!is.na(delta_ncrr11), !is.na(next_ghqwb_change_z)),
+  name = "B_NCRR11_change_to_next_GHQwb_change",
+  vcov = ~pidp
+)
+
+# Sensitivity without current NCRR11 level, in case level/change collinearity is
+# consequential in the switcher-only identifying sample.
+B_ls_change_nolevel <- safe_feols(
+  next_ls_change_z ~
+    delta_ncrr11 + ls_z + splines::ns(lat_duration_months, df = 3) |
+    lat_episode_id + wave,
+  data = lat_subjective %>%
+    dplyr::filter(!is.na(delta_ncrr11), !is.na(next_ls_change_z)),
+  name = "B_NCRR11_change_to_next_LS_change_no_current_intention",
+  vcov = ~pidp
+)
+
+B_ghq_change_nolevel <- safe_feols(
+  next_ghqwb_change_z ~
+    delta_ncrr11 + ghqwb_z + splines::ns(lat_duration_months, df = 3) |
+    lat_episode_id + wave,
+  data = lat_subjective %>%
+    dplyr::filter(!is.na(delta_ncrr11), !is.na(next_ghqwb_change_z)),
+  name = "B_NCRR11_change_to_next_GHQwb_change_no_current_intention",
+  vcov = ~pidp
+)
+
+B_results <- dplyr::bind_rows(
+  extract_term(
+    B_ls_change, "delta_ncrr11",
+    "NCRR11 strengthening -> subsequent psychological change",
+    "Life satisfaction",
+    "Preferred: +1 shift toward intending cohabitation"
+  ) %>% dplyr::mutate(specification = "preferred + current intention level"),
+  extract_term(
+    B_ghq_change, "delta_ncrr11",
+    "NCRR11 strengthening -> subsequent psychological change",
+    "GHQ well-being (-GHQ12)",
+    "Preferred: +1 shift toward intending cohabitation"
+  ) %>% dplyr::mutate(specification = "preferred + current intention level"),
+  extract_term(
+    B_ls_change_nolevel, "delta_ncrr11",
+    "NCRR11 strengthening -> subsequent psychological change",
+    "Life satisfaction",
+    "Sensitivity: +1 shift toward intending cohabitation"
+  ) %>% dplyr::mutate(specification = "sensitivity without current intention level"),
+  extract_term(
+    B_ghq_change_nolevel, "delta_ncrr11",
+    "NCRR11 strengthening -> subsequent psychological change",
+    "GHQ well-being (-GHQ12)",
+    "Sensitivity: +1 shift toward intending cohabitation"
+  ) %>% dplyr::mutate(specification = "sensitivity without current intention level")
+) %>%
+  dplyr::group_by(specification) %>%
+  dplyr::mutate(p_holm_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(B_results, "B02_NCRR11_change_to_next_psychological_change.csv")
+
+
+# ==============================================================================
+# 11. NCRR12 VARIATION AUDIT AND CHANGE-IN-EXPECTATION MODEL
+# ==============================================================================
+
+ncrr12_rows <- lat_subjective %>%
+  dplyr::filter(!is.na(ncrr12_clean)) %>%
+  dplyr::arrange(lat_episode_id, interview_ym) %>%
+  dplyr::group_by(lat_episode_id) %>%
+  dplyr::mutate(
+    prev_ncrr12_ym = dplyr::lag(interview_ym),
+    ncrr12_prev_gap = interview_ym - prev_ncrr12_ym,
+    prev_ncrr12_score = dplyr::lag(ncrr12_likelihood_score),
+    prev_ncrr12_category = dplyr::lag(ncrr12_clean),
+    delta_ncrr12_likelihood = dplyr::if_else(
+      !is.na(ncrr12_likelihood_score) & !is.na(prev_ncrr12_score) &
+        ncrr12_prev_gap >= PSYCH_MIN_GAP_MONTHS &
+        ncrr12_prev_gap <= PSYCH_MAX_GAP_MONTHS,
+      ncrr12_likelihood_score - prev_ncrr12_score,
+      NA_real_
+    )
+  ) %>%
+  dplyr::ungroup()
+
+ncrr12_score_mean <- safe_mean(ncrr12_rows$ncrr12_likelihood_score)
+ncrr12_score_sd <- safe_sd(ncrr12_rows$ncrr12_likelihood_score)
+if (!is.finite(ncrr12_score_sd) || ncrr12_score_sd <= 0) {
+  stop("Could not compute a valid NCRR12 likelihood-score SD.")
+}
+
+ncrr12_rows <- ncrr12_rows %>%
+  dplyr::mutate(
+    ncrr12_score_z =
+      (ncrr12_likelihood_score - ncrr12_score_mean) / ncrr12_score_sd
+  )
+
+C_episode_audit <- ncrr12_rows %>%
+  dplyr::group_by(lat_episode_id) %>%
+  dplyr::summarise(
+    pidp = dplyr::first(pidp),
+    n_ncrr12 = dplyr::n(),
+    n_distinct_ncrr12 = dplyr::n_distinct(ncrr12_clean),
+    any_change = n_distinct_ncrr12 >= 2,
+    any_strengthening = any(delta_ncrr12_likelihood > 0, na.rm = TRUE),
+    any_weakening = any(delta_ncrr12_likelihood < 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::summarise(
+    episodes = dplyr::n(),
+    people = dplyr::n_distinct(pidp),
+    episodes_2plus = sum(n_ncrr12 >= 2),
+    episodes_3plus = sum(n_ncrr12 >= 3),
+    episodes_with_change = sum(any_change),
+    pct_episodes_with_change = 100 * mean(any_change),
+    episodes_with_strengthening = sum(any_strengthening),
+    episodes_with_weakening = sum(any_weakening)
+  )
+write_csv_quiet(C_episode_audit, "C00_NCRR12_within_LAT_variation_audit.csv", "diagnostics")
+
+C_transition_matrix <- ncrr12_rows %>%
+  dplyr::filter(
+    !is.na(prev_ncrr12_category),
+    !is.na(ncrr12_clean),
+    ncrr12_prev_gap >= PSYCH_MIN_GAP_MONTHS,
+    ncrr12_prev_gap <= PSYCH_MAX_GAP_MONTHS
+  ) %>%
+  dplyr::count(
+    prev_ncrr12_category,
+    ncrr12_clean,
+    name = "transitions"
+  ) %>%
+  dplyr::arrange(prev_ncrr12_category, ncrr12_clean)
+write_csv_quiet(C_transition_matrix, "C01_NCRR12_transition_matrix.csv", "diagnostics")
+
+C_change_distribution <- ncrr12_rows %>%
+  dplyr::filter(!is.na(delta_ncrr12_likelihood)) %>%
+  dplyr::count(delta_ncrr12_likelihood, name = "rows") %>%
+  dplyr::arrange(delta_ncrr12_likelihood)
+write_csv_quiet(C_change_distribution, "C02_NCRR12_change_distribution.csv", "diagnostics")
+
+C_change_analysis_counts <- dplyr::bind_rows(
+  ncrr12_rows %>%
+    dplyr::filter(!is.na(delta_ncrr12_likelihood), !is.na(next_ls_change_z)) %>%
+    dplyr::summarise(
+      outcome = "Life satisfaction", rows = dplyr::n(),
+      episodes = dplyr::n_distinct(lat_episode_id),
+      people = dplyr::n_distinct(pidp),
+      strengthening = sum(delta_ncrr12_likelihood > 0),
+      unchanged = sum(delta_ncrr12_likelihood == 0),
+      weakening = sum(delta_ncrr12_likelihood < 0)
+    ),
+  ncrr12_rows %>%
+    dplyr::filter(!is.na(delta_ncrr12_likelihood), !is.na(next_ghqwb_change_z)) %>%
+    dplyr::summarise(
+      outcome = "GHQ well-being (-GHQ12)", rows = dplyr::n(),
+      episodes = dplyr::n_distinct(lat_episode_id),
+      people = dplyr::n_distinct(pidp),
+      strengthening = sum(delta_ncrr12_likelihood > 0),
+      unchanged = sum(delta_ncrr12_likelihood == 0),
+      weakening = sum(delta_ncrr12_likelihood < 0)
+    )
+)
+write_csv_quiet(C_change_analysis_counts, "C02b_NCRR12_change_analysis_counts.csv", "diagnostics")
+
+C_ls_change <- safe_feols(
+  next_ls_change_z ~
+    delta_ncrr12_likelihood + ncrr12_score_z + ls_z +
+    splines::ns(lat_duration_months, df = 3) |
+    lat_episode_id + wave,
+  data = ncrr12_rows %>%
+    dplyr::filter(
+      !is.na(delta_ncrr12_likelihood),
+      !is.na(next_ls_change_z)
+    ),
+  name = "C_NCRR12_change_to_next_LS_change",
+  vcov = ~pidp
+)
+
+C_ghq_change <- safe_feols(
+  next_ghqwb_change_z ~
+    delta_ncrr12_likelihood + ncrr12_score_z + ghqwb_z +
+    splines::ns(lat_duration_months, df = 3) |
+    lat_episode_id + wave,
+  data = ncrr12_rows %>%
+    dplyr::filter(
+      !is.na(delta_ncrr12_likelihood),
+      !is.na(next_ghqwb_change_z)
+    ),
+  name = "C_NCRR12_change_to_next_GHQwb_change",
+  vcov = ~pidp
+)
+
+# Static ordinal level models are included only to connect the new change test
+# to the earlier level-based NCRR12 analyses.
+C_ls_level <- safe_feols(
+  next_ls_change_z ~
+    ncrr12_score_z + ls_z + splines::ns(lat_duration_months, df = 3) |
+    lat_episode_id + wave,
+  data = ncrr12_rows %>% dplyr::filter(!is.na(next_ls_change_z)),
+  name = "C_NCRR12_level_to_next_LS_change",
+  vcov = ~pidp
+)
+
+C_ghq_level <- safe_feols(
+  next_ghqwb_change_z ~
+    ncrr12_score_z + ghqwb_z + splines::ns(lat_duration_months, df = 3) |
+    lat_episode_id + wave,
+  data = ncrr12_rows %>% dplyr::filter(!is.na(next_ghqwb_change_z)),
+  name = "C_NCRR12_level_to_next_GHQwb_change",
+  vcov = ~pidp
+)
+
+C_results <- dplyr::bind_rows(
+  extract_term(
+    C_ls_change, "delta_ncrr12_likelihood",
+    "NCRR12 strengthening -> subsequent psychological change",
+    "Life satisfaction",
+    "+1 increase in marriage-likelihood score"
+  ) %>% dplyr::mutate(specification = "change in expectation"),
+  extract_term(
+    C_ghq_change, "delta_ncrr12_likelihood",
+    "NCRR12 strengthening -> subsequent psychological change",
+    "GHQ well-being (-GHQ12)",
+    "+1 increase in marriage-likelihood score"
+  ) %>% dplyr::mutate(specification = "change in expectation"),
+  extract_term(
+    C_ls_level, "ncrr12_score_z",
+    "NCRR12 level -> subsequent psychological change",
+    "Life satisfaction",
+    "1-SD higher current marriage likelihood"
+  ) %>% dplyr::mutate(specification = "current expectation level"),
+  extract_term(
+    C_ghq_level, "ncrr12_score_z",
+    "NCRR12 level -> subsequent psychological change",
+    "GHQ well-being (-GHQ12)",
+    "1-SD higher current marriage likelihood"
+  ) %>% dplyr::mutate(specification = "current expectation level")
+) %>%
+  dplyr::group_by(specification) %>%
+  dplyr::mutate(p_holm_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(C_results, "C03_NCRR12_change_and_level_to_next_psychological_change.csv")
+
+# Exploratory construct-validity sensitivity among LAT episodes conservatively
+# linked to a subsequent cohabitation spell. Outcome is whether that linked
+# cohabitation spell is observed to progress to marriage. This is NOT a complete
+# same-partner marriage construct-validity test for all LAT relationships.
+C_construct_rows <- ncrr12_rows %>%
+  dplyr::inner_join(
+    lat_pathways %>%
+      dplyr::filter(!is.na(linked_cohab_spell_id)) %>%
+      dplyr::select(
+        lat_episode_id,
+        linked_cohab_spell_outcome,
+        linked_marriage_start_ym
+      ),
+    by = "lat_episode_id",
+    relationship = "many-to-one"
+  ) %>%
+  dplyr::mutate(
+    linked_cohab_later_married = dplyr::case_when(
+      linked_cohab_spell_outcome == "marriage" ~ 1,
+      linked_cohab_spell_outcome %in% c("breakup", "ongoing") ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+C_construct_model <- safe_feglm(
+  linked_cohab_later_married ~
+    ncrr12_score_z + splines::ns(lat_duration_months, df = 3) +
+    age + i(sex) | wave,
+  data = C_construct_rows %>%
+    dplyr::filter(!is.na(linked_cohab_later_married)),
+  family = "binomial",
+  name = "C_NCRR12_level_predicts_marriage_via_linked_cohab",
+  vcov = ~pidp
+)
+
+C_construct_result <- extract_term(
+  C_construct_model,
+  "ncrr12_score_z",
+  "NCRR12 construct-validity sensitivity",
+  "Observed marriage after probable LAT -> cohabitation linkage",
+  "1-SD higher LAT marriage expectation"
+) %>%
+  dplyr::mutate(
+    odds_ratio = exp(estimate),
+    or_conf_low = exp(conf_low),
+    or_conf_high = exp(conf_high),
+    caution = paste(
+      "Exploratory: restricted to LAT episodes conservatively linked to",
+      "cohabitation; does not capture all direct or unlinked marriages."
+    )
+  )
+write_csv_quiet(C_construct_result, "C04_NCRR12_construct_validity_sensitivity.csv")
+
+
+# ==============================================================================
+# 12. FIXED-HORIZON MARRIAGE PATHWAYS FROM COHABITATION ONSET
+# ==============================================================================
+
+required_cohab <- c(
+  "pidp", "wave", "interview_ym", "relationship_spell_id",
+  "ambiguous_active_cohab", "cohab_duration_months", "cohab_start_ym",
+  "cohab_end_ym", "spell_outcome", "marriage_start_ym",
+  "age", "sex", "ghq", "life_satisfaction"
+)
+missing_cohab <- setdiff(required_cohab, names(cohab_panel))
+if (length(missing_cohab) > 0L) {
+  stop(
+    "cohabitation panel is missing variables required for fixed-horizon analysis: ",
+    paste(missing_cohab, collapse = ", ")
+  )
+}
+
+cohab_primary <- cohab_panel %>%
+  dplyr::filter(!ambiguous_active_cohab) %>%
+  dplyr::mutate(
+    ghq_wb = dplyr::if_else(!is.na(ghq), -ghq, NA_real_),
+    marriage_age_months = marriage_start_ym - cohab_start_ym,
+    end_age_months = cohab_end_ym - cohab_start_ym
+  )
+
+cohab_spell_path <- cohab_primary %>%
+  dplyr::group_by(pidp, relationship_spell_id) %>%
+  dplyr::summarise(
+    cohab_start_ym = dplyr::first(cohab_start_ym),
+    cohab_end_ym = dplyr::first(cohab_end_ym),
+    spell_outcome = dplyr::first(spell_outcome),
+    marriage_start_ym = dplyr::first(marriage_start_ym),
+    marriage_age_months = dplyr::first(marriage_age_months),
+    end_age_months = dplyr::first(end_age_months),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    path_group = dplyr::case_when(
+      spell_outcome == "marriage" &
+        !is.na(marriage_age_months) &
+        marriage_age_months > 0 &
+        marriage_age_months <= PATHWAY_HORIZON_MONTHS ~ "future_marriage_36",
+
+      spell_outcome == "breakup" &
+        !is.na(end_age_months) &
+        end_age_months > 0 &
+        end_age_months <= PATHWAY_HORIZON_MONTHS ~ "future_breakup_36",
+
+      !is.na(end_age_months) &
+        end_age_months >= PATHWAY_HORIZON_MONTHS &
+        (
+          is.na(marriage_age_months) |
+            marriage_age_months > PATHWAY_HORIZON_MONTHS
+        ) ~ "stable_cohab_36",
+
+      TRUE ~ "other_or_censored"
+    )
+  )
+
+write_csv_quiet(
+  cohab_spell_path %>%
+    dplyr::count(path_group, name = "cohabitation_spells") %>%
+    dplyr::mutate(percent = 100 * cohabitation_spells / sum(cohabitation_spells)),
+  "D00_cohabitation_fixed_horizon_pathway_counts.csv",
+  "diagnostics"
+)
+
+# Standardize with the pooled primary cohabitation support. Positive is favorable.
+cohab_ls_sd <- safe_sd(cohab_primary$life_satisfaction)
+cohab_ghqwb_sd <- safe_sd(cohab_primary$ghq_wb)
+
+if (!is.finite(cohab_ls_sd) || cohab_ls_sd <= 0 ||
+    !is.finite(cohab_ghqwb_sd) || cohab_ghqwb_sd <= 0) {
+  stop("Could not compute valid cohabitation psychological outcome SDs.")
+}
+
+cohab_primary <- cohab_primary %>%
+  dplyr::inner_join(
+    cohab_spell_path %>%
+      dplyr::select(pidp, relationship_spell_id, path_group),
+    by = c("pidp", "relationship_spell_id"),
+    relationship = "many-to-one"
+  )
+
+cohab_stage_data <- purrr::map_dfr(seq_len(nrow(COHAB_STAGE_WINDOWS)), function(i) {
+  w <- COHAB_STAGE_WINDOWS[i, ]
+
+  choose_one_in_window(
+    cohab_primary,
+    id_var = "relationship_spell_id",
+    time_var = "cohab_duration_months",
+    lower = w$lower[[1]],
+    upper = w$upper[[1]],
+    target = w$target[[1]]
+  ) %>%
+    dplyr::transmute(
+      pidp,
+      episode_id = relationship_spell_id,
+      path_group,
+      stage = w$stage[[1]],
+      wave = as.character(wave),
+      wave_raw = wave,
+      observed_ym = interview_ym,
+      onset_ym = cohab_start_ym,
+      age,
+      sex = code_chr(sex),
+      life_sat_z = life_satisfaction / cohab_ls_sd,
+      ghqwb_z = ghq_wb / cohab_ghqwb_sd
+    )
+}) %>%
+  dplyr::mutate(
+    stage = factor(stage, levels = COHAB_STAGE_ORDER, ordered = TRUE)
+  )
+
+write_csv_quiet(
+  cohab_stage_data %>%
+    dplyr::count(path_group, stage, name = "rows"),
+  "D01_marriage_pathway_stage_sample_counts.csv",
+  "diagnostics"
+)
+
+cohab_onset_events <- cohab_stage_data %>%
+  dplyr::filter(stage == "COHAB_0_11") %>%
+  dplyr::transmute(
+    pidp,
+    episode_id,
+    onset_ym,
+    path_group,
+    baseline_wave = wave,
+    age,
+    sex,
+    baseline_month = observed_ym,
+    positive_wave = baseline_wave,
+    baseline_to_positive_months = 0
+  )
+
+D_marriage_match_index <- build_simple_match_index(
+  cohab_onset_events,
+  treated_path = "future_marriage_36",
+  control_path = "stable_cohab_36",
+  comparison_label = "COHAB_future_marriage_vs_stable36",
+  onset_type = "COHAB"
+)
+
+D_breakup_match_index <- build_simple_match_index(
+  cohab_onset_events,
+  treated_path = "future_breakup_36",
+  control_path = "stable_cohab_36",
+  comparison_label = "COHAB_future_breakup_vs_stable36",
+  onset_type = "COHAB"
+)
+
+D_match_summary <- dplyr::bind_rows(
+  summarise_match_index(
+    D_marriage_match_index,
+    "COHAB_future_marriage_vs_stable36"
+  ),
+  summarise_match_index(
+    D_breakup_match_index,
+    "COHAB_future_breakup_vs_stable36"
+  )
+)
+write_csv_quiet(D_match_summary, "D02_marriage_pathway_matching_summary.csv", "diagnostics")
+
+D_match_condition_audit <- dplyr::bind_rows(
+  match_index_condition_audit(
+    D_marriage_match_index,
+    "COHAB_future_marriage_vs_stable36"
+  ),
+  match_index_condition_audit(
+    D_breakup_match_index,
+    "COHAB_future_breakup_vs_stable36"
+  )
+)
+write_csv_quiet(
+  D_match_condition_audit,
+  "D02c_marriage_pathway_match_condition_audit.csv",
+  "diagnostics"
+)
+
+D_onset_balance <- dplyr::bind_rows(
+  onset_balance_audit(
+    D_marriage_match_index, cohab_onset_events,
+    c("age", "onset_ym"),
+    "Cohabitation future marriage vs stable cohabitation"
+  ),
+  onset_balance_audit(
+    D_breakup_match_index, cohab_onset_events,
+    c("age", "onset_ym"),
+    "Cohabitation future breakup vs stable cohabitation"
+  )
+)
+write_csv_quiet(D_onset_balance, "D02b_marriage_pathway_onset_balance.csv", "diagnostics")
+
+D_marriage_stack <- make_matched_stage_stack(D_marriage_match_index, cohab_stage_data)
+D_breakup_stack <- make_matched_stage_stack(D_breakup_match_index, cohab_stage_data)
+
+D_LS_MARRIAGE <- fit_matched_trajectory_direct(
+  D_marriage_stack,
+  "life_sat_z",
+  "COHAB_0_11",
+  "D_COHAB_future_marriage_vs_stable_LS"
+)
+
+D_GHQ_MARRIAGE <- fit_matched_trajectory_direct(
+  D_marriage_stack,
+  "ghqwb_z",
+  "COHAB_0_11",
+  "D_COHAB_future_marriage_vs_stable_GHQwb"
+)
+
+D_LS_BREAKUP <- fit_matched_trajectory_direct(
+  D_breakup_stack,
+  "life_sat_z",
+  "COHAB_0_11",
+  "D_COHAB_future_breakup_vs_stable_LS"
+)
+
+D_GHQ_BREAKUP <- fit_matched_trajectory_direct(
+  D_breakup_stack,
+  "ghqwb_z",
+  "COHAB_0_11",
+  "D_COHAB_future_breakup_vs_stable_GHQwb"
+)
+
+D_joint_tests <- dplyr::bind_rows(
+  wald_terms(
+    D_LS_MARRIAGE,
+    c(
+      find_terms_all(D_LS_MARRIAGE, c("COHAB_12_23")),
+      find_terms_all(D_LS_MARRIAGE, c("COHAB_24_35"))
+    ) %>% unique(),
+    "Cohabitation future marriage vs stable cohabitation",
+    "Life satisfaction",
+    "Joint post-cohabitation differential trajectory: 12-35 months"
+  ),
+  wald_terms(
+    D_GHQ_MARRIAGE,
+    c(
+      find_terms_all(D_GHQ_MARRIAGE, c("COHAB_12_23")),
+      find_terms_all(D_GHQ_MARRIAGE, c("COHAB_24_35"))
+    ) %>% unique(),
+    "Cohabitation future marriage vs stable cohabitation",
+    "GHQ well-being (-GHQ12)",
+    "Joint post-cohabitation differential trajectory: 12-35 months"
+  ),
+  wald_terms(
+    D_LS_BREAKUP,
+    c(
+      find_terms_all(D_LS_BREAKUP, c("COHAB_12_23")),
+      find_terms_all(D_LS_BREAKUP, c("COHAB_24_35"))
+    ) %>% unique(),
+    "Cohabitation future breakup vs stable cohabitation",
+    "Life satisfaction",
+    "Joint post-cohabitation differential trajectory: 12-35 months"
+  ),
+  wald_terms(
+    D_GHQ_BREAKUP,
+    c(
+      find_terms_all(D_GHQ_BREAKUP, c("COHAB_12_23")),
+      find_terms_all(D_GHQ_BREAKUP, c("COHAB_24_35"))
+    ) %>% unique(),
+    "Cohabitation future breakup vs stable cohabitation",
+    "GHQ well-being (-GHQ12)",
+    "Joint post-cohabitation differential trajectory: 12-35 months"
+  )
+) %>%
+  dplyr::group_by(analysis) %>%
+  dplyr::mutate(p_holm_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(D_joint_tests, "D03_marriage_pathway_joint_trajectory_tests.csv")
+
+
+# ==============================================================================
+# 13. BALANCED MARRIAGE TARGET-BIN SENSITIVITIES
+# ==============================================================================
+
+D_balanced_results <- list()
+
+for (target_stage in c("COHAB_12_23", "COHAB_24_35")) {
+  for (outcome in c("life_sat_z", "ghqwb_z")) {
+    outcome_label <- ifelse(
+      outcome == "life_sat_z",
+      "Life satisfaction",
+      "GHQ well-being (-GHQ12)"
+    )
+
+    res <- fit_balanced_target(
+      match_index = D_marriage_match_index,
+      stage_data = cohab_stage_data,
+      target_stage = target_stage,
+      outcome_var = outcome,
+      outcome_label = outcome_label,
+      comparison_label = "Cohabitation future marriage vs stable cohabitation",
+      model_stub = "D_BAL_COHAB_future_marriage_vs_stable",
+      reference_stage = "COHAB_0_11"
+    )
+
+    D_balanced_results[[paste(target_stage, outcome, sep = "_")]] <- res$result
+  }
+}
+
+D_balanced_table <- dplyr::bind_rows(D_balanced_results) %>%
+  dplyr::group_by(target_stage) %>%
+  dplyr::mutate(p_holm_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(D_balanced_table, "D04_marriage_balanced_target_bin_sensitivities.csv")
+
+
+# ==============================================================================
+# 14. KEY SYNTHESIS TABLE
+# ==============================================================================
+
+key_synthesis <- dplyr::bind_rows(
+  A_joint_tests %>%
+    dplyr::filter(analysis == "LAT future cohabitation vs stable LAT") %>%
+    dplyr::transmute(
+      evidence_family = "Pathway-based cohabitation anticipation",
+      test,
+      outcome,
+      estimate = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value,
+      adjusted_p = p_holm_2_outcomes,
+      status
+    ),
+
+  A_balanced_table %>%
+    dplyr::transmute(
+      evidence_family = "Balanced cohabitation pathway sensitivity",
+      test = paste0(target_stage, " differential change"),
+      outcome,
+      estimate,
+      conf_low,
+      conf_high,
+      p_value,
+      adjusted_p = p_holm_2_outcomes,
+      status
+    ),
+
+  B_results %>%
+    dplyr::filter(specification == "preferred + current intention level") %>%
+    dplyr::transmute(
+      evidence_family = "Subjective cohabitation anticipation: NCRR11 change",
+      test = contrast,
+      outcome,
+      estimate,
+      conf_low,
+      conf_high,
+      p_value,
+      adjusted_p = p_holm_2_outcomes,
+      status
+    ),
+
+  C_results %>%
+    dplyr::filter(specification == "change in expectation") %>%
+    dplyr::transmute(
+      evidence_family = "Subjective marriage anticipation: NCRR12 change during LAT",
+      test = contrast,
+      outcome,
+      estimate,
+      conf_low,
+      conf_high,
+      p_value,
+      adjusted_p = p_holm_2_outcomes,
+      status
+    ),
+
+  D_joint_tests %>%
+    dplyr::filter(
+      analysis == "Cohabitation future marriage vs stable cohabitation"
+    ) %>%
+    dplyr::transmute(
+      evidence_family = "Pathway-based marriage anticipation",
+      test,
+      outcome,
+      estimate = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value,
+      adjusted_p = p_holm_2_outcomes,
+      status
+    ),
+
+  D_balanced_table %>%
+    dplyr::transmute(
+      evidence_family = "Balanced marriage pathway sensitivity",
+      test = paste0(target_stage, " differential change"),
+      outcome,
+      estimate,
+      conf_low,
+      conf_high,
+      p_value,
+      adjusted_p = p_holm_2_outcomes,
+      status
+    )
+)
+
+write_csv_quiet(key_synthesis, "Z00_KEY_pathway_based_anticipation_results.csv")
+
+
+# ==============================================================================
+# 15. INTERPRETATION GUIDE
+# ==============================================================================
+
+interpretation_guide <- tibble::tribble(
+  ~pattern, ~preferred_interpretation,
+
+  "No pre-LAT differential trajectory, but favorable post-LAT divergence for future cohabiters",
+  paste(
+    "Pattern consistent with a transition-bound process emerging after formation",
+    "of the nonresidential relationship; anticipation is one plausible mechanism."
+  ),
+
+  "Future cohabiters already differ in pre-LAT or formation change",
+  paste(
+    "Dynamic selection or early relationship-specific differentiation precedes",
+    "the period in which pathway-based anticipation could be isolated."
+  ),
+
+  "Future cohabiters and stable LAT controls show similar post-LAT change",
+  paste(
+    "Little evidence for a systematic average transition-bound psychological",
+    "anticipation effect of later cohabitation."
+  ),
+
+  "Future breakup relationships deteriorate while future cohabiters do not",
+  paste(
+    "A progressor-vs-nonprogressor contrast must not be attributed to anticipation",
+    "if it is primarily driven by deterioration before dissolution."
+  ),
+
+  "NCRR11 strengthens and predicts subsequent favorable psychological change",
+  paste(
+    "Convergent subjective evidence consistent with cohabitation anticipation,",
+    "provided the intention item also retains behavioral validity."
+  ),
+
+  "NCRR11 predicts cohabitation but NCRR11 change does not predict psychology",
+  paste(
+    "Intention is behaviorally meaningful, but there is little evidence that",
+    "strengthening intention itself is accompanied by psychological improvement."
+  ),
+
+  "NCRR12 strengthens and predicts subsequent favorable psychological change during LAT",
+  paste(
+    "Earlier-stage subjective evidence consistent with marriage anticipation",
+    "before coresidence; this is not a cohabiter-specific anticipation test."
+  ),
+
+  "No post-cohabitation divergence for future marriers vs stable cohabiters",
+  paste(
+    "Little evidence for a systematic average marriage-bound psychological",
+    "anticipation trajectory after cohabitation onset."
+  ),
+
+  "Post-cohabitation divergence plus NCRR12 change evidence",
+  paste(
+    "Strongest cross-stage convergence consistent with marriage anticipation,",
+    "although observational relationship development remains an alternative."
+  )
+)
+
+write_csv_quiet(interpretation_guide, "Z01_interpretation_guide.csv")
+
+
+# ==============================================================================
+# 16. OUTPUT CHECK AND SESSION INFORMATION
+# ==============================================================================
+
+expected_outputs <- c(
+  "diagnostics/00_input_audit.csv",
+    "diagnostics/00c_month_origin_harmonization_audit.csv",
+  "diagnostics/03_LAT_fixed_horizon_pathway_counts.csv",
+  "diagnostics/05_incident_LAT_episode_link_audit.csv",
+  "diagnostics/A02_LAT_pathway_matching_summary.csv",
+  "tables/A03_LAT_pathway_joint_postformation_tests.csv",
+  "tables/A04_LAT_pathway_preformation_diagnostic_tests.csv",
+  "tables/A05_LAT_balanced_target_bin_sensitivities.csv",
+  "diagnostics/B00_NCRR11_change_variation_audit.csv",
+  "tables/B02_NCRR11_change_to_next_psychological_change.csv",
+  "diagnostics/C00_NCRR12_within_LAT_variation_audit.csv",
+  "diagnostics/C01_NCRR12_transition_matrix.csv",
+  "tables/C03_NCRR12_change_and_level_to_next_psychological_change.csv",
+  "diagnostics/D00_cohabitation_fixed_horizon_pathway_counts.csv",
+  "diagnostics/D02_marriage_pathway_matching_summary.csv",
+  "tables/D03_marriage_pathway_joint_trajectory_tests.csv",
+  "tables/D04_marriage_balanced_target_bin_sensitivities.csv",
+  "tables/Z00_KEY_pathway_based_anticipation_results.csv"
+)
+
+output_check <- tibble::tibble(
+  file = expected_outputs,
+  exists = file.exists(file.path(OUT_DIR, expected_outputs))
+)
+write_csv_quiet(output_check, "98_output_check.csv", "diagnostics")
+
+capture.output(
+  sessionInfo(),
+  file = file.path(OUT_DIR, "diagnostics", "99_sessionInfo.txt")
+)
+
+write_txt(
+  c(
+    "UKHLS PATHWAY-BASED ANTICIPATION ADD-ON V1.2 (PIDP TYPE FIX)",
+    "",
+    paste0("V4.1 input directory: ", normalizePath(V41_OUT_DIR, winslash = "/", mustWork = FALSE)),
+    paste0("Incident LAT directory: ", normalizePath(INCIDENT_LAT_DIR, winslash = "/", mustWork = FALSE)),
+    paste0("Output directory: ", normalizePath(OUT_DIR, winslash = "/", mustWork = FALSE)),
+    "",
+    "PRIMARY PATHWAY TESTS:",
+    "A: incident LAT future cohabitation within 36m vs stable LAT through 36m.",
+    "D: cohabitation future marriage within 36m vs stable cohabitation through 36m.",
+    "",
+    "SUBJECTIVE TRIANGULATION:",
+    "B: within-LAT NCRR11 strengthening -> subsequent psychological change.",
+    "C: within-LAT NCRR12 strengthening -> subsequent psychological change.",
+    "",
+    "INTERPRETATION:",
+    "Pathway divergence is consistent with transition-bound development/anticipation",
+    "but is not a causal anticipation effect. NCRR12 is LAT-stage marriage expectation,",
+    "not a cohabiter-specific marriage-expectation measure."
+  ),
+  "00_READ_ME_FIRST.txt",
+  "diagnostics"
+)
+
+cat("\n============================================================\n")
+cat("PATHWAY-BASED ANTICIPATION ADD-ON V1.2 COMPLETE\n")
+cat("Results directory:\n", OUT_DIR, "\n")
+cat("============================================================\n\n")
+################################################################################

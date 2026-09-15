@@ -1,0 +1,221 @@
+################################################################################
+# TABLE S2 POST-ESTIMATION REPRODUCTION
+# Reads the four saved primary relationship-age trajectory models and reproduces
+# Table S2 Panels A, B, and D without refitting any model.
+################################################################################
+
+if (!requireNamespace("fixest", quietly = TRUE)) stop("Please install: fixest")
+
+OUT_DIR <- file.path(getwd(), "UKHLS_REVISED_selection_development_proximity_v4_2")
+MODEL_DIR <- file.path(OUT_DIR, "models")
+TABLE_DIR <- file.path(OUT_DIR, "tables")
+DIAG_DIR <- file.path(OUT_DIR, "diagnostics")
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIAG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+bins <- c("12-23", "24-35", "36-59", "60-83", "84-119", "120-179")
+stub <- gsub("-", "_", bins, fixed = TRUE)
+dur_terms <- paste0("dur_", stub)
+mar_terms <- paste0("marriage_x_", stub)
+brk_terms <- paste0("breakup_x_", stub)
+
+spec <- data.frame(
+  outcome = c("GHQ distress", "Life satisfaction", "RDAS satisfaction", "RDAS cohesion"),
+  domain = c("Psychological functioning", "Psychological functioning",
+             "Relationship quality", "Relationship quality"),
+  file = c("C1_GHQ_relationship_age_trajectory.rds",
+           "C1_LS_relationship_age_trajectory.rds",
+           "C2_RDAS_satisfaction_relationship_age_trajectory.rds",
+           "C2_RDAS_cohesion_relationship_age_trajectory.rds"),
+  stringsAsFactors = FALSE
+)
+
+read_model <- function(file) {
+  path <- file.path(MODEL_DIR, file)
+  if (!file.exists(path)) stop("Missing saved model: ", path)
+  readRDS(path)
+}
+models <- setNames(lapply(spec$file, read_model), spec$outcome)
+
+need_terms <- c(dur_terms, mar_terms, brk_terms)
+for (nm in names(models)) {
+  miss <- setdiff(need_terms, names(stats::coef(models[[nm]])))
+  if (length(miss)) stop(nm, " is missing: ", paste(miss, collapse = ", "))
+}
+
+write_csv <- function(x, path) utils::write.csv(x, path, row.names = FALSE, na = "")
+
+# ---------- helpers -----------------------------------------------------------
+term_row <- function(m, term) {
+  b <- stats::coef(m); s <- fixest::se(m); p <- fixest::pvalue(m); ci <- stats::confint(m)
+  c(estimate = unname(b[term]), std_error = unname(s[term]),
+    conf_low = unname(ci[term, 1]), conf_high = unname(ci[term, 2]),
+    p_value = unname(p[term]))
+}
+
+sym_pinv <- function(V) {
+  ee <- eigen(V, symmetric = TRUE)
+  tol <- max(1, nrow(V)) * max(max(abs(ee$values)), 1) * .Machine$double.eps * 100
+  keep <- which(ee$values > tol)
+  if (!length(keep)) stop("Constraint covariance matrix has rank zero")
+  Q <- ee$vectors[, keep, drop = FALSE]
+  list(inv = Q %*% diag(1 / ee$values[keep], nrow = length(keep)) %*% t(Q),
+       rank = length(keep))
+}
+
+wald_zero <- function(m, terms) {
+  b <- stats::coef(m)[terms]
+  V <- stats::vcov(m)[terms, terms, drop = FALSE]
+  z <- sym_pinv(V)
+  stat <- as.numeric(t(b) %*% z$inv %*% b)
+  c(chi_square = stat, df = z$rank,
+    p_value = stats::pchisq(stat, df = z$rank, lower.tail = FALSE))
+}
+
+lincon <- function(m, plus, minus) {
+  b <- stats::coef(m); V <- stats::vcov(m)
+  est <- unname(b[plus] - b[minus])
+  vv <- unname(V[plus, plus] + V[minus, minus] - 2 * V[plus, minus])
+  se <- sqrt(vv); z <- est / se
+  c(estimate = est, std_error = se, conf_low = est - 1.96 * se,
+    conf_high = est + 1.96 * se, z = z,
+    p_value = 2 * stats::pnorm(abs(z), lower.tail = FALSE))
+}
+
+wald_differences <- function(m) {
+  b <- stats::coef(m); V <- stats::vcov(m); p <- length(b)
+  R <- matrix(0, nrow = length(bins), ncol = p, dimnames = list(bins, names(b)))
+  for (j in seq_along(bins)) {
+    R[j, mar_terms[j]] <- 1
+    R[j, brk_terms[j]] <- -1
+  }
+  d <- as.numeric(R %*% b)
+  S <- R %*% V %*% t(R)
+  q <- sym_pinv(S)
+  stat <- as.numeric(t(d) %*% q$inv %*% d)
+  c(chi_square = stat, df = q$rank,
+    p_value = stats::pchisq(stat, df = q$rank, lower.tail = FALSE))
+}
+
+# ---------- Panel A: complete primary trajectory coefficients ----------------
+panel_A <- do.call(rbind, lapply(seq_along(bins), function(j) {
+  do.call(rbind, lapply(spec$outcome, function(out) {
+    m <- models[[out]]
+    d <- term_row(m, dur_terms[j]); ma <- term_row(m, mar_terms[j]); br <- term_row(m, brk_terms[j])
+    data.frame(
+      duration_months = bins[j], outcome = out,
+      duration_estimate = d["estimate"], duration_se = d["std_error"],
+      duration_conf_low = d["conf_low"], duration_conf_high = d["conf_high"], duration_p = d["p_value"],
+      marriage_estimate = ma["estimate"], marriage_se = ma["std_error"],
+      marriage_conf_low = ma["conf_low"], marriage_conf_high = ma["conf_high"], marriage_p = ma["p_value"],
+      dissolution_estimate = br["estimate"], dissolution_se = br["std_error"],
+      dissolution_conf_low = br["conf_low"], dissolution_conf_high = br["conf_high"], dissolution_p = br["p_value"],
+      stringsAsFactors = FALSE
+    )
+  }))
+}))
+write_csv(panel_A, file.path(TABLE_DIR, "S2A_relationship_age_trajectory_coefficients.csv"))
+
+# ---------- Panel B: six-df omnibus trajectory tests --------------------------
+panel_B <- do.call(rbind, lapply(seq_len(nrow(spec)), function(i) {
+  m <- models[[spec$outcome[i]]]
+  wm <- wald_zero(m, mar_terms); wb <- wald_zero(m, brk_terms)
+  rbind(
+    data.frame(outcome = spec$outcome[i], domain = spec$domain[i],
+               interaction_family = "Marriage vs continuing cohabitation",
+               chi_square = wm["chi_square"], df = wm["df"], p_value = wm["p_value"]),
+    data.frame(outcome = spec$outcome[i], domain = spec$domain[i],
+               interaction_family = "Dissolution vs continuing cohabitation",
+               chi_square = wb["chi_square"], df = wb["df"], p_value = wb["p_value"])
+  )
+}))
+panel_B$holm_p <- NA_real_
+for (d in unique(panel_B$domain)) {
+  ii <- panel_B$domain == d
+  panel_B$holm_p[ii] <- stats::p.adjust(panel_B$p_value[ii], method = "holm")
+}
+write_csv(panel_B, file.path(TABLE_DIR, "S2B_relationship_age_omnibus_tests.csv"))
+
+# ---------- Panel D: marriage-minus-dissolution psychological contrasts -------
+psych <- c("GHQ distress", "Life satisfaction")
+panel_D <- do.call(rbind, lapply(psych, function(out) {
+  m <- models[[out]]
+  do.call(rbind, lapply(seq_along(bins), function(j) {
+    x <- lincon(m, mar_terms[j], brk_terms[j])
+    data.frame(outcome = out, duration_months = bins[j],
+               estimate = x["estimate"], std_error = x["std_error"],
+               conf_low = x["conf_low"], conf_high = x["conf_high"],
+               z = x["z"], p_value = x["p_value"], stringsAsFactors = FALSE)
+  }))
+}))
+panel_D$holm_p <- NA_real_
+for (out in psych) {
+  ii <- panel_D$outcome == out
+  panel_D$holm_p[ii] <- stats::p.adjust(panel_D$p_value[ii], method = "holm")
+}
+write_csv(panel_D, file.path(TABLE_DIR, "S2D_marriage_minus_dissolution_duration_contrasts.csv"))
+
+panel_D_omnibus <- do.call(rbind, lapply(psych, function(out) {
+  x <- wald_differences(models[[out]])
+  data.frame(outcome = out, chi_square = x["chi_square"], df = x["df"], p_value = x["p_value"])
+}))
+panel_D_omnibus$holm_p <- stats::p.adjust(panel_D_omnibus$p_value, method = "holm")
+write_csv(panel_D_omnibus, file.path(TABLE_DIR, "S2D_marriage_minus_dissolution_omnibus.csv"))
+
+# ---------- published-value verification (rounded as displayed in Table S2) --
+verify <- data.frame(item = character(), computed = numeric(), published = numeric(),
+                     digits = integer(), pass = logical(), stringsAsFactors = FALSE)
+add_check <- function(item, computed, published, digits) {
+  data.frame(item = item, computed = computed, published = published, digits = digits,
+             pass = isTRUE(all.equal(round(computed, digits), published,
+                                     tolerance = 10^(-(digits + 1)))),
+             stringsAsFactors = FALSE)
+}
+
+pub_B <- data.frame(
+  outcome = c("GHQ distress", "GHQ distress", "Life satisfaction", "Life satisfaction",
+              "RDAS satisfaction", "RDAS satisfaction", "RDAS cohesion", "RDAS cohesion"),
+  interaction_family = rep(c("Marriage vs continuing cohabitation",
+                             "Dissolution vs continuing cohabitation"), 4),
+  published = c(5.94, 13.55, 10.03, 2.27, 26.92, 12.15, 13.92, 2.24),
+  stringsAsFactors = FALSE
+)
+for (i in seq_len(nrow(pub_B))) {
+  z <- panel_B[panel_B$outcome == pub_B$outcome[i] &
+                 panel_B$interaction_family == pub_B$interaction_family[i], ]
+  verify <- rbind(verify, add_check(
+    paste0("Panel B: ", pub_B$outcome[i], " / ", pub_B$interaction_family[i]),
+    z$chi_square, pub_B$published[i], 2L))
+}
+
+pub_D <- data.frame(
+  outcome = rep(psych, each = 6), duration_months = rep(bins, 2),
+  published = c(0.003, 0.118, 0.006, 0.037, -0.085, -0.119,
+                0.044, 0.041, 0.077, 0.151, 0.080, 0.245),
+  stringsAsFactors = FALSE
+)
+for (i in seq_len(nrow(pub_D))) {
+  z <- panel_D[panel_D$outcome == pub_D$outcome[i] &
+                 panel_D$duration_months == pub_D$duration_months[i], ]
+  verify <- rbind(verify, add_check(
+    paste0("Panel D contrast: ", pub_D$outcome[i], " / ", pub_D$duration_months[i]),
+    z$estimate, pub_D$published[i], 3L))
+}
+
+pub_D_omni <- c("GHQ distress" = 12.317, "Life satisfaction" = 8.389)
+for (out in names(pub_D_omni)) {
+  z <- panel_D_omnibus[panel_D_omnibus$outcome == out, ]
+  verify <- rbind(verify, add_check(
+    paste0("Panel D omnibus: ", out), z$chi_square, pub_D_omni[[out]], 3L))
+}
+write_csv(verify, file.path(DIAG_DIR, "S2_postestimation_validation.csv"))
+
+if (any(!verify$pass)) {
+  bad <- verify[!verify$pass, ]
+  stop("Table S2 validation failed for: ", paste(bad$item, collapse = " | "),
+       ". Inspect diagnostics/S2_postestimation_validation.csv")
+}
+
+cat("\nTable S2 Panels A, B, and D reproduced and validated successfully.\n")
+cat("Outputs: ", normalizePath(TABLE_DIR, winslash = "/", mustWork = FALSE), "\n", sep = "")
+################################################################################

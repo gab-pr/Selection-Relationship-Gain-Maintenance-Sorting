@@ -1,0 +1,5779 @@
+################################################################################
+# UKHLS H1 PSYCHOLOGICAL SELECTION
+# FINAL WAVE-ADJUSTED STABLE-TRAIT / WPVS DECOMPOSITION
+# Version 1.0
+#
+# PURPOSE
+# -------
+# Definitive second-stage H1 analysis using the wave-adjusted model-based
+# decomposition produced by:
+#
+#   UKHLS_latent_stable_WPVS_final_measurement_stage_v2_1_WAVECENTERED_AGEFIX.R.txt
+#
+# The psychological predictors are:
+#
+#   1. stable_score_SD
+#      Model-based stable between-person psychological component.
+#
+#   2. current_wpvs_SD
+#      Current within-person variability score (WPVS) at the clean-unpartnered
+#      baseline, conditional on the stable component.
+#
+# Both are expressed in units of the SAME outcome-specific raw current-score SD
+# by the measurement-stage workflow.
+#
+# PRIMARY HISTORY SPECIFICATION
+# -----------------------------
+# T = 4:
+#   current clean-unpartnered baseline + 3 immediately preceding UKHLS waves.
+#
+# HISTORY-LENGTH SENSITIVITIES
+# ----------------------------
+# T = 5 and T = 6.
+#
+# H1 DESIGN A: INCIDENT LAT FORMATION
+# -----------------------------------
+# Reuses the VALIDATED incident-LAT matched risk sets.
+# A matched conditional-logistic model is fit separately for:
+#   - life satisfaction
+#   - favorable-oriented GHQ / lower psychological distress
+#
+# Model:
+#
+#   incident LAT ~ stable component + current WPVS
+#                  + strata(matched set) + respondent-clustered robust SE
+#
+# Matched sets are pruned AFTER score eligibility so every retained set contains
+# exactly one incident-LAT case and at least one eligible control.
+#
+# H1 DESIGN B: SUBSEQUENT COHABITATION / MARRIAGE
+# ------------------------------------------------
+# Reuses the already validated NON-OVERLAPPING clean-unpartnered episode
+# construction. For each episode and psychological measure, this script selects
+# the FIRST clean-unpartnered landmark with an available latent T-specific score.
+#
+# Thus the latent analysis does NOT merely retain the old >=2-prior baseline:
+# if that earlier baseline lacks a latent score but a later clean landmark in the
+# same episode has one, the later FIRST LATENT-SCORE-ELIGIBLE landmark becomes the
+# baseline. Outcomes are then reconstructed prospectively from that new baseline.
+#
+# Endpoints:
+#   A. Cohabitation
+#      Cause-specific Cox model. Marriage before or in the same recorded month as
+#      cohabitation is treated as a competing event and ends the risk interval.
+#
+#   B. Marriage
+#      First subsequent marriage. Cohabitation is allowed as an intermediate
+#      state and does not censor follow-up.
+#
+#   C. Cohabitation or marriage
+#      First occurrence of either state.
+#
+# Primary Cox specification:
+#   stable component + current WPVS
+#   + age + age^2 + sex
+#   + recurrent-episode indicator
+#   + flexible adjustment for baseline delay within clean-unpartnered episode
+#   + baseline-calendar-year strata
+#   + respondent-clustered robust sandwich SE
+#
+# Time scale:
+#   months since the selected psychological baseline.
+#
+# PRIMARY MULTIPLICITY
+# --------------------
+# The two H1 designs retain the manuscript's separate inferential families:
+#
+# Incident LAT:
+#   2 outcomes x 2 components = 4 primary coefficient tests.
+#   Holm correction across 4.
+#   Two 2-df joint tests (one per psychological outcome), Holm across 2.
+#
+# Cox transition models:
+#   3 endpoints x 2 outcomes x 2 components = 12 primary coefficient tests.
+#   Holm correction across 12.
+#   Six 2-df joint tests, Holm across 6.
+#
+# T=5 and T=6 are sensitivity families and receive the same within-design Holm
+# correction separately at each T.
+#
+# INTERPRETATION
+# --------------
+# Higher predictor values always indicate MORE FAVORABLE psychological
+# functioning:
+#   - higher life satisfaction
+#   - lower psychological distress for GHQ
+#
+# OR/HR > 1 therefore indicates greater subsequent transition odds/rate for a
+# more favorable psychological component.
+#
+# These are prospective selection associations, NOT causal effects of
+# psychological functioning on relationship transitions.
+#
+# IMPORTANT TWO-STEP INFERENCE NOTE
+# ---------------------------------
+# This script treats Step-1 correlation-preserving stable/WPVS scores as generated
+# regressors and uses the same respondent-robust inferential structure as the
+# existing manuscript analyses. It does NOT propagate SEM/scoring uncertainty.
+# A full respondent-level two-step bootstrap that re-estimates the measurement
+# model and scores is best treated as a later inferential sensitivity after the
+# substantive H1 estimates have been inspected.
+#
+# RUN FROM THE BEGINNING IN A FRESH R SESSION.
+################################################################################
+
+
+# ==============================================================================
+# 0. PACKAGES
+# ==============================================================================
+
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "tibble",
+  "readr",
+  "stringr",
+  "survival",
+  "splines"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install required package(s) before running this script: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(survival)
+  library(splines)
+})
+
+options(dplyr.summarise.inform = FALSE)
+
+
+# ==============================================================================
+# 1. PATHS AND USER-EDITABLE OPTIONS
+# ==============================================================================
+
+UKHLS_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se/ukhls"
+)
+
+COMMON_STATA_DIR <- dirname(UKHLS_DIR)
+
+
+# ------------------------------------------------------------------------------
+# 1A. Final latent measurement-stage outputs
+# ------------------------------------------------------------------------------
+
+LATENT_MEASUREMENT_DIR <-
+  "D:/Documenti/UKHLS_latent_stable_WPVS_final_measurement_stage_v2_wavecentered"
+
+LATENT_DATA_DIR <- file.path(
+  LATENT_MEASUREMENT_DIR,
+  "data"
+)
+
+SCORE_FILE <- function(T_now) {
+  file.path(
+    LATENT_DATA_DIR,
+    paste0(
+      "final_wave_adjusted_latent_score_lookup_T",
+      T_now,
+      ".rds"
+    )
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# 1B. Clean-unpartnered source analytic base
+# ------------------------------------------------------------------------------
+
+NCRR1_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "psychological_selection_UKHLS_wave3plus_NCRR1_v3_current_unpartnered_primary"
+)
+
+STRICT_UNPARTNERED_RDS <- file.path(
+  NCRR1_DIR,
+  "NCRR1_v3_formation_analytic_base.rds"
+)
+
+
+# ------------------------------------------------------------------------------
+# 1C. Validated incident-LAT matching outputs
+# ------------------------------------------------------------------------------
+
+INCIDENT_LAT_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "incident_LAT_psychological_trajectory_v1"
+)
+
+INCIDENT_EVENTS_RDS <- file.path(
+  INCIDENT_LAT_DIR,
+  "primary_incident_LAT_events.rds"
+)
+
+INCIDENT_MATCH_RDS <- file.path(
+  INCIDENT_LAT_DIR,
+  "primary_LAT_match_index.rds"
+)
+
+
+# ------------------------------------------------------------------------------
+# 1D. Existing non-overlapping clean-unpartnered episode audit outputs
+# ------------------------------------------------------------------------------
+
+EPISODE_AUDIT_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "unpartnered_episode_cohab_marriage_feasibility_v1"
+)
+
+EPISODE_AUDIT_DATA_DIR <- file.path(
+  EPISODE_AUDIT_DIR,
+  "data"
+)
+
+CLEAN_EP_RDS <- file.path(
+  EPISODE_AUDIT_DATA_DIR,
+  "clean_unpartnered_landmarks_with_episode_id.rds"
+)
+
+EPISODE_SUMMARY_RDS <- file.path(
+  EPISODE_AUDIT_DATA_DIR,
+  "clean_unpartnered_episode_summary.rds"
+)
+
+
+# ------------------------------------------------------------------------------
+# 1E. v4.1 panel / PHISTORY objects for prospective event reconstruction
+# ------------------------------------------------------------------------------
+
+v41_candidates <- c(
+  file.path(
+    getwd(),
+    "UKHLS_REVISED_selection_development_proximity_v4_1"
+  ),
+  file.path(
+    COMMON_STATA_DIR,
+    "UKHLS_REVISED_selection_development_proximity_v4_1"
+  ),
+  file.path(
+    "D:/Documenti/psicologia/big data/Understanding Society+BHPS",
+    "UKHLS_REVISED_selection_development_proximity_v4_1"
+  )
+)
+
+v41_exists <- v41_candidates[
+  file.exists(
+    file.path(
+      v41_candidates,
+      "data",
+      "01_panel_person_wave.rds"
+    )
+  ) &
+    file.exists(
+      file.path(
+        v41_candidates,
+        "data",
+        "02_phistory_clean.rds"
+      )
+    )
+]
+
+if (length(v41_exists) == 0L) {
+  stop(
+    "Could not locate the validated v4.1 output directory.\n",
+    "Edit v41_candidates or set V41_OUT_DIR manually."
+  )
+}
+
+V41_OUT_DIR <- v41_exists[[1L]]
+
+PANEL_RDS <- file.path(
+  V41_OUT_DIR,
+  "data",
+  "01_panel_person_wave.rds"
+)
+
+PHISTORY_RDS <- file.path(
+  V41_OUT_DIR,
+  "data",
+  "02_phistory_clean.rds"
+)
+
+COMBINED_PANEL_RDS <- file.path(
+  COMMON_STATA_DIR,
+  "first_marriage_Tminus5_T0_diagnostic",
+  "combined_person_wave_panel.rds"
+)
+
+
+# ------------------------------------------------------------------------------
+# 1F. Output directory
+# ------------------------------------------------------------------------------
+
+OUT_DIR <- "D:/Documenti/UKHLS_H1_latent_stable_WPVS_selection_v1"
+
+TABLE_DIR <- file.path(
+  OUT_DIR,
+  "tables"
+)
+
+DIAG_DIR <- file.path(
+  OUT_DIR,
+  "diagnostics"
+)
+
+MODEL_DIR <- file.path(
+  OUT_DIR,
+  "models"
+)
+
+DATA_DIR <- file.path(
+  OUT_DIR,
+  "data"
+)
+
+for (d in c(
+  OUT_DIR,
+  TABLE_DIR,
+  DIAG_DIR,
+  MODEL_DIR,
+  DATA_DIR
+)) {
+  dir.create(
+    d,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# 1G. Analysis options
+# ------------------------------------------------------------------------------
+
+PRIMARY_T <- 4L
+SENSITIVITY_T <- c(5L, 6L)
+RUN_T5_T6_SENSITIVITIES <- TRUE
+
+T_VALUES <- if (RUN_T5_T6_SENSITIVITIES) {
+  c(PRIMARY_T, SENSITIVITY_T)
+} else {
+  PRIMARY_T
+}
+
+COX_TIES <- "efron"
+
+# Existing manuscript family sizes.
+N_LAT_COMPONENT_TESTS <- 4L
+N_LAT_JOINT_TESTS <- 2L
+
+N_COX_COMPONENT_TESTS <- 12L
+N_COX_JOINT_TESTS <- 6L
+N_COX_DIFFERENCE_TESTS <- 6L
+
+# PH diagnostics are run for all T=4 primary Cox models.
+RUN_PRIMARY_PH_DIAGNOSTICS <- TRUE
+
+# Save analytic datasets for complete reproducibility.
+SAVE_ANALYTIC_DATA <- TRUE
+
+
+# ==============================================================================
+# 2. CONSTANTS AND HELPERS
+# ==============================================================================
+
+PH_STATUS_MARRIED <- 2L
+PH_STATUS_CIVIL_PARTNER <- 3L
+PH_STATUS_COHAB <- 10L
+
+PANEL_COHAB_STATUS <- "cohab"
+PANEL_MARRIED_STATUS <- "married"
+
+
+normalize_pidp <- function(x) {
+
+  z <- x
+
+  if (
+    inherits(z, "haven_labelled") ||
+      inherits(z, "labelled") ||
+      inherits(z, "haven_labelled_spss")
+  ) {
+    z <- unclass(z)
+  }
+
+  if (is.factor(z)) {
+    z <- as.character(z)
+  }
+
+  if (is.numeric(z) || is.integer(z)) {
+    out <- ifelse(
+      is.na(z),
+      NA_character_,
+      format(
+        z,
+        scientific = FALSE,
+        trim = TRUE,
+        digits = 22
+      )
+    )
+    out <- sub(
+      "\\.0+$",
+      "",
+      out
+    )
+    return(out)
+  }
+
+  out <- trimws(
+    as.character(z)
+  )
+
+  out[
+    out %in% c(
+      "",
+      "NA",
+      "NaN"
+    )
+  ] <- NA_character_
+
+  sub(
+    "\\.0+$",
+    "",
+    out
+  )
+}
+
+
+write_csv_quiet <- function(
+    x,
+    filename,
+    subdir = "tables"
+) {
+
+  target_dir <- switch(
+    subdir,
+    tables = TABLE_DIR,
+    diagnostics = DIAG_DIR,
+    data = DATA_DIR,
+    models = MODEL_DIR,
+    TABLE_DIR
+  )
+
+  path <- file.path(
+    target_dir,
+    filename
+  )
+
+  readr::write_csv(
+    x,
+    path,
+    na = "",
+    progress = FALSE
+  )
+
+  invisible(path)
+}
+
+
+write_txt <- function(
+    x,
+    filename,
+    subdir = "diagnostics"
+) {
+
+  target_dir <- switch(
+    subdir,
+    tables = TABLE_DIR,
+    diagnostics = DIAG_DIR,
+    data = DATA_DIR,
+    models = MODEL_DIR,
+    DIAG_DIR
+  )
+
+  path <- file.path(
+    target_dir,
+    filename
+  )
+
+  writeLines(
+    as.character(x),
+    path,
+    useBytes = TRUE
+  )
+
+  invisible(path)
+}
+
+
+safe_min <- function(x) {
+
+  z <- suppressWarnings(
+    as.numeric(x)
+  )
+
+  z <- z[
+    is.finite(z)
+  ]
+
+  if (
+    length(z) == 0L
+  ) {
+    NA_real_
+  } else {
+    min(z)
+  }
+}
+
+
+safe_median <- function(x) {
+
+  z <- suppressWarnings(
+    as.numeric(x)
+  )
+
+  z <- z[
+    is.finite(z)
+  ]
+
+  if (
+    length(z) == 0L
+  ) {
+    NA_real_
+  } else {
+    stats::median(z)
+  }
+}
+
+
+safe_max <- function(x) {
+
+  z <- suppressWarnings(
+    as.numeric(x)
+  )
+
+  z <- z[
+    is.finite(z)
+  ]
+
+  if (
+    length(z) == 0L
+  ) {
+    NA_real_
+  } else {
+    max(z)
+  }
+}
+
+
+safe_cor <- function(x, y) {
+
+  ok <-
+    is.finite(x) &
+    is.finite(y)
+
+  if (
+    sum(ok) < 3L
+  ) {
+    return(
+      NA_real_
+    )
+  }
+
+  suppressWarnings(
+    stats::cor(
+      x[ok],
+      y[ok]
+    )
+  )
+}
+
+
+normal_ci <- function(
+    est,
+    se,
+    level = 0.95
+) {
+
+  crit <- stats::qnorm(
+    1 -
+      (
+        1 -
+          level
+      ) /
+      2
+  )
+
+  c(
+    est -
+      crit *
+      se,
+    est +
+      crit *
+      se
+  )
+}
+
+
+adjust_valid_p <- function(
+    p,
+    status = rep(
+      "OK",
+      length(p)
+    ),
+    method = "holm",
+    n_total = NULL
+) {
+
+  out <- rep(
+    NA_real_,
+    length(p)
+  )
+
+  ok <-
+    status == "OK" &
+    is.finite(p)
+
+  if (!any(ok)) {
+    return(out)
+  }
+
+  n_use <- if (
+    is.null(n_total)
+  ) {
+    sum(ok)
+  } else {
+    as.integer(n_total)
+  }
+
+  if (
+    !is.finite(n_use) ||
+      n_use <
+      sum(ok)
+  ) {
+    n_use <- sum(ok)
+  }
+
+  out[ok] <- stats::p.adjust(
+    p[ok],
+    method = method,
+    n = n_use
+  )
+
+  out
+}
+
+
+safe_inverse <- function(V) {
+
+  V <- as.matrix(V)
+
+  if (
+    nrow(V) == 0L ||
+      any(
+        !is.finite(V)
+      )
+  ) {
+    return(NULL)
+  }
+
+  inv <- tryCatch(
+    solve(V),
+    error = function(e) NULL
+  )
+
+  if (!is.null(inv)) {
+    return(inv)
+  }
+
+  ee <- tryCatch(
+    eigen(
+      V,
+      symmetric = TRUE
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(ee)) {
+    return(NULL)
+  }
+
+  tol <-
+    max(dim(V)) *
+    max(
+      abs(
+        ee$values
+      ),
+      1
+    ) *
+    .Machine$double.eps *
+    100
+
+  keep <- which(
+    ee$values >
+      tol
+  )
+
+  if (
+    length(keep) == 0L
+  ) {
+    return(NULL)
+  }
+
+  Q <- ee$vectors[
+    ,
+    keep,
+    drop = FALSE
+  ]
+
+  Q %*%
+    diag(
+      1 /
+        ee$values[
+          keep
+        ],
+      nrow = length(
+        keep
+      )
+    ) %*%
+    t(Q)
+}
+
+
+in_followup_interval <- function(
+    event_ym,
+    baseline_ym,
+    end_ym,
+    end_is_next_episode
+) {
+
+  after_baseline <-
+    !is.na(event_ym) &
+    !is.na(baseline_ym) &
+    event_ym >
+    baseline_ym
+
+  before_end <- dplyr::case_when(
+    is.na(end_ym) ~ FALSE,
+    end_is_next_episode %in% TRUE ~
+      event_ym <
+      end_ym,
+    TRUE ~
+      event_ym <=
+      end_ym
+  )
+
+  after_baseline &
+    before_end
+}
+
+
+# ==============================================================================
+# 3. INPUT FILE CHECK
+# ==============================================================================
+
+required_inputs <- c(
+  STRICT_UNPARTNERED_RDS,
+  INCIDENT_EVENTS_RDS,
+  INCIDENT_MATCH_RDS,
+  CLEAN_EP_RDS,
+  EPISODE_SUMMARY_RDS,
+  PANEL_RDS,
+  PHISTORY_RDS,
+  COMBINED_PANEL_RDS,
+  vapply(
+    T_VALUES,
+    SCORE_FILE,
+    character(1)
+  )
+)
+
+missing_inputs <- required_inputs[
+  !file.exists(
+    required_inputs
+  )
+]
+
+if (
+  length(
+    missing_inputs
+  ) > 0L
+) {
+
+  stop(
+    "Required input file(s) not found:\n  - ",
+    paste(
+      missing_inputs,
+      collapse = "\n  - "
+    ),
+    "\n\nRun the validated upstream workflows and final latent measurement stage first."
+  )
+}
+
+
+# ==============================================================================
+# 4. LOAD AND VALIDATE LATENT SCORE LOOKUPS
+# ==============================================================================
+
+score_lookups <- list()
+
+score_schema_audit <- list()
+schema_idx <- 0L
+
+
+for (
+  T_now in T_VALUES
+) {
+
+  s <- readRDS(
+    SCORE_FILE(
+      T_now
+    )
+  )
+
+  required_score_vars <- c(
+    "baseline_id",
+    "pidp_key",
+    "baseline_wave",
+    "measure",
+    "T",
+    "raw_current_score_sd",
+    "stable_score_SD",
+    "current_wpvs_SD"
+  )
+
+  missing_score_vars <- setdiff(
+    required_score_vars,
+    names(s)
+  )
+
+  if (
+    length(
+      missing_score_vars
+    ) > 0L
+  ) {
+    stop(
+      "Latent score lookup T=",
+      T_now,
+      " is missing: ",
+      paste(
+        missing_score_vars,
+        collapse = ", "
+      )
+    )
+  }
+
+  s <- s %>%
+    dplyr::mutate(
+      pidp_key =
+        normalize_pidp(
+          pidp_key
+        ),
+      baseline_wave =
+        suppressWarnings(
+          as.integer(
+            baseline_wave
+          )
+        ),
+      T =
+        suppressWarnings(
+          as.integer(
+            T
+          )
+        ),
+      stable_score_SD =
+        suppressWarnings(
+          as.numeric(
+            stable_score_SD
+          )
+        ),
+      current_wpvs_SD =
+        suppressWarnings(
+          as.numeric(
+            current_wpvs_SD
+          )
+        ),
+      raw_current_score_sd =
+        suppressWarnings(
+          as.numeric(
+            raw_current_score_sd
+          )
+        ),
+      baseline_id =
+        as.character(
+          baseline_id
+        ),
+      measure =
+        as.character(
+          measure
+        )
+    ) %>%
+    dplyr::filter(
+      T ==
+        T_now
+    )
+
+  if (
+    anyDuplicated(
+      s[
+        c(
+          "pidp_key",
+          "baseline_wave",
+          "measure"
+        )
+      ]
+    ) > 0L
+  ) {
+    stop(
+      "Latent score lookup T=",
+      T_now,
+      " is not unique by pidp x baseline wave x measure."
+    )
+  }
+
+  score_lookups[[as.character(T_now)]] <- s
+
+  schema_idx <- schema_idx + 1L
+
+  score_schema_audit[[schema_idx]] <- s %>%
+    dplyr::group_by(
+      measure
+    ) %>%
+    dplyr::summarise(
+      T = T_now,
+      rows =
+        dplyr::n(),
+      people =
+        dplyr::n_distinct(
+          pidp_key
+        ),
+      finite_stable =
+        sum(
+          is.finite(
+            stable_score_SD
+          )
+        ),
+      finite_current_wpvs =
+        sum(
+          is.finite(
+            current_wpvs_SD
+          )
+        ),
+      correlation_stable_current_wpvs =
+        safe_cor(
+          stable_score_SD,
+          current_wpvs_SD
+        ),
+      raw_current_score_sd_min =
+        safe_min(
+          raw_current_score_sd
+        ),
+      raw_current_score_sd_max =
+        safe_max(
+          raw_current_score_sd
+        ),
+      .groups = "drop"
+    )
+}
+
+
+score_schema_audit <- dplyr::bind_rows(
+  score_schema_audit
+)
+
+write_csv_quiet(
+  score_schema_audit,
+  "00_latent_score_lookup_audit.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 5. LOAD CLEAN-UNPARTNERED BASE, INCIDENT LAT OBJECTS, AND EPISODE OBJECTS
+# ==============================================================================
+
+formation_raw <- readRDS(
+  STRICT_UNPARTNERED_RDS
+)
+
+incident_events <- readRDS(
+  INCIDENT_EVENTS_RDS
+)
+
+incident_match <- readRDS(
+  INCIDENT_MATCH_RDS
+)
+
+clean_ep <- readRDS(
+  CLEAN_EP_RDS
+)
+
+episode_summary <- readRDS(
+  EPISODE_SUMMARY_RDS
+)
+
+
+# ------------------------------------------------------------------------------
+# 5A. Harmonize identifiers
+# ------------------------------------------------------------------------------
+
+formation_raw <- formation_raw %>%
+  dplyr::mutate(
+    pidp_key =
+      normalize_pidp(
+        pidp_key
+      ),
+    wave_num =
+      suppressWarnings(
+        as.integer(
+          wave_num
+        )
+      ),
+    baseline_id = paste(
+      pidp_key,
+      wave_num,
+      sep = "__wave__"
+    )
+  )
+
+
+incident_events <- incident_events %>%
+  dplyr::mutate(
+    treated_pidp =
+      normalize_pidp(
+        treated_pidp
+      ),
+    baseline_wave =
+      suppressWarnings(
+        as.integer(
+          baseline_wave
+        )
+      )
+  )
+
+
+incident_match <- incident_match %>%
+  dplyr::mutate(
+    unit_pidp =
+      normalize_pidp(
+        unit_pidp
+      ),
+    baseline_wave =
+      suppressWarnings(
+        as.integer(
+          baseline_wave
+        )
+      ),
+    condition =
+      as.character(
+        condition
+      ),
+    treated =
+      dplyr::if_else(
+        condition ==
+          "treated",
+        1L,
+        0L
+      )
+  )
+
+
+clean_ep <- clean_ep %>%
+  dplyr::mutate(
+    pidp =
+      normalize_pidp(
+        pidp
+      ),
+    wave_n =
+      suppressWarnings(
+        as.integer(
+          wave_n
+        )
+      ),
+    clean_ym =
+      suppressWarnings(
+        as.numeric(
+          clean_ym
+        )
+      ),
+    episode_num =
+      suppressWarnings(
+        as.integer(
+          episode_num
+        )
+      ),
+    episode_uid =
+      as.character(
+        episode_uid
+      )
+  )
+
+
+episode_summary <- episode_summary %>%
+  dplyr::mutate(
+    pidp =
+      normalize_pidp(
+        pidp
+      ),
+    episode_num =
+      suppressWarnings(
+        as.integer(
+          episode_num
+        )
+      ),
+    episode_uid =
+      as.character(
+        episode_uid
+      ),
+    episode_start_ym =
+      suppressWarnings(
+        as.numeric(
+          episode_start_ym
+        )
+      ),
+    next_episode_start_ym =
+      suppressWarnings(
+        as.numeric(
+          next_episode_start_ym
+        )
+      ),
+    panel_last_ym =
+      suppressWarnings(
+        as.numeric(
+          panel_last_ym
+        )
+      ),
+    episode_followup_end_ym =
+      suppressWarnings(
+        as.numeric(
+          episode_followup_end_ym
+        )
+      ),
+    end_is_next_episode =
+      as.logical(
+        end_is_next_episode
+      )
+  )
+
+
+# ------------------------------------------------------------------------------
+# 5B. Attach episode follow-up boundaries to all clean landmarks
+# ------------------------------------------------------------------------------
+
+clean_ep <- clean_ep %>%
+  dplyr::select(
+    -dplyr::any_of(
+      c(
+        "episode_start_ym",
+        "next_episode_start_ym",
+        "panel_last_ym",
+        "episode_followup_end_ym",
+        "end_is_next_episode"
+      )
+    )
+  ) %>%
+  dplyr::left_join(
+    episode_summary %>%
+      dplyr::select(
+        episode_uid,
+        episode_start_ym,
+        next_episode_start_ym,
+        panel_last_ym,
+        episode_followup_end_ym,
+        end_is_next_episode
+      ),
+    by =
+      "episode_uid",
+    relationship =
+      "many-to-one"
+  )
+
+
+# ------------------------------------------------------------------------------
+# 5C. Alignment audit: score lookup to exact clean-unpartnered landmarks
+# ------------------------------------------------------------------------------
+
+score_clean_alignment <- purrr::map_dfr(
+  T_VALUES,
+  function(T_now) {
+
+    s <- score_lookups[[as.character(T_now)]]
+
+    s %>%
+      dplyr::left_join(
+        clean_ep %>%
+          dplyr::transmute(
+            pidp_key = pidp,
+            baseline_wave = wave_n,
+            clean_landmark_present = TRUE,
+            clean_ym
+          ),
+        by = c(
+          "pidp_key",
+          "baseline_wave"
+        ),
+        relationship =
+          "many-to-one"
+      ) %>%
+      dplyr::group_by(
+        measure
+      ) %>%
+      dplyr::summarise(
+        T = T_now,
+        score_rows =
+          dplyr::n(),
+        rows_linked_to_clean_landmark =
+          sum(
+            clean_landmark_present %in% TRUE,
+            na.rm = TRUE
+          ),
+        rows_not_linked_to_clean_landmark =
+          sum(
+            is.na(
+              clean_landmark_present
+            )
+          ),
+        .groups =
+          "drop"
+      )
+  }
+)
+
+write_csv_quiet(
+  score_clean_alignment,
+  "01_score_to_clean_landmark_alignment.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 6. H1 DESIGN A: INCIDENT LAT FORMATION
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# 6A. Matched-set helpers
+# ------------------------------------------------------------------------------
+
+prune_matched_sets <- function(
+    dat,
+    case_var = "treated"
+) {
+
+  dat %>%
+    dplyr::filter(
+      !is.na(
+        .data[[case_var]]
+      ),
+      !is.na(
+        match_set_id
+      ),
+      !is.na(
+        unit_pidp
+      )
+    ) %>%
+    dplyr::group_by(
+      match_set_id
+    ) %>%
+    dplyr::filter(
+      sum(
+        .data[[case_var]] ==
+          1L,
+        na.rm = TRUE
+      ) ==
+        1L,
+      sum(
+        .data[[case_var]] ==
+          0L,
+        na.rm = TRUE
+      ) >=
+        1L
+    ) %>%
+    dplyr::ungroup()
+}
+
+
+matched_sample_summary <- function(
+    dat,
+    measure,
+    T_now
+) {
+
+  if (
+    nrow(dat) == 0L
+  ) {
+
+    return(
+      tibble::tibble(
+        design =
+          "Incident LAT matched conditional logit",
+        measure =
+          measure,
+        T =
+          T_now,
+        rows =
+          0L,
+        matched_sets =
+          0L,
+        cases =
+          0L,
+        controls =
+          0L,
+        people =
+          0L,
+        unique_case_people =
+          0L,
+        unique_control_people =
+          0L,
+        median_controls_per_set =
+          NA_real_
+      )
+    )
+  }
+
+  controls_per_set <- dat %>%
+    dplyr::group_by(
+      match_set_id
+    ) %>%
+    dplyr::summarise(
+      n_controls =
+        sum(
+          treated ==
+            0L
+        ),
+      .groups =
+        "drop"
+    )
+
+  tibble::tibble(
+    design =
+      "Incident LAT matched conditional logit",
+    measure =
+      measure,
+    T =
+      T_now,
+    rows =
+      nrow(dat),
+    matched_sets =
+      dplyr::n_distinct(
+        dat$match_set_id
+      ),
+    cases =
+      sum(
+        dat$treated ==
+          1L
+      ),
+    controls =
+      sum(
+        dat$treated ==
+          0L
+      ),
+    people =
+      dplyr::n_distinct(
+        dat$unit_pidp
+      ),
+    unique_case_people =
+      dplyr::n_distinct(
+        dat$unit_pidp[
+          dat$treated ==
+            1L
+        ]
+      ),
+    unique_control_people =
+      dplyr::n_distinct(
+        dat$unit_pidp[
+          dat$treated ==
+            0L
+        ]
+      ),
+    median_controls_per_set =
+      safe_median(
+        controls_per_set$n_controls
+      )
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# 6B. Build score-eligible matched data
+# ------------------------------------------------------------------------------
+
+build_lat_matched_data <- function(
+    T_now,
+    measure_label
+) {
+
+  s <- score_lookups[[as.character(T_now)]] %>%
+    dplyr::filter(
+      measure ==
+        measure_label
+    ) %>%
+    dplyr::transmute(
+      pidp_key,
+      baseline_wave,
+      latent_baseline_id =
+        baseline_id,
+      stable_z =
+        stable_score_SD,
+      wpvs_z =
+        current_wpvs_SD,
+      raw_current_score_sd
+    )
+
+  joined <- incident_match %>%
+    dplyr::left_join(
+      s,
+      by = c(
+        "unit_pidp" =
+          "pidp_key",
+        "baseline_wave" =
+          "baseline_wave"
+      ),
+      relationship =
+        "many-to-one"
+    )
+
+  before <- joined %>%
+    dplyr::summarise(
+      T =
+        T_now,
+      measure =
+        measure_label,
+      matched_index_rows =
+        dplyr::n(),
+      matched_sets_before_score_restriction =
+        dplyr::n_distinct(
+          match_set_id
+        ),
+      cases_before_score_restriction =
+        sum(
+          treated ==
+            1L
+        ),
+      controls_before_score_restriction =
+        sum(
+          treated ==
+            0L
+        ),
+      rows_with_finite_latent_scores =
+        sum(
+          is.finite(
+            stable_z
+          ) &
+            is.finite(
+              wpvs_z
+            )
+        ),
+      cases_with_finite_latent_scores =
+        sum(
+          treated ==
+            1L &
+            is.finite(
+              stable_z
+            ) &
+            is.finite(
+              wpvs_z
+            )
+        ),
+      controls_with_finite_latent_scores =
+        sum(
+          treated ==
+            0L &
+            is.finite(
+              stable_z
+            ) &
+            is.finite(
+              wpvs_z
+            )
+        )
+    )
+
+  analytic <- joined %>%
+    dplyr::filter(
+      is.finite(
+        stable_z
+      ),
+      is.finite(
+        wpvs_z
+      )
+    ) %>%
+    prune_matched_sets(
+      case_var =
+        "treated"
+    )
+
+  after <- matched_sample_summary(
+    analytic,
+    measure_label,
+    T_now
+  )
+
+  list(
+    data =
+      analytic,
+    join_audit =
+      dplyr::bind_cols(
+        before,
+        after %>%
+          dplyr::select(
+            rows_after_pruning =
+              rows,
+            matched_sets_after_pruning =
+              matched_sets,
+            cases_after_pruning =
+              cases,
+            controls_after_pruning =
+              controls,
+            people_after_pruning =
+              people,
+            median_controls_per_set_after_pruning =
+              median_controls_per_set
+          )
+      ),
+    sample =
+      after
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# 6C. LAT model extraction
+# ------------------------------------------------------------------------------
+
+empty_lat_coefficients <- function(
+    measure,
+    T_now,
+    status
+) {
+
+  tibble::tibble(
+    design =
+      "Incident LAT matched conditional logit",
+    endpoint =
+      "Incident LAT formation",
+    measure =
+      measure,
+    T =
+      T_now,
+    component =
+      c(
+        "Stable between-person component",
+        "Current within-person component (WPVS)"
+      ),
+    term =
+      c(
+        "stable_z",
+        "wpvs_z"
+      ),
+    estimate_log_or =
+      NA_real_,
+    robust_se =
+      NA_real_,
+    odds_ratio =
+      NA_real_,
+    conf_low =
+      NA_real_,
+    conf_high =
+      NA_real_,
+    p_value =
+      NA_real_,
+    n_rows =
+      NA_integer_,
+    n_sets =
+      NA_integer_,
+    n_cases =
+      NA_integer_,
+    n_controls =
+      NA_integer_,
+    n_people =
+      NA_integer_,
+    status =
+      status
+  )
+}
+
+
+lat_joint_test <- function(
+    fit,
+    dat,
+    measure,
+    T_now
+) {
+
+  out <- tibble::tibble(
+    design =
+      "Incident LAT matched conditional logit",
+    endpoint =
+      "Incident LAT formation",
+    measure =
+      measure,
+    T =
+      T_now,
+    test =
+      "Stable + current WPVS = 0",
+    statistic =
+      NA_real_,
+    df =
+      2L,
+    p_value =
+      NA_real_,
+    n_rows =
+      nrow(dat),
+    n_sets =
+      dplyr::n_distinct(
+        dat$match_set_id
+      ),
+    n_cases =
+      sum(
+        dat$treated ==
+          1L
+      ),
+    n_people =
+      dplyr::n_distinct(
+        dat$unit_pidp
+      ),
+    status =
+      "MODEL_MISSING"
+  )
+
+  if (is.null(fit)) {
+    return(out)
+  }
+
+  terms <- c(
+    "stable_z",
+    "wpvs_z"
+  )
+
+  b <- stats::coef(
+    fit
+  )
+
+  V <- tryCatch(
+    stats::vcov(
+      fit
+    ),
+    error =
+      function(e) NULL
+  )
+
+  if (
+    is.null(V) ||
+      !all(
+        terms %in%
+          names(b)
+      ) ||
+      !all(
+        terms %in%
+          rownames(V)
+      )
+  ) {
+    out$status <-
+      "TERM_OR_VCOV_MISSING"
+    return(out)
+  }
+
+  bb <- as.numeric(
+    b[
+      terms
+    ]
+  )
+
+  VV <- as.matrix(
+    V[
+      terms,
+      terms,
+      drop = FALSE
+    ]
+  )
+
+  invV <- safe_inverse(
+    VV
+  )
+
+  if (
+    is.null(
+      invV
+    ) ||
+      any(
+        !is.finite(
+          bb
+        )
+      )
+  ) {
+    out$status <-
+      "NONINVERTIBLE_OR_NONFINITE"
+    return(out)
+  }
+
+  W <- as.numeric(
+    t(bb) %*%
+      invV %*%
+      bb
+  )
+
+  out$statistic <-
+    W
+
+  out$p_value <-
+    stats::pchisq(
+      W,
+      df = 2L,
+      lower.tail = FALSE
+    )
+
+  out$status <-
+    "OK"
+
+  out
+}
+
+
+lat_component_difference <- function(
+    fit,
+    dat,
+    measure,
+    T_now
+) {
+
+  out <- tibble::tibble(
+    design =
+      "Incident LAT matched conditional logit",
+    endpoint =
+      "Incident LAT formation",
+    measure =
+      measure,
+    T =
+      T_now,
+    test =
+      "Stable coefficient = current WPVS coefficient",
+    difference_log_or =
+      NA_real_,
+    robust_se_difference =
+      NA_real_,
+    statistic_z =
+      NA_real_,
+    p_value =
+      NA_real_,
+    n_rows =
+      nrow(dat),
+    n_sets =
+      dplyr::n_distinct(
+        dat$match_set_id
+      ),
+    status =
+      "MODEL_MISSING"
+  )
+
+  if (is.null(fit)) {
+    return(out)
+  }
+
+  terms <- c(
+    "stable_z",
+    "wpvs_z"
+  )
+
+  b <- stats::coef(
+    fit
+  )
+
+  V <- tryCatch(
+    stats::vcov(
+      fit
+    ),
+    error =
+      function(e) NULL
+  )
+
+  if (
+    is.null(V) ||
+      !all(
+        terms %in%
+          names(b)
+      ) ||
+      !all(
+        terms %in%
+          rownames(V)
+      )
+  ) {
+    out$status <-
+      "TERM_OR_VCOV_MISSING"
+    return(out)
+  }
+
+  diff <-
+    as.numeric(
+      b[["stable_z"]] -
+        b[["wpvs_z"]]
+    )
+
+  var_diff <-
+    V[
+      "stable_z",
+      "stable_z"
+    ] +
+    V[
+      "wpvs_z",
+      "wpvs_z"
+    ] -
+    2 *
+    V[
+      "stable_z",
+      "wpvs_z"
+    ]
+
+  if (
+    !is.finite(
+      var_diff
+    ) ||
+      var_diff <= 0
+  ) {
+    out$status <-
+      "INVALID_VARIANCE"
+    return(out)
+  }
+
+  se_diff <-
+    sqrt(
+      var_diff
+    )
+
+  z <-
+    diff /
+    se_diff
+
+  out$difference_log_or <-
+    diff
+
+  out$robust_se_difference <-
+    se_diff
+
+  out$statistic_z <-
+    z
+
+  out$p_value <-
+    2 *
+    stats::pnorm(
+      abs(z),
+      lower.tail = FALSE
+    )
+
+  out$status <-
+    "OK"
+
+  out
+}
+
+
+fit_lat_selection <- function(
+    dat,
+    measure,
+    T_now,
+    save_model = TRUE
+) {
+
+  if (
+    nrow(dat) == 0L ||
+      dplyr::n_distinct(
+        dat$match_set_id
+      ) <
+      2L
+  ) {
+
+    return(
+      list(
+        coefficients =
+          empty_lat_coefficients(
+            measure,
+            T_now,
+            "NO_ANALYTIC_SETS"
+          ),
+        joint =
+          lat_joint_test(
+            NULL,
+            dat,
+            measure,
+            T_now
+          ),
+        difference =
+          lat_component_difference(
+            NULL,
+            dat,
+            measure,
+            T_now
+          ),
+        model =
+          NULL
+      )
+    )
+  }
+
+  fit <- tryCatch(
+    survival::clogit(
+      treated ~
+        stable_z +
+        wpvs_z +
+        strata(
+          match_set_id
+        ) +
+        cluster(
+          unit_pidp
+        ),
+      data =
+        dat,
+      method =
+        "efron",
+      na.action =
+        stats::na.omit
+    ),
+    error =
+      function(e) e
+  )
+
+  stub <- paste0(
+    "LAT_T",
+    T_now,
+    "_",
+    ifelse(
+      measure ==
+        "Life satisfaction",
+      "LS",
+      "DISTRESS"
+    )
+  )
+
+  if (
+    inherits(
+      fit,
+      "error"
+    )
+  ) {
+
+    write_txt(
+      c(
+        "MODEL FAILED",
+        "",
+        conditionMessage(
+          fit
+        )
+      ),
+      paste0(
+        stub,
+        "_ERROR.txt"
+      ),
+      "models"
+    )
+
+    return(
+      list(
+        coefficients =
+          empty_lat_coefficients(
+            measure,
+            T_now,
+            paste0(
+              "MODEL_ERROR: ",
+              conditionMessage(
+                fit
+              )
+            )
+          ),
+        joint =
+          lat_joint_test(
+            NULL,
+            dat,
+            measure,
+            T_now
+          ),
+        difference =
+          lat_component_difference(
+            NULL,
+            dat,
+            measure,
+            T_now
+          ),
+        model =
+          NULL
+      )
+    )
+  }
+
+  if (
+    save_model
+  ) {
+
+    saveRDS(
+      fit,
+      file.path(
+        MODEL_DIR,
+        paste0(
+          stub,
+          ".rds"
+        )
+      )
+    )
+
+    write_txt(
+      capture.output(
+        summary(
+          fit
+        )
+      ),
+      paste0(
+        stub,
+        "_summary.txt"
+      ),
+      "models"
+    )
+  }
+
+  b <- stats::coef(
+    fit
+  )
+
+  V <- stats::vcov(
+    fit
+  )
+
+  extract_one <- function(
+      term,
+      component
+  ) {
+
+    if (
+      !term %in%
+        names(b) ||
+        !term %in%
+        rownames(V)
+    ) {
+
+      return(
+        tibble::tibble(
+          design =
+            "Incident LAT matched conditional logit",
+          endpoint =
+            "Incident LAT formation",
+          measure =
+            measure,
+          T =
+            T_now,
+          component =
+            component,
+          term =
+            term,
+          estimate_log_or =
+            NA_real_,
+          robust_se =
+            NA_real_,
+          odds_ratio =
+            NA_real_,
+          conf_low =
+            NA_real_,
+          conf_high =
+            NA_real_,
+          p_value =
+            NA_real_,
+          n_rows =
+            nrow(
+              dat
+            ),
+          n_sets =
+            dplyr::n_distinct(
+              dat$match_set_id
+            ),
+          n_cases =
+            sum(
+              dat$treated ==
+                1L
+            ),
+          n_controls =
+            sum(
+              dat$treated ==
+                0L
+            ),
+          n_people =
+            dplyr::n_distinct(
+              dat$unit_pidp
+            ),
+          status =
+            "TERM_MISSING"
+        )
+      )
+    }
+
+    est <- as.numeric(
+      b[[term]]
+    )
+
+    se <- sqrt(
+      as.numeric(
+        V[
+          term,
+          term
+        ]
+      )
+    )
+
+    ci <- normal_ci(
+      est,
+      se
+    )
+
+    tibble::tibble(
+      design =
+        "Incident LAT matched conditional logit",
+      endpoint =
+        "Incident LAT formation",
+      measure =
+        measure,
+      T =
+        T_now,
+      component =
+        component,
+      term =
+        term,
+      estimate_log_or =
+        est,
+      robust_se =
+        se,
+      odds_ratio =
+        exp(
+          est
+        ),
+      conf_low =
+        exp(
+          ci[
+            1L
+          ]
+        ),
+      conf_high =
+        exp(
+          ci[
+            2L
+          ]
+        ),
+      p_value =
+        2 *
+        stats::pnorm(
+          abs(
+            est /
+              se
+          ),
+          lower.tail =
+            FALSE
+        ),
+      n_rows =
+        nrow(
+          dat
+        ),
+      n_sets =
+        dplyr::n_distinct(
+          dat$match_set_id
+        ),
+      n_cases =
+        sum(
+          dat$treated ==
+            1L
+        ),
+      n_controls =
+        sum(
+          dat$treated ==
+            0L
+        ),
+      n_people =
+        dplyr::n_distinct(
+          dat$unit_pidp
+        ),
+      status =
+        "OK"
+    )
+  }
+
+  coefficients <- dplyr::bind_rows(
+    extract_one(
+      "stable_z",
+      "Stable between-person component"
+    ),
+    extract_one(
+      "wpvs_z",
+      "Current within-person component (WPVS)"
+    )
+  )
+
+  list(
+    coefficients =
+      coefficients,
+    joint =
+      lat_joint_test(
+        fit,
+        dat,
+        measure,
+        T_now
+      ),
+    difference =
+      lat_component_difference(
+        fit,
+        dat,
+        measure,
+        T_now
+      ),
+    model =
+      fit
+  )
+}
+
+
+# ------------------------------------------------------------------------------
+# 6D. Run incident-LAT models for T=4/5/6
+# ------------------------------------------------------------------------------
+
+lat_results <- list()
+lat_join_audits <- list()
+lat_samples <- list()
+
+lat_idx <- 0L
+
+
+for (
+  T_now in T_VALUES
+) {
+
+  for (
+    measure_label in c(
+      "Life satisfaction",
+      "Psychological distress"
+    )
+  ) {
+
+    built <- build_lat_matched_data(
+      T_now,
+      measure_label
+    )
+
+    fit <- fit_lat_selection(
+      dat =
+        built$data,
+      measure =
+        measure_label,
+      T_now =
+        T_now,
+      save_model =
+        TRUE
+    )
+
+    lat_idx <- lat_idx + 1L
+
+    lat_results[[lat_idx]] <- list(
+      T =
+        T_now,
+      measure =
+        measure_label,
+      coefficients =
+        fit$coefficients,
+      joint =
+        fit$joint,
+      difference =
+        fit$difference
+    )
+
+    lat_join_audits[[lat_idx]] <- built$join_audit
+
+    lat_samples[[lat_idx]] <- built$sample
+
+    if (
+      SAVE_ANALYTIC_DATA
+    ) {
+
+      saveRDS(
+        built$data,
+        file.path(
+          DATA_DIR,
+          paste0(
+            "LAT_T",
+            T_now,
+            "_",
+            ifelse(
+              measure_label ==
+                "Life satisfaction",
+              "LS",
+              "DISTRESS"
+            ),
+            "_analytic_matched_data.rds"
+          )
+        )
+      )
+    }
+  }
+}
+
+
+lat_coefficients <- dplyr::bind_rows(
+  purrr::map(
+    lat_results,
+    "coefficients"
+  )
+)
+
+lat_joint <- dplyr::bind_rows(
+  purrr::map(
+    lat_results,
+    "joint"
+  )
+)
+
+lat_difference <- dplyr::bind_rows(
+  purrr::map(
+    lat_results,
+    "difference"
+  )
+)
+
+lat_join_audits <- dplyr::bind_rows(
+  lat_join_audits
+)
+
+lat_samples <- dplyr::bind_rows(
+  lat_samples
+)
+
+
+# ------------------------------------------------------------------------------
+# 6E. Holm adjustment within each T-specific LAT family
+# ------------------------------------------------------------------------------
+
+lat_coefficients <- lat_coefficients %>%
+  dplyr::group_by(
+    T
+  ) %>%
+  dplyr::mutate(
+    p_holm_LAT_4 =
+      adjust_valid_p(
+        p_value,
+        status,
+        method =
+          "holm",
+        n_total =
+          N_LAT_COMPONENT_TESTS
+      )
+  ) %>%
+  dplyr::ungroup()
+
+
+lat_joint <- lat_joint %>%
+  dplyr::group_by(
+    T
+  ) %>%
+  dplyr::mutate(
+    p_holm_LAT_2_joint =
+      adjust_valid_p(
+        p_value,
+        status,
+        method =
+          "holm",
+        n_total =
+          N_LAT_JOINT_TESTS
+      )
+  ) %>%
+  dplyr::ungroup()
+
+
+lat_difference <- lat_difference %>%
+  dplyr::group_by(
+    T
+  ) %>%
+  dplyr::mutate(
+    p_holm_LAT_2_difference =
+      adjust_valid_p(
+        p_value,
+        status,
+        method =
+          "holm",
+        n_total =
+          2L
+      )
+  ) %>%
+  dplyr::ungroup()
+
+
+write_csv_quiet(
+  lat_join_audits,
+  "02_LAT_score_join_and_pruning_audit.csv",
+  "diagnostics"
+)
+
+write_csv_quiet(
+  lat_samples,
+  "03_LAT_model_sample_support.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 7. RECONSTRUCT PROSPECTIVE COHABITATION / MARRIAGE EVENT TABLES
+# ==============================================================================
+
+panel_raw <- readRDS(
+  PANEL_RDS
+)
+
+ph_raw <- readRDS(
+  PHISTORY_RDS
+)
+
+combined_raw <- readRDS(
+  COMBINED_PANEL_RDS
+)
+
+
+required_panel <- c(
+  "pidp",
+  "wave_n",
+  "interview_ym",
+  "ncrr1"
+)
+
+required_ph <- c(
+  "pidp",
+  "status",
+  "start_ym"
+)
+
+required_combined <- c(
+  "pidp",
+  "survey",
+  "wave_num",
+  "status"
+)
+
+if (
+  length(
+    setdiff(
+      required_panel,
+      names(
+        panel_raw
+      )
+    )
+  ) > 0L
+) {
+  stop(
+    "v4.1 panel is missing required variables."
+  )
+}
+
+if (
+  length(
+    setdiff(
+      required_ph,
+      names(
+        ph_raw
+      )
+    )
+  ) > 0L
+) {
+  stop(
+    "v4.1 PHISTORY is missing required variables."
+  )
+}
+
+if (
+  length(
+    setdiff(
+      required_combined,
+      names(
+        combined_raw
+      )
+    )
+  ) > 0L
+) {
+  stop(
+    "Combined person-wave panel is missing required variables."
+  )
+}
+
+
+status_lookup <- combined_raw %>%
+  dplyr::transmute(
+    pidp =
+      normalize_pidp(
+        pidp
+      ),
+    survey =
+      as.character(
+        survey
+      ),
+    wave_n =
+      suppressWarnings(
+        as.integer(
+          wave_num
+        )
+      ),
+    status =
+      tolower(
+        as.character(
+          status
+        )
+      )
+  ) %>%
+  dplyr::filter(
+    survey ==
+      "UKHLS",
+    !is.na(
+      pidp
+    ),
+    !is.na(
+      wave_n
+    )
+  ) %>%
+  dplyr::select(
+    pidp,
+    wave_n,
+    status
+  )
+
+
+if (
+  anyDuplicated(
+    status_lookup[
+      c(
+        "pidp",
+        "wave_n"
+      )
+    ]
+  ) > 0L
+) {
+  stop(
+    "UKHLS status lookup is not unique by pidp x wave."
+  )
+}
+
+
+panel <- panel_raw %>%
+  dplyr::transmute(
+    pidp =
+      normalize_pidp(
+        pidp
+      ),
+    wave_n =
+      suppressWarnings(
+        as.integer(
+          wave_n
+        )
+      ),
+    interview_ym =
+      suppressWarnings(
+        as.numeric(
+          interview_ym
+        )
+      ),
+    ncrr1 =
+      suppressWarnings(
+        as.numeric(
+          ncrr1
+        )
+      )
+  ) %>%
+  dplyr::filter(
+    !is.na(
+      pidp
+    ),
+    !is.na(
+      wave_n
+    ),
+    is.finite(
+      interview_ym
+    )
+  ) %>%
+  dplyr::left_join(
+    status_lookup,
+    by = c(
+      "pidp",
+      "wave_n"
+    ),
+    relationship =
+      "many-to-one"
+  ) %>%
+  dplyr::arrange(
+    pidp,
+    interview_ym,
+    wave_n
+  )
+
+
+ph <- ph_raw %>%
+  dplyr::transmute(
+    pidp =
+      normalize_pidp(
+        pidp
+      ),
+    ph_status =
+      suppressWarnings(
+        as.integer(
+          status
+        )
+      ),
+    start_ym =
+      suppressWarnings(
+        as.numeric(
+          start_ym
+        )
+      )
+  ) %>%
+  dplyr::filter(
+    !is.na(
+      pidp
+    ),
+    !is.na(
+      ph_status
+    )
+  )
+
+
+# ------------------------------------------------------------------------------
+# 7A. Hybrid event candidates
+# ------------------------------------------------------------------------------
+
+ph_cohab_events <- ph %>%
+  dplyr::filter(
+    ph_status ==
+      PH_STATUS_COHAB,
+    is.finite(
+      start_ym
+    )
+  ) %>%
+  dplyr::transmute(
+    pidp,
+    event_ym =
+      start_ym,
+    event_source =
+      "PHISTORY dated cohabitation start"
+  )
+
+
+ph_marriage_events <- ph %>%
+  dplyr::filter(
+    ph_status ==
+      PH_STATUS_MARRIED,
+    is.finite(
+      start_ym
+    )
+  ) %>%
+  dplyr::transmute(
+    pidp,
+    event_ym =
+      start_ym,
+    event_source =
+      "PHISTORY dated marriage start"
+  )
+
+
+panel_cohab_events <- panel %>%
+  dplyr::filter(
+    status ==
+      PANEL_COHAB_STATUS
+  ) %>%
+  dplyr::transmute(
+    pidp,
+    event_ym =
+      interview_ym,
+    event_source =
+      "panel first observed cohabiting status"
+  )
+
+
+panel_marriage_events <- panel %>%
+  dplyr::filter(
+    status ==
+      PANEL_MARRIED_STATUS
+  ) %>%
+  dplyr::transmute(
+    pidp,
+    event_ym =
+      interview_ym,
+    event_source =
+      "panel first observed married status"
+  )
+
+
+cohab_events_hybrid <- dplyr::bind_rows(
+  ph_cohab_events,
+  panel_cohab_events
+) %>%
+  dplyr::distinct(
+    pidp,
+    event_ym,
+    event_source
+  )
+
+
+marriage_events_hybrid <- dplyr::bind_rows(
+  ph_marriage_events,
+  panel_marriage_events
+) %>%
+  dplyr::distinct(
+    pidp,
+    event_ym,
+    event_source
+  )
+
+
+event_candidate_audit <- tibble::tibble(
+  candidate_type = c(
+    "PHISTORY cohabitation starts",
+    "Panel-observed cohabiting states",
+    "Hybrid cohabitation event rows",
+    "PHISTORY marriage starts",
+    "Panel-observed married states",
+    "Hybrid marriage event rows"
+  ),
+  rows = c(
+    nrow(
+      ph_cohab_events
+    ),
+    nrow(
+      panel_cohab_events
+    ),
+    nrow(
+      cohab_events_hybrid
+    ),
+    nrow(
+      ph_marriage_events
+    ),
+    nrow(
+      panel_marriage_events
+    ),
+    nrow(
+      marriage_events_hybrid
+    )
+  )
+)
+
+write_csv_quiet(
+  event_candidate_audit,
+  "04_event_candidate_audit.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 8. SELECT FIRST LATENT-SCORE-ELIGIBLE BASELINE PER NON-OVERLAPPING EPISODE
+# ==============================================================================
+
+build_latent_episode_baselines <- function(
+    T_now,
+    measure_label
+) {
+
+  s <- score_lookups[[as.character(T_now)]] %>%
+    dplyr::filter(
+      measure ==
+        measure_label
+    ) %>%
+    dplyr::transmute(
+      pidp =
+        pidp_key,
+      wave_n =
+        baseline_wave,
+      latent_baseline_id =
+        baseline_id,
+      stable_z =
+        stable_score_SD,
+      wpvs_z =
+        current_wpvs_SD,
+      raw_current_score_sd
+    )
+
+  joined <- clean_ep %>%
+    dplyr::left_join(
+      s,
+      by = c(
+        "pidp",
+        "wave_n"
+      ),
+      relationship =
+        "many-to-one"
+    )
+
+  eligible_episode_support <- joined %>%
+    dplyr::group_by(
+      episode_uid
+    ) %>%
+    dplyr::summarise(
+      any_latent_score =
+        any(
+          is.finite(
+            stable_z
+          ) &
+            is.finite(
+              wpvs_z
+          )
+        ),
+      n_latent_score_eligible_landmarks =
+        sum(
+          is.finite(
+            stable_z
+          ) &
+            is.finite(
+              wpvs_z
+          )
+        ),
+      .groups =
+        "drop"
+    )
+
+  selected <- joined %>%
+    dplyr::filter(
+      is.finite(
+        stable_z
+      ),
+      is.finite(
+        wpvs_z
+      ),
+      is.finite(
+        clean_ym
+      ),
+      is.finite(
+        episode_followup_end_ym
+      ),
+      clean_ym <
+        episode_followup_end_ym
+    ) %>%
+    dplyr::arrange(
+      pidp,
+      episode_num,
+      clean_ym,
+      wave_n
+    ) %>%
+    dplyr::group_by(
+      pidp,
+      episode_num,
+      episode_uid
+    ) %>%
+    dplyr::slice_head(
+      n =
+        1L
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      measure =
+        measure_label,
+      T =
+        T_now,
+      baseline_wave_n =
+        wave_n,
+      baseline_ym =
+        clean_ym,
+      baseline_delay_from_episode_start =
+        baseline_ym -
+        episode_start_ym,
+      followup_end_ym =
+        episode_followup_end_ym,
+      followup_months =
+        followup_end_ym -
+        baseline_ym,
+      baseline_year =
+        suppressWarnings(
+          as.integer(
+            interview_year
+          )
+        ),
+      recurrent_episode =
+        as.integer(
+          episode_num >=
+            2L
+        )
+    ) %>%
+    dplyr::filter(
+      is.finite(
+        followup_months
+      ),
+      followup_months >
+        0,
+      is.finite(
+        baseline_delay_from_episode_start
+      ),
+      baseline_delay_from_episode_start >=
+        0,
+      is.finite(
+        age_c
+      ),
+      !is.na(
+        sex
+      )
+    )
+
+  audit <- tibble::tibble(
+    T =
+      T_now,
+    measure =
+      measure_label,
+    clean_landmarks =
+      nrow(
+        joined
+      ),
+    clean_episodes =
+      dplyr::n_distinct(
+        joined$episode_uid
+      ),
+    episodes_with_any_latent_score =
+      sum(
+        eligible_episode_support$any_latent_score
+      ),
+    selected_episode_baselines =
+      nrow(
+        selected
+      ),
+    selected_people =
+      dplyr::n_distinct(
+        selected$pidp
+      ),
+    recurrent_episode_baselines =
+      sum(
+        selected$recurrent_episode ==
+          1L
+      ),
+    median_baseline_delay_months =
+      safe_median(
+        selected$baseline_delay_from_episode_start
+      ),
+    median_followup_months =
+      safe_median(
+        selected$followup_months
+      )
+  )
+
+  list(
+    selected =
+      selected,
+    episode_support =
+      eligible_episode_support,
+    audit =
+      audit
+  )
+}
+
+
+# ==============================================================================
+# 9. ATTACH FIRST EVENT AFTER EACH LATENT BASELINE
+# ==============================================================================
+
+attach_first_event <- function(
+    baselines,
+    event_tbl,
+    event_stub
+) {
+
+  if (
+    nrow(
+      baselines
+    ) ==
+      0L
+  ) {
+
+    out <- baselines
+
+    out[[paste0(event_stub, "_event")]] <- integer(
+      0
+    )
+
+    out[[paste0(event_stub, "_ym")]] <- numeric(
+      0
+    )
+
+    out[[paste0("months_to_", event_stub)]] <- numeric(
+      0
+    )
+
+    out[[paste0(event_stub, "_source")]] <- character(
+      0
+    )
+
+    return(out)
+  }
+
+  base_for_join <- baselines %>%
+    dplyr::select(
+      episode_uid,
+      pidp,
+      baseline_ym,
+      followup_end_ym,
+      end_is_next_episode
+    )
+
+  candidates <- base_for_join %>%
+    dplyr::inner_join(
+      event_tbl,
+      by =
+        "pidp",
+      relationship =
+        "many-to-many"
+    ) %>%
+    dplyr::mutate(
+      eligible_event =
+        in_followup_interval(
+          event_ym =
+            event_ym,
+          baseline_ym =
+            baseline_ym,
+          end_ym =
+            followup_end_ym,
+          end_is_next_episode =
+            end_is_next_episode
+        ),
+      phistory_source =
+        stringr::str_detect(
+          event_source,
+          "^PHISTORY"
+        )
+    ) %>%
+    dplyr::filter(
+      eligible_event
+    ) %>%
+    dplyr::arrange(
+      episode_uid,
+      event_ym,
+      dplyr::desc(
+        phistory_source
+      )
+    ) %>%
+    dplyr::group_by(
+      episode_uid
+    ) %>%
+    dplyr::slice_head(
+      n =
+        1L
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::transmute(
+      episode_uid,
+      first_event_ym =
+        event_ym,
+      first_event_source =
+        event_source
+    )
+
+  out <- baselines %>%
+    dplyr::left_join(
+      candidates,
+      by =
+        "episode_uid",
+      relationship =
+        "one-to-one"
+    ) %>%
+    dplyr::mutate(
+      event_flag =
+        dplyr::if_else(
+          !is.na(
+            first_event_ym
+          ),
+          1L,
+          0L
+        ),
+      months_to_event =
+        first_event_ym -
+        baseline_ym
+    )
+
+  names(out)[
+    names(out) ==
+      "event_flag"
+  ] <- paste0(
+    event_stub,
+    "_event"
+  )
+
+  names(out)[
+    names(out) ==
+      "first_event_ym"
+  ] <- paste0(
+    event_stub,
+    "_ym"
+  )
+
+  names(out)[
+    names(out) ==
+      "months_to_event"
+  ] <- paste0(
+    "months_to_",
+    event_stub
+  )
+
+  names(out)[
+    names(out) ==
+      "first_event_source"
+  ] <- paste0(
+    event_stub,
+    "_source"
+  )
+
+  out
+}
+
+
+attach_primary_outcomes <- function(
+    baselines
+) {
+
+  out <- attach_first_event(
+    baselines,
+    cohab_events_hybrid,
+    "cohab"
+  )
+
+  out <- attach_first_event(
+    out,
+    marriage_events_hybrid,
+    "marriage"
+  )
+
+  out %>%
+    dplyr::mutate(
+      any_core_event =
+        dplyr::if_else(
+          cohab_event ==
+            1L |
+            marriage_event ==
+            1L,
+          1L,
+          0L
+        ),
+      first_core_ym =
+        dplyr::case_when(
+          cohab_event ==
+            1L &
+            marriage_event ==
+            1L ~
+              pmin(
+                cohab_ym,
+                marriage_ym,
+                na.rm = TRUE
+              ),
+          cohab_event ==
+            1L ~
+              cohab_ym,
+          marriage_event ==
+            1L ~
+              marriage_ym,
+          TRUE ~
+            NA_real_
+        ),
+      months_to_first_core =
+        first_core_ym -
+        baseline_ym
+    )
+}
+
+
+# ------------------------------------------------------------------------------
+# 9A. Build all T-specific latent episode baseline datasets
+# ------------------------------------------------------------------------------
+
+episode_datasets <- list()
+episode_audits <- list()
+episode_idx <- 0L
+
+
+for (
+  T_now in T_VALUES
+) {
+
+  for (
+    measure_label in c(
+      "Life satisfaction",
+      "Psychological distress"
+    )
+  ) {
+
+    built <- build_latent_episode_baselines(
+      T_now =
+        T_now,
+      measure_label =
+        measure_label
+    )
+
+    with_outcomes <- attach_primary_outcomes(
+      built$selected
+    )
+
+    episode_idx <- episode_idx + 1L
+
+    key <- paste0(
+      "T",
+      T_now,
+      "__",
+      ifelse(
+        measure_label ==
+          "Life satisfaction",
+        "LS",
+        "DISTRESS"
+      )
+    )
+
+    episode_datasets[[key]] <- with_outcomes
+
+    event_counts <- tibble::tibble(
+      T =
+        T_now,
+      measure =
+        measure_label,
+      cohab_events =
+        sum(
+          with_outcomes$cohab_event ==
+            1L,
+          na.rm = TRUE
+        ),
+      marriage_events =
+        sum(
+          with_outcomes$marriage_event ==
+            1L,
+          na.rm = TRUE
+        ),
+      either_events =
+        sum(
+          with_outcomes$any_core_event ==
+            1L,
+          na.rm = TRUE
+        )
+    )
+
+    episode_audits[[episode_idx]] <- built$audit %>%
+      dplyr::left_join(
+        event_counts,
+        by = c(
+          "T",
+          "measure"
+        )
+      )
+
+    if (
+      SAVE_ANALYTIC_DATA
+    ) {
+
+      saveRDS(
+        with_outcomes,
+        file.path(
+          DATA_DIR,
+          paste0(
+            key,
+            "_nonoverlapping_episode_baselines_with_outcomes.rds"
+          )
+        )
+      )
+    }
+  }
+}
+
+
+episode_audits <- dplyr::bind_rows(
+  episode_audits
+)
+
+write_csv_quiet(
+  episode_audits,
+  "05_latent_episode_baseline_and_event_support.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 10. CONSTRUCT SURVIVAL ENDPOINTS
+# ==============================================================================
+
+ENDPOINT_ORDER <- c(
+  "Cohabitation",
+  "Marriage",
+  "Cohabitation or marriage"
+)
+
+
+endpoint_estimand <- function(
+    endpoint
+) {
+
+  switch(
+    endpoint,
+    "Cohabitation" =
+      paste(
+        "Cause-specific hazard of first subsequent cohabitation;",
+        "marriage before/same month as cohabitation ends risk as a competing event"
+      ),
+    "Marriage" =
+      paste(
+        "Hazard of first subsequent marriage;",
+        "cohabitation is allowed as an intermediate state"
+      ),
+    "Cohabitation or marriage" =
+      paste(
+        "Hazard of first subsequent cohabitation or marriage,",
+        "whichever occurs first"
+      ),
+    endpoint
+  )
+}
+
+
+make_endpoint_data <- function(
+    dat,
+    endpoint
+) {
+
+  cohab_time <- dplyr::if_else(
+    dat$cohab_event ==
+      1L &
+      is.finite(
+        dat$months_to_cohab
+      ) &
+      dat$months_to_cohab >
+      0,
+    dat$months_to_cohab,
+    Inf
+  )
+
+  marriage_time <- dplyr::if_else(
+    dat$marriage_event ==
+      1L &
+      is.finite(
+        dat$months_to_marriage
+      ) &
+      dat$months_to_marriage >
+      0,
+    dat$months_to_marriage,
+    Inf
+  )
+
+  censor_time <-
+    dat$followup_months
+
+  if (
+    endpoint ==
+      "Cohabitation"
+  ) {
+
+    time <- pmin(
+      cohab_time,
+      marriage_time,
+      censor_time,
+      na.rm = TRUE
+    )
+
+    event <- as.integer(
+      is.finite(
+        cohab_time
+      ) &
+        cohab_time <
+        marriage_time &
+        cohab_time <=
+        censor_time
+    )
+
+    competing_marriage <- as.integer(
+      is.finite(
+        marriage_time
+      ) &
+        marriage_time <=
+        cohab_time &
+        marriage_time <=
+        censor_time
+    )
+
+  } else if (
+    endpoint ==
+      "Marriage"
+  ) {
+
+    time <- pmin(
+      marriage_time,
+      censor_time,
+      na.rm = TRUE
+    )
+
+    event <- as.integer(
+      is.finite(
+        marriage_time
+      ) &
+        marriage_time <=
+        censor_time
+    )
+
+    competing_marriage <- rep(
+      0L,
+      nrow(
+        dat
+      )
+    )
+
+  } else if (
+    endpoint ==
+      "Cohabitation or marriage"
+  ) {
+
+    core_time <- pmin(
+      cohab_time,
+      marriage_time,
+      na.rm = TRUE
+    )
+
+    time <- pmin(
+      core_time,
+      censor_time,
+      na.rm = TRUE
+    )
+
+    event <- as.integer(
+      is.finite(
+        core_time
+      ) &
+        core_time <=
+        censor_time
+    )
+
+    competing_marriage <- rep(
+      0L,
+      nrow(
+        dat
+      )
+    )
+
+  } else {
+
+    stop(
+      "Unknown endpoint: ",
+      endpoint
+    )
+  }
+
+  endpoint_label <-
+    endpoint
+
+  estimand_label <-
+    endpoint_estimand(
+      endpoint_label
+    )
+
+  dat %>%
+    dplyr::mutate(
+      endpoint =
+        .env$endpoint_label,
+      estimand =
+        .env$estimand_label,
+      time =
+        as.numeric(
+          .env$time
+        ),
+      event =
+        as.integer(
+          .env$event
+        ),
+      competing_marriage =
+        as.integer(
+          .env$competing_marriage
+        )
+    ) %>%
+    dplyr::filter(
+      is.finite(
+        time
+      ),
+      time >
+        0,
+      event %in%
+        c(
+          0L,
+          1L
+        )
+    )
+}
+
+
+# ==============================================================================
+# 11. COX MODEL HELPERS
+# ==============================================================================
+
+build_cox_formula <- function(
+    dat
+) {
+
+  rhs <- c(
+    "stable_z",
+    "wpvs_z",
+    "age_c",
+    "I(age_c^2)"
+  )
+
+  sex_nonmissing <- dat$sex[
+    !is.na(
+      dat$sex
+    )
+  ]
+
+  if (
+    length(
+      unique(
+        sex_nonmissing
+      )
+    ) >=
+      2L
+  ) {
+    rhs <- c(
+      rhs,
+      "factor(sex)"
+    )
+  }
+
+  if (
+    length(
+      unique(
+        dat$recurrent_episode
+      )
+    ) >=
+      2L
+  ) {
+    rhs <- c(
+      rhs,
+      "recurrent_episode"
+    )
+  }
+
+  n_delay_values <- length(
+    unique(
+      dat$baseline_delay_from_episode_start[
+        is.finite(
+          dat$baseline_delay_from_episode_start
+        )
+      ]
+    )
+  )
+
+  if (
+    n_delay_values >=
+      4L
+  ) {
+
+    rhs <- c(
+      rhs,
+      "splines::ns(baseline_delay_from_episode_start, df = 3)"
+    )
+
+  } else if (
+    n_delay_values >=
+      2L
+  ) {
+
+    rhs <- c(
+      rhs,
+      "baseline_delay_from_episode_start"
+    )
+  }
+
+  if (
+    length(
+      unique(
+        dat$baseline_year
+      )
+    ) >=
+      2L
+  ) {
+
+    rhs <- c(
+      rhs,
+      "strata(baseline_year)"
+    )
+  }
+
+  rhs <- c(
+    rhs,
+    "cluster(pidp)"
+  )
+
+  stats::as.formula(
+    paste(
+      "survival::Surv(time, event)",
+      "~",
+      paste(
+        rhs,
+        collapse =
+          " + "
+      )
+    )
+  )
+}
+
+
+empty_cox_coefficients <- function(
+    T_now,
+    measure,
+    endpoint,
+    status
+) {
+
+  tibble::tibble(
+    design =
+      "Non-overlapping clean-unpartnered Cox",
+    endpoint =
+      endpoint,
+    estimand =
+      endpoint_estimand(
+        endpoint
+      ),
+    measure =
+      measure,
+    T =
+      T_now,
+    component =
+      c(
+        "Stable between-person component",
+        "Current within-person component (WPVS)"
+      ),
+    term =
+      c(
+        "stable_z",
+        "wpvs_z"
+      ),
+    estimate_log_hr =
+      NA_real_,
+    robust_se =
+      NA_real_,
+    hazard_ratio =
+      NA_real_,
+    conf_low =
+      NA_real_,
+    conf_high =
+      NA_real_,
+    p_value =
+      NA_real_,
+    n_rows =
+      NA_integer_,
+    n_people =
+      NA_integer_,
+    n_events =
+      NA_integer_,
+    n_competing_marriages =
+      NA_integer_,
+    status =
+      status
+  )
+}
+
+
+cox_joint_test <- function(
+    fit,
+    dat,
+    T_now,
+    measure,
+    endpoint
+) {
+
+  out <- tibble::tibble(
+    design =
+      "Non-overlapping clean-unpartnered Cox",
+    endpoint =
+      endpoint,
+    estimand =
+      endpoint_estimand(
+        endpoint
+      ),
+    measure =
+      measure,
+    T =
+      T_now,
+    test =
+      "Stable + current WPVS = 0",
+    statistic =
+      NA_real_,
+    df =
+      2L,
+    p_value =
+      NA_real_,
+    n_rows =
+      nrow(
+        dat
+      ),
+    n_people =
+      dplyr::n_distinct(
+        dat$pidp
+      ),
+    n_events =
+      sum(
+        dat$event ==
+          1L
+      ),
+    status =
+      "MODEL_MISSING"
+  )
+
+  if (
+    is.null(
+      fit
+    )
+  ) {
+    return(
+      out
+    )
+  }
+
+  terms <- c(
+    "stable_z",
+    "wpvs_z"
+  )
+
+  b <- stats::coef(
+    fit
+  )
+
+  V <- tryCatch(
+    stats::vcov(
+      fit
+    ),
+    error =
+      function(e) NULL
+  )
+
+  if (
+    is.null(
+      V
+    ) ||
+      !all(
+        terms %in%
+          names(
+            b
+          )
+      ) ||
+      !all(
+        terms %in%
+          rownames(
+            V
+          )
+      )
+  ) {
+
+    out$status <-
+      "TERM_OR_VCOV_MISSING"
+
+    return(
+      out
+    )
+  }
+
+  bb <- as.numeric(
+    b[
+      terms
+    ]
+  )
+
+  VV <- as.matrix(
+    V[
+      terms,
+      terms,
+      drop =
+        FALSE
+    ]
+  )
+
+  invV <- safe_inverse(
+    VV
+  )
+
+  if (
+    is.null(
+      invV
+    ) ||
+      any(
+        !is.finite(
+          bb
+        )
+      )
+  ) {
+
+    out$status <-
+      "NONINVERTIBLE_OR_NONFINITE"
+
+    return(
+      out
+    )
+  }
+
+  W <- as.numeric(
+    t(
+      bb
+    ) %*%
+      invV %*%
+      bb
+  )
+
+  out$statistic <-
+    W
+
+  out$p_value <-
+    stats::pchisq(
+      W,
+      df =
+        2L,
+      lower.tail =
+        FALSE
+    )
+
+  out$status <-
+    "OK"
+
+  out
+}
+
+
+cox_component_difference <- function(
+    fit,
+    dat,
+    T_now,
+    measure,
+    endpoint
+) {
+
+  out <- tibble::tibble(
+    design =
+      "Non-overlapping clean-unpartnered Cox",
+    endpoint =
+      endpoint,
+    estimand =
+      endpoint_estimand(
+        endpoint
+      ),
+    measure =
+      measure,
+    T =
+      T_now,
+    test =
+      "Stable coefficient = current WPVS coefficient",
+    difference_log_hr =
+      NA_real_,
+    robust_se_difference =
+      NA_real_,
+    statistic_z =
+      NA_real_,
+    p_value =
+      NA_real_,
+    n_rows =
+      nrow(
+        dat
+      ),
+    n_people =
+      dplyr::n_distinct(
+        dat$pidp
+      ),
+    n_events =
+      sum(
+        dat$event ==
+          1L
+      ),
+    status =
+      "MODEL_MISSING"
+  )
+
+  if (
+    is.null(
+      fit
+    )
+  ) {
+    return(out)
+  }
+
+  terms <- c(
+    "stable_z",
+    "wpvs_z"
+  )
+
+  b <- stats::coef(
+    fit
+  )
+
+  V <- tryCatch(
+    stats::vcov(
+      fit
+    ),
+    error =
+      function(e) NULL
+  )
+
+  if (
+    is.null(
+      V
+    ) ||
+      !all(
+        terms %in%
+          names(
+            b
+          )
+      ) ||
+      !all(
+        terms %in%
+          rownames(
+            V
+          )
+      )
+  ) {
+
+    out$status <-
+      "TERM_OR_VCOV_MISSING"
+
+    return(out)
+  }
+
+  diff <-
+    as.numeric(
+      b[["stable_z"]] -
+        b[["wpvs_z"]]
+    )
+
+  var_diff <-
+    V[
+      "stable_z",
+      "stable_z"
+    ] +
+    V[
+      "wpvs_z",
+      "wpvs_z"
+    ] -
+    2 *
+    V[
+      "stable_z",
+      "wpvs_z"
+    ]
+
+  if (
+    !is.finite(
+      var_diff
+    ) ||
+      var_diff <=
+      0
+  ) {
+
+    out$status <-
+      "INVALID_VARIANCE"
+
+    return(out)
+  }
+
+  se_diff <-
+    sqrt(
+      var_diff
+    )
+
+  z <-
+    diff /
+    se_diff
+
+  out$difference_log_hr <-
+    diff
+
+  out$robust_se_difference <-
+    se_diff
+
+  out$statistic_z <-
+    z
+
+  out$p_value <-
+    2 *
+    stats::pnorm(
+      abs(
+        z
+      ),
+      lower.tail =
+        FALSE
+    )
+
+  out$status <-
+    "OK"
+
+  out
+}
+
+
+cox_ph_diagnostic <- function(
+    fit,
+    T_now,
+    measure,
+    endpoint
+) {
+
+  if (
+    is.null(
+      fit
+    )
+  ) {
+
+    return(
+      tibble::tibble(
+        T =
+          T_now,
+        measure =
+          measure,
+        endpoint =
+          endpoint,
+        term =
+          NA_character_,
+        rho =
+          NA_real_,
+        chisq =
+          NA_real_,
+        p_value =
+          NA_real_,
+        status =
+          "MODEL_MISSING"
+      )
+    )
+  }
+
+  zph <- tryCatch(
+    survival::cox.zph(
+      fit,
+      transform =
+        "km"
+    ),
+    error =
+      function(e) e
+  )
+
+  if (
+    inherits(
+      zph,
+      "error"
+    )
+  ) {
+
+    return(
+      tibble::tibble(
+        T =
+          T_now,
+        measure =
+          measure,
+        endpoint =
+          endpoint,
+        term =
+          NA_character_,
+        rho =
+          NA_real_,
+        chisq =
+          NA_real_,
+        p_value =
+          NA_real_,
+        status =
+          paste0(
+            "COX_ZPH_ERROR: ",
+            conditionMessage(
+              zph
+            )
+          )
+      )
+    )
+  }
+
+  tab <- as.data.frame(
+    zph$table
+  )
+
+  tab$term <- rownames(
+    tab
+  )
+
+  rownames(
+    tab
+  ) <- NULL
+
+  tibble::tibble(
+    T =
+      T_now,
+    measure =
+      measure,
+    endpoint =
+      endpoint,
+    term =
+      tab$term,
+    rho =
+      if (
+        "rho" %in%
+          names(
+            tab
+          )
+      ) {
+        suppressWarnings(
+          as.numeric(
+            tab[["rho"]]
+          )
+        )
+      } else {
+        NA_real_
+      },
+    chisq =
+      if (
+        "chisq" %in%
+          names(
+            tab
+          )
+      ) {
+        suppressWarnings(
+          as.numeric(
+            tab[["chisq"]]
+          )
+        )
+      } else {
+        NA_real_
+      },
+    p_value =
+      if (
+        "p" %in%
+          names(
+            tab
+          )
+      ) {
+        suppressWarnings(
+          as.numeric(
+            tab[["p"]]
+          )
+        )
+      } else {
+        NA_real_
+      },
+    status =
+      "OK"
+  )
+}
+
+
+fit_one_cox <- function(
+    dat,
+    T_now,
+    measure,
+    endpoint,
+    run_ph = FALSE,
+    save_model = TRUE
+) {
+
+  d <- make_endpoint_data(
+    dat,
+    endpoint
+  )
+
+  if (
+    nrow(
+      d
+    ) <
+      20L ||
+      sum(
+        d$event ==
+          1L
+      ) <
+      5L
+  ) {
+
+    return(
+      list(
+        coefficients =
+          empty_cox_coefficients(
+            T_now,
+            measure,
+            endpoint,
+            "INSUFFICIENT_EVENTS"
+          ),
+        joint =
+          cox_joint_test(
+            NULL,
+            d,
+            T_now,
+            measure,
+            endpoint
+          ),
+        difference =
+          cox_component_difference(
+            NULL,
+            d,
+            T_now,
+            measure,
+            endpoint
+          ),
+        ph =
+          if (
+            run_ph
+          ) {
+            cox_ph_diagnostic(
+              NULL,
+              T_now,
+              measure,
+              endpoint
+            )
+          } else {
+            NULL
+          },
+        model =
+          NULL,
+        data =
+          d
+      )
+    )
+  }
+
+  formula <- build_cox_formula(
+    d
+  )
+
+  fit <- tryCatch(
+    survival::coxph(
+      formula =
+        formula,
+      data =
+        d,
+      ties =
+        COX_TIES,
+      na.action =
+        stats::na.omit,
+      x =
+        TRUE,
+      y =
+        TRUE,
+      model =
+        TRUE,
+      control =
+        survival::coxph.control(
+          iter.max =
+            50
+        )
+    ),
+    error =
+      function(e) e
+  )
+
+  stub <- paste0(
+    "COX_T",
+    T_now,
+    "_",
+    ifelse(
+      measure ==
+        "Life satisfaction",
+      "LS_",
+      "DISTRESS_"
+    ),
+    dplyr::case_when(
+      endpoint ==
+        "Cohabitation" ~
+          "COHAB",
+      endpoint ==
+        "Marriage" ~
+          "MARRIAGE",
+      endpoint ==
+        "Cohabitation or marriage" ~
+          "COHAB_OR_MARRIAGE",
+      TRUE ~
+          "ENDPOINT"
+    )
+  )
+
+  if (
+    inherits(
+      fit,
+      "error"
+    )
+  ) {
+
+    write_txt(
+      c(
+        "MODEL FAILED",
+        "",
+        "Formula:",
+        paste(
+          deparse(
+            formula
+          ),
+          collapse =
+            " "
+        ),
+        "",
+        "Error:",
+        conditionMessage(
+          fit
+        )
+      ),
+      paste0(
+        stub,
+        "_ERROR.txt"
+      ),
+      "models"
+    )
+
+    fit <- NULL
+  }
+
+  if (
+    !is.null(
+      fit
+    ) &&
+      save_model
+  ) {
+
+    saveRDS(
+      fit,
+      file.path(
+        MODEL_DIR,
+        paste0(
+          stub,
+          ".rds"
+        )
+      )
+    )
+
+    write_txt(
+      c(
+        "FORMULA",
+        paste(
+          deparse(
+            formula
+          ),
+          collapse =
+            " "
+        ),
+        "",
+        capture.output(
+          summary(
+            fit
+          )
+        )
+      ),
+      paste0(
+        stub,
+        "_summary.txt"
+      ),
+      "models"
+    )
+  }
+
+  if (
+    is.null(
+      fit
+    )
+  ) {
+
+    return(
+      list(
+        coefficients =
+          empty_cox_coefficients(
+            T_now,
+            measure,
+            endpoint,
+            "MODEL_ERROR"
+          ),
+        joint =
+          cox_joint_test(
+            NULL,
+            d,
+            T_now,
+            measure,
+            endpoint
+          ),
+        difference =
+          cox_component_difference(
+            NULL,
+            d,
+            T_now,
+            measure,
+            endpoint
+          ),
+        ph =
+          if (
+            run_ph
+          ) {
+            cox_ph_diagnostic(
+              NULL,
+              T_now,
+              measure,
+              endpoint
+            )
+          } else {
+            NULL
+          },
+        model =
+          NULL,
+        data =
+          d
+      )
+    )
+  }
+
+  b <- stats::coef(
+    fit
+  )
+
+  V <- stats::vcov(
+    fit
+  )
+
+  extract_one <- function(
+      term,
+      component
+  ) {
+
+    if (
+      !term %in%
+        names(
+          b
+        ) ||
+        !term %in%
+        rownames(
+          V
+        )
+    ) {
+
+      return(
+        tibble::tibble(
+          design =
+            "Non-overlapping clean-unpartnered Cox",
+          endpoint =
+            endpoint,
+          estimand =
+            endpoint_estimand(
+              endpoint
+            ),
+          measure =
+            measure,
+          T =
+            T_now,
+          component =
+            component,
+          term =
+            term,
+          estimate_log_hr =
+            NA_real_,
+          robust_se =
+            NA_real_,
+          hazard_ratio =
+            NA_real_,
+          conf_low =
+            NA_real_,
+          conf_high =
+            NA_real_,
+          p_value =
+            NA_real_,
+          n_rows =
+            nrow(
+              d
+            ),
+          n_people =
+            dplyr::n_distinct(
+              d$pidp
+            ),
+          n_events =
+            sum(
+              d$event ==
+                1L
+            ),
+          n_competing_marriages =
+            if (
+              endpoint ==
+                "Cohabitation"
+            ) {
+              sum(
+                d$competing_marriage ==
+                  1L
+              )
+            } else {
+              NA_integer_
+            },
+          status =
+            "TERM_MISSING"
+        )
+      )
+    }
+
+    est <- as.numeric(
+      b[[term]]
+    )
+
+    se <- sqrt(
+      as.numeric(
+        V[
+          term,
+          term
+        ]
+      )
+    )
+
+    if (
+      !is.finite(
+        se
+      ) ||
+        se <=
+        0
+    ) {
+
+      return(
+        tibble::tibble(
+          design =
+            "Non-overlapping clean-unpartnered Cox",
+          endpoint =
+            endpoint,
+          estimand =
+            endpoint_estimand(
+              endpoint
+            ),
+          measure =
+            measure,
+          T =
+            T_now,
+          component =
+            component,
+          term =
+            term,
+          estimate_log_hr =
+            est,
+          robust_se =
+            se,
+          hazard_ratio =
+            exp(
+              est
+            ),
+          conf_low =
+            NA_real_,
+          conf_high =
+            NA_real_,
+          p_value =
+            NA_real_,
+          n_rows =
+            nrow(
+              d
+            ),
+          n_people =
+            dplyr::n_distinct(
+              d$pidp
+            ),
+          n_events =
+            sum(
+              d$event ==
+                1L
+            ),
+          n_competing_marriages =
+            if (
+              endpoint ==
+                "Cohabitation"
+            ) {
+              sum(
+                d$competing_marriage ==
+                  1L
+              )
+            } else {
+              NA_integer_
+            },
+          status =
+            "INVALID_SE"
+        )
+      )
+    }
+
+    ci <- normal_ci(
+      est,
+      se
+    )
+
+    tibble::tibble(
+      design =
+        "Non-overlapping clean-unpartnered Cox",
+      endpoint =
+        endpoint,
+      estimand =
+        endpoint_estimand(
+          endpoint
+        ),
+      measure =
+        measure,
+      T =
+        T_now,
+      component =
+        component,
+      term =
+        term,
+      estimate_log_hr =
+        est,
+      robust_se =
+        se,
+      hazard_ratio =
+        exp(
+          est
+        ),
+      conf_low =
+        exp(
+          ci[
+            1L
+          ]
+        ),
+      conf_high =
+        exp(
+          ci[
+            2L
+          ]
+        ),
+      p_value =
+        2 *
+        stats::pnorm(
+          abs(
+            est /
+              se
+          ),
+          lower.tail =
+            FALSE
+        ),
+      n_rows =
+        nrow(
+          d
+        ),
+      n_people =
+        dplyr::n_distinct(
+          d$pidp
+        ),
+      n_events =
+        sum(
+          d$event ==
+            1L
+        ),
+      n_competing_marriages =
+        if (
+          endpoint ==
+            "Cohabitation"
+        ) {
+          sum(
+            d$competing_marriage ==
+              1L
+          )
+        } else {
+          NA_integer_
+        },
+      status =
+        "OK"
+    )
+  }
+
+  coefficients <- dplyr::bind_rows(
+    extract_one(
+      "stable_z",
+      "Stable between-person component"
+    ),
+    extract_one(
+      "wpvs_z",
+      "Current within-person component (WPVS)"
+    )
+  )
+
+  list(
+    coefficients =
+      coefficients,
+    joint =
+      cox_joint_test(
+        fit,
+        d,
+        T_now,
+        measure,
+        endpoint
+      ),
+    difference =
+      cox_component_difference(
+        fit,
+        d,
+        T_now,
+        measure,
+        endpoint
+      ),
+    ph =
+      if (
+        run_ph
+      ) {
+        cox_ph_diagnostic(
+          fit,
+          T_now,
+          measure,
+          endpoint
+        )
+      } else {
+        NULL
+      },
+    model =
+      fit,
+    data =
+      d
+  )
+}
+
+
+# ==============================================================================
+# 12. RUN COX MODEL FAMILIES
+# ==============================================================================
+
+cox_results <- list()
+cox_idx <- 0L
+
+
+for (
+  T_now in T_VALUES
+) {
+
+  for (
+    measure_label in c(
+      "Life satisfaction",
+      "Psychological distress"
+    )
+  ) {
+
+    key <- paste0(
+      "T",
+      T_now,
+      "__",
+      ifelse(
+        measure_label ==
+          "Life satisfaction",
+        "LS",
+        "DISTRESS"
+      )
+    )
+
+    dat <- episode_datasets[[key]]
+
+    for (
+      endpoint in ENDPOINT_ORDER
+    ) {
+
+      cox_idx <- cox_idx + 1L
+
+      fit <- fit_one_cox(
+        dat =
+          dat,
+        T_now =
+          T_now,
+        measure =
+          measure_label,
+        endpoint =
+          endpoint,
+        run_ph =
+          RUN_PRIMARY_PH_DIAGNOSTICS &&
+          T_now ==
+          PRIMARY_T,
+        save_model =
+          TRUE
+      )
+
+      cox_results[[cox_idx]] <- list(
+        T =
+          T_now,
+        measure =
+          measure_label,
+        endpoint =
+          endpoint,
+        coefficients =
+          fit$coefficients,
+        joint =
+          fit$joint,
+        difference =
+          fit$difference,
+        ph =
+          fit$ph,
+        n_rows =
+          nrow(
+            fit$data
+          ),
+        n_people =
+          dplyr::n_distinct(
+            fit$data$pidp
+          ),
+        n_events =
+          sum(
+            fit$data$event ==
+              1L
+          ),
+        n_competing_marriages =
+          if (
+            endpoint ==
+              "Cohabitation"
+          ) {
+            sum(
+              fit$data$competing_marriage ==
+                1L
+            )
+          } else {
+            NA_integer_
+          }
+      )
+    }
+  }
+}
+
+
+cox_coefficients <- dplyr::bind_rows(
+  purrr::map(
+    cox_results,
+    "coefficients"
+  )
+)
+
+cox_joint <- dplyr::bind_rows(
+  purrr::map(
+    cox_results,
+    "joint"
+  )
+)
+
+cox_difference <- dplyr::bind_rows(
+  purrr::map(
+    cox_results,
+    "difference"
+  )
+)
+
+cox_ph <- dplyr::bind_rows(
+  purrr::map(
+    cox_results,
+    "ph"
+  )
+)
+
+cox_sample_support <- purrr::map_dfr(
+  cox_results,
+  function(x) {
+
+    tibble::tibble(
+      T =
+        x$T,
+      measure =
+        x$measure,
+      endpoint =
+        x$endpoint,
+      rows =
+        x$n_rows,
+      people =
+        x$n_people,
+      events =
+        x$n_events,
+      competing_marriages =
+        x$n_competing_marriages
+    )
+  }
+)
+
+
+# ------------------------------------------------------------------------------
+# 12A. Holm adjustment within each T-specific Cox family
+# ------------------------------------------------------------------------------
+
+cox_coefficients <- cox_coefficients %>%
+  dplyr::group_by(
+    T
+  ) %>%
+  dplyr::mutate(
+    p_holm_COX_12 =
+      adjust_valid_p(
+        p_value,
+        status,
+        method =
+          "holm",
+        n_total =
+          N_COX_COMPONENT_TESTS
+      )
+  ) %>%
+  dplyr::ungroup()
+
+
+cox_joint <- cox_joint %>%
+  dplyr::group_by(
+    T
+  ) %>%
+  dplyr::mutate(
+    p_holm_COX_6_joint =
+      adjust_valid_p(
+        p_value,
+        status,
+        method =
+          "holm",
+        n_total =
+          N_COX_JOINT_TESTS
+      )
+  ) %>%
+  dplyr::ungroup()
+
+
+cox_difference <- cox_difference %>%
+  dplyr::group_by(
+    T
+  ) %>%
+  dplyr::mutate(
+    p_holm_COX_6_difference =
+      adjust_valid_p(
+        p_value,
+        status,
+        method =
+          "holm",
+        n_total =
+          N_COX_DIFFERENCE_TESTS
+      )
+  ) %>%
+  dplyr::ungroup()
+
+
+write_csv_quiet(
+  cox_sample_support,
+  "06_COX_model_sample_support.csv",
+  "diagnostics"
+)
+
+if (
+  nrow(
+    cox_ph
+  ) >
+    0L
+) {
+
+  write_csv_quiet(
+    cox_ph,
+    "07_PRIMARY_T4_proportional_hazards_diagnostics.csv",
+    "diagnostics"
+  )
+}
+
+
+# ==============================================================================
+# 13. PRIMARY T=4 H1 TABLES
+# ==============================================================================
+
+lat_primary <- lat_coefficients %>%
+  dplyr::filter(
+    T ==
+      PRIMARY_T
+  ) %>%
+  dplyr::mutate(
+    effect_type =
+      "OR",
+    effect =
+      odds_ratio,
+    p_holm =
+      p_holm_LAT_4,
+    design_panel =
+      "Panel A. Incident LAT formation"
+  ) %>%
+  dplyr::transmute(
+    design_panel,
+    endpoint,
+    measure,
+    component,
+    effect_type,
+    effect,
+    conf_low,
+    conf_high,
+    p_value,
+    p_holm,
+    n_rows,
+    n_people,
+    n_events =
+      n_cases,
+    T,
+    status
+  )
+
+
+cox_primary <- cox_coefficients %>%
+  dplyr::filter(
+    T ==
+      PRIMARY_T
+  ) %>%
+  dplyr::mutate(
+    effect_type =
+      "HR",
+    effect =
+      hazard_ratio,
+    p_holm =
+      p_holm_COX_12,
+    design_panel =
+      "Panel B. Cohabitation and marriage from clean-unpartnered episodes"
+  ) %>%
+  dplyr::transmute(
+    design_panel,
+    endpoint,
+    measure,
+    component,
+    effect_type,
+    effect,
+    conf_low,
+    conf_high,
+    p_value,
+    p_holm,
+    n_rows,
+    n_people,
+    n_events,
+    T,
+    status
+  )
+
+
+H1_primary_table <- dplyr::bind_rows(
+  lat_primary,
+  cox_primary
+) %>%
+  dplyr::mutate(
+    endpoint_order =
+      dplyr::case_when(
+        endpoint ==
+          "Incident LAT formation" ~
+            1L,
+        endpoint ==
+          "Cohabitation" ~
+            2L,
+        endpoint ==
+          "Marriage" ~
+            3L,
+        endpoint ==
+          "Cohabitation or marriage" ~
+            4L,
+        TRUE ~
+            99L
+      ),
+    measure_order =
+      dplyr::case_when(
+        measure ==
+          "Life satisfaction" ~
+            1L,
+        TRUE ~
+            2L
+      ),
+    component_order =
+      dplyr::case_when(
+        component ==
+          "Stable between-person component" ~
+            1L,
+        TRUE ~
+            2L
+      )
+  ) %>%
+  dplyr::arrange(
+    endpoint_order,
+    measure_order,
+    component_order
+  ) %>%
+  dplyr::select(
+    -endpoint_order,
+    -measure_order,
+    -component_order
+  )
+
+
+write_csv_quiet(
+  H1_primary_table,
+  "T01_PRIMARY_T4_H1_latent_selection_coefficients.csv"
+)
+
+
+# ------------------------------------------------------------------------------
+# 13A. Primary T4 joint tests
+# ------------------------------------------------------------------------------
+
+H1_primary_joint <- dplyr::bind_rows(
+  lat_joint %>%
+    dplyr::filter(
+      T ==
+        PRIMARY_T
+    ) %>%
+    dplyr::rename(
+      p_holm =
+        p_holm_LAT_2_joint
+    ),
+  cox_joint %>%
+    dplyr::filter(
+      T ==
+        PRIMARY_T
+    ) %>%
+    dplyr::rename(
+      p_holm =
+        p_holm_COX_6_joint
+    )
+)
+
+
+write_csv_quiet(
+  H1_primary_joint,
+  "T02_PRIMARY_T4_H1_joint_stable_WPVS_tests.csv"
+)
+
+
+# ------------------------------------------------------------------------------
+# 13B. Primary T4 stable-vs-WPVS coefficient-difference tests
+# ------------------------------------------------------------------------------
+
+H1_primary_difference <- dplyr::bind_rows(
+  lat_difference %>%
+    dplyr::filter(
+      T ==
+        PRIMARY_T
+    ) %>%
+    dplyr::rename(
+      p_holm =
+        p_holm_LAT_2_difference
+    ),
+  cox_difference %>%
+    dplyr::filter(
+      T ==
+        PRIMARY_T
+    ) %>%
+    dplyr::rename(
+      p_holm =
+        p_holm_COX_6_difference
+    )
+)
+
+
+write_csv_quiet(
+  H1_primary_difference,
+  "T03_PRIMARY_T4_stable_vs_WPVS_difference_tests.csv"
+)
+
+
+# ==============================================================================
+# 14. T=5 / T=6 HISTORY-LENGTH SENSITIVITIES
+# ==============================================================================
+
+sensitivity_coefficients <- dplyr::bind_rows(
+  lat_coefficients %>%
+    dplyr::filter(
+      T %in%
+        SENSITIVITY_T
+    ) %>%
+    dplyr::mutate(
+      effect_type =
+        "OR",
+      effect =
+        odds_ratio,
+      p_holm =
+        p_holm_LAT_4,
+      design_panel =
+        "Incident LAT formation"
+    ) %>%
+    dplyr::transmute(
+      T,
+      design_panel,
+      endpoint,
+      measure,
+      component,
+      effect_type,
+      effect,
+      conf_low,
+      conf_high,
+      p_value,
+      p_holm,
+      n_rows,
+      n_people,
+      n_events =
+        n_cases,
+      status
+    ),
+
+  cox_coefficients %>%
+    dplyr::filter(
+      T %in%
+        SENSITIVITY_T
+    ) %>%
+    dplyr::mutate(
+      effect_type =
+        "HR",
+      effect =
+        hazard_ratio,
+      p_holm =
+        p_holm_COX_12,
+      design_panel =
+        "Cohabitation/marriage Cox"
+    ) %>%
+    dplyr::transmute(
+      T,
+      design_panel,
+      endpoint,
+      measure,
+      component,
+      effect_type,
+      effect,
+      conf_low,
+      conf_high,
+      p_value,
+      p_holm,
+      n_rows,
+      n_people,
+      n_events,
+      status
+    )
+) %>%
+  dplyr::arrange(
+    T,
+    design_panel,
+    endpoint,
+    measure,
+    component
+  )
+
+
+write_csv_quiet(
+  sensitivity_coefficients,
+  "T04_SENSITIVITY_T5_T6_H1_coefficients.csv"
+)
+
+
+sensitivity_joint <- dplyr::bind_rows(
+  lat_joint %>%
+    dplyr::filter(
+      T %in%
+        SENSITIVITY_T
+    ) %>%
+    dplyr::rename(
+      p_holm =
+        p_holm_LAT_2_joint
+    ),
+  cox_joint %>%
+    dplyr::filter(
+      T %in%
+        SENSITIVITY_T
+    ) %>%
+    dplyr::rename(
+      p_holm =
+        p_holm_COX_6_joint
+    )
+)
+
+
+write_csv_quiet(
+  sensitivity_joint,
+  "T05_SENSITIVITY_T5_T6_H1_joint_tests.csv"
+)
+
+
+# ==============================================================================
+# 15. COMPONENT CORRELATIONS IN THE FINAL MODEL SAMPLES
+# ==============================================================================
+
+lat_correlations <- purrr::map_dfr(
+  T_VALUES,
+  function(T_now) {
+
+    purrr::map_dfr(
+      c(
+        "Life satisfaction",
+        "Psychological distress"
+      ),
+      function(measure_label) {
+
+        built <- build_lat_matched_data(
+          T_now,
+          measure_label
+        )
+
+        tibble::tibble(
+          design =
+            "Incident LAT matched conditional logit",
+          T =
+            T_now,
+          measure =
+            measure_label,
+          endpoint =
+            "Incident LAT formation",
+          n_rows =
+            nrow(
+              built$data
+            ),
+          correlation_stable_WPVS =
+            safe_cor(
+              built$data$stable_z,
+              built$data$wpvs_z
+            )
+        )
+      }
+    )
+  }
+)
+
+
+cox_correlations <- purrr::map_dfr(
+  T_VALUES,
+  function(T_now) {
+
+    purrr::map_dfr(
+      c(
+        "Life satisfaction",
+        "Psychological distress"
+      ),
+      function(measure_label) {
+
+        key <- paste0(
+          "T",
+          T_now,
+          "__",
+          ifelse(
+            measure_label ==
+              "Life satisfaction",
+            "LS",
+            "DISTRESS"
+          )
+        )
+
+        dat <- episode_datasets[[key]]
+
+        tibble::tibble(
+          design =
+            "Non-overlapping clean-unpartnered Cox",
+          T =
+            T_now,
+          measure =
+            measure_label,
+          endpoint =
+            "Common baseline pool for all three Cox endpoints",
+          n_rows =
+            nrow(
+              dat
+            ),
+          correlation_stable_WPVS =
+            safe_cor(
+              dat$stable_z,
+              dat$wpvs_z
+            )
+        )
+      }
+    )
+  }
+)
+
+
+component_correlations <- dplyr::bind_rows(
+  lat_correlations,
+  cox_correlations
+)
+
+
+write_csv_quiet(
+  component_correlations,
+  "08_final_model_component_correlations.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 16. INCIDENT-LAT BASELINE ALIGNMENT AUDIT
+# ==============================================================================
+
+incident_alignment <- incident_events %>%
+  dplyr::transmute(
+    treated_pidp,
+    baseline_wave,
+    baseline_id =
+      paste(
+        treated_pidp,
+        baseline_wave,
+        sep =
+          "__wave__"
+      )
+  ) %>%
+  dplyr::left_join(
+    formation_raw %>%
+      dplyr::transmute(
+        baseline_id,
+        in_clean_unpartnered_base =
+          TRUE
+      ),
+    by =
+      "baseline_id"
+  )
+
+
+write_csv_quiet(
+  incident_alignment %>%
+    dplyr::filter(
+      is.na(
+        in_clean_unpartnered_base
+      )
+    ),
+  "09_incident_LAT_baselines_not_in_clean_unpartnered_base.csv",
+  "diagnostics"
+)
+
+
+incident_alignment_summary <- incident_alignment %>%
+  dplyr::summarise(
+    incident_LAT_events =
+      dplyr::n(),
+    found_in_clean_unpartnered_base =
+      sum(
+        in_clean_unpartnered_base %in%
+          TRUE,
+        na.rm =
+          TRUE
+      ),
+    not_found_in_clean_unpartnered_base =
+      sum(
+        is.na(
+          in_clean_unpartnered_base
+        )
+      )
+  )
+
+
+write_csv_quiet(
+  incident_alignment_summary,
+  "09b_incident_LAT_alignment_summary.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 17. COMPACT PRIMARY H1 SUMMARY FOR MANUSCRIPT REVISION
+# ==============================================================================
+
+primary_compact <- H1_primary_table %>%
+  dplyr::mutate(
+    estimate_with_ci =
+      paste0(
+        effect_type,
+        " = ",
+        sprintf(
+          "%.3f",
+          effect
+        ),
+        " [",
+        sprintf(
+          "%.3f",
+          conf_low
+        ),
+        ", ",
+        sprintf(
+          "%.3f",
+          conf_high
+        ),
+        "]"
+      ),
+    p_display =
+      dplyr::case_when(
+        is.na(
+          p_value
+        ) ~
+          NA_character_,
+        p_value <
+          0.001 ~
+          "<.001",
+        TRUE ~
+          sprintf(
+            "%.3f",
+            p_value
+          )
+      ),
+    p_holm_display =
+      dplyr::case_when(
+        is.na(
+          p_holm
+        ) ~
+          NA_character_,
+        p_holm <
+          0.001 ~
+          "<.001",
+        TRUE ~
+          sprintf(
+            "%.3f",
+            p_holm
+          )
+      )
+  ) %>%
+  dplyr::select(
+    design_panel,
+    endpoint,
+    measure,
+    component,
+    estimate_with_ci,
+    p_display,
+    p_holm_display,
+    n_events,
+    n_people,
+    status
+  )
+
+
+write_csv_quiet(
+  primary_compact,
+  "T06_PRIMARY_T4_H1_manuscript_ready_summary.csv"
+)
+
+
+# ==============================================================================
+# 18. READ ME
+# ==============================================================================
+
+readme <- c(
+  "UKHLS H1 LATENT STABLE-TRAIT / WPVS PSYCHOLOGICAL SELECTION v1",
+  "",
+  "PRIMARY MEASUREMENT SPECIFICATION",
+  "T=4: current clean-unpartnered baseline plus 3 immediately preceding UKHLS waves.",
+  "Psychological scores were adjusted for actual UKHLS survey-wave means before",
+  "stable-trait/WPVS decomposition in the upstream measurement-stage workflow.",
+  "",
+  "PRIMARY PREDICTORS",
+  "Stable between-person component = stable_score_SD.",
+  "Current within-person component = current_wpvs_SD.",
+  "Both use the same outcome-specific raw-current-score SD metric.",
+  "For GHQ, higher predictor values mean LOWER psychological distress.",
+  "",
+  "DESIGN A: INCIDENT LAT",
+  "Validated matched incident-LAT risk sets are reused.",
+  "Matched sets are pruned after latent-score eligibility.",
+  "Conditional logit is stratified by matched set with respondent-clustered robust SE.",
+  "Holm correction is across the four T-specific primary component tests.",
+  "",
+  "DESIGN B: COHABITATION / MARRIAGE",
+  "Validated non-overlapping clean-unpartnered episode IDs are reused.",
+  "Within each episode, the FIRST latent-score-eligible clean landmark is selected.",
+  "Events are reconstructed AFTER that selected baseline.",
+  "Cohabitation: cause-specific Cox; marriage before/same month is competing.",
+  "Marriage: cohabitation may occur as an intermediate state and does not censor.",
+  "Either endpoint: first cohabitation or marriage.",
+  "Robust SEs are clustered by respondent.",
+  "Holm correction is across the 12 T-specific Cox component tests.",
+  "",
+  "SENSITIVITIES",
+  "T=5 and T=6 repeat both designs and use their own within-design Holm families.",
+  "",
+  "GENERATED-REGRESSOR INFERENCE",
+  "The present script uses plug-in latent scores and robust second-stage SEs.",
+  "It does not propagate Step-1 measurement/scoring uncertainty.",
+  "A full two-step respondent bootstrap can be added after inspecting these results.",
+  "",
+  "PRIMARY OUTPUTS",
+  "tables/T01_PRIMARY_T4_H1_latent_selection_coefficients.csv",
+  "tables/T02_PRIMARY_T4_H1_joint_stable_WPVS_tests.csv",
+  "tables/T03_PRIMARY_T4_stable_vs_WPVS_difference_tests.csv",
+  "tables/T04_SENSITIVITY_T5_T6_H1_coefficients.csv",
+  "tables/T06_PRIMARY_T4_H1_manuscript_ready_summary.csv",
+  "diagnostics/02_LAT_score_join_and_pruning_audit.csv",
+  "diagnostics/05_latent_episode_baseline_and_event_support.csv",
+  "diagnostics/06_COX_model_sample_support.csv",
+  "diagnostics/07_PRIMARY_T4_proportional_hazards_diagnostics.csv",
+  "diagnostics/08_final_model_component_correlations.csv",
+  "diagnostics/09_incident_LAT_baselines_not_in_clean_unpartnered_base.csv",
+  "",
+  "INTERPRETATION",
+  "OR/HR > 1 means more favorable psychological functioning is associated with",
+  "greater subsequent transition odds/rate. These are prospective selection",
+  "associations and should not be described as causal effects."
+)
+
+
+write_txt(
+  readme,
+  "00_READ_ME_FIRST.txt",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 19. SESSION INFORMATION AND OUTPUT CHECK
+# ==============================================================================
+
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    DIAG_DIR,
+    "99_sessionInfo.txt"
+  )
+)
+
+
+expected_outputs <- c(
+  file.path(
+    DIAG_DIR,
+    "00_READ_ME_FIRST.txt"
+  ),
+  file.path(
+    DIAG_DIR,
+    "00_latent_score_lookup_audit.csv"
+  ),
+  file.path(
+    DIAG_DIR,
+    "01_score_to_clean_landmark_alignment.csv"
+  ),
+  file.path(
+    DIAG_DIR,
+    "02_LAT_score_join_and_pruning_audit.csv"
+  ),
+  file.path(
+    DIAG_DIR,
+    "03_LAT_model_sample_support.csv"
+  ),
+  file.path(
+    DIAG_DIR,
+    "05_latent_episode_baseline_and_event_support.csv"
+  ),
+  file.path(
+    DIAG_DIR,
+    "06_COX_model_sample_support.csv"
+  ),
+  file.path(
+    TABLE_DIR,
+    "T01_PRIMARY_T4_H1_latent_selection_coefficients.csv"
+  ),
+  file.path(
+    TABLE_DIR,
+    "T02_PRIMARY_T4_H1_joint_stable_WPVS_tests.csv"
+  ),
+  file.path(
+    TABLE_DIR,
+    "T03_PRIMARY_T4_stable_vs_WPVS_difference_tests.csv"
+  ),
+  file.path(
+    TABLE_DIR,
+    "T04_SENSITIVITY_T5_T6_H1_coefficients.csv"
+  ),
+  file.path(
+    TABLE_DIR,
+    "T06_PRIMARY_T4_H1_manuscript_ready_summary.csv"
+  )
+)
+
+
+output_check <- tibble::tibble(
+  file =
+    expected_outputs,
+  exists =
+    file.exists(
+      expected_outputs
+    )
+)
+
+
+write_csv_quiet(
+  output_check,
+  "98_output_check.csv",
+  "diagnostics"
+)
+
+
+if (
+  any(
+    !output_check$exists
+  )
+) {
+
+  warning(
+    "At least one expected output is missing. Inspect diagnostics/98_output_check.csv."
+  )
+}
+
+
+# ==============================================================================
+# 20. CONSOLE REPORT
+# ==============================================================================
+
+cat(
+  "\n\n============================================================\n"
+)
+
+cat(
+  "H1 LATENT STABLE-TRAIT / WPVS SELECTION ANALYSIS COMPLETE\n"
+)
+
+cat(
+  "============================================================\n\n"
+)
+
+
+cat(
+  "PRIMARY T=4 H1 COEFFICIENTS\n\n"
+)
+
+print(
+  H1_primary_table,
+  n =
+    Inf
+)
+
+
+cat(
+  "\n\nPRIMARY T=4 JOINT TESTS\n\n"
+)
+
+print(
+  H1_primary_joint,
+  n =
+    Inf
+)
+
+
+cat(
+  "\n\nPRIMARY T=4 STABLE-vs-WPVS DIFFERENCE TESTS\n\n"
+)
+
+print(
+  H1_primary_difference,
+  n =
+    Inf
+)
+
+
+cat(
+  "\n\nLAT MATCHED SAMPLE SUPPORT\n\n"
+)
+
+print(
+  lat_samples,
+  n =
+    Inf
+)
+
+
+cat(
+  "\n\nCOX EPISODE / EVENT SUPPORT\n\n"
+)
+
+print(
+  episode_audits,
+  n =
+    Inf
+)
+
+
+cat(
+  "\n\nCOX MODEL SUPPORT\n\n"
+)
+
+print(
+  cox_sample_support %>%
+    dplyr::filter(
+      T ==
+        PRIMARY_T
+    ),
+  n =
+    Inf
+)
+
+
+cat(
+  "\n\nOutput directory:\n  ",
+  OUT_DIR,
+  "\n",
+  sep =
+    ""
+)
+
+
+cat(
+  "\nIMPORTANT: these are plug-in second-stage SEs conditional on the generated",
+  "\nlatent scores. A full two-step bootstrap can be added after substantive review.\n"
+)
+
+
+cat(
+  "============================================================\n\n"
+)
+
+################################################################################
+# END
+################################################################################

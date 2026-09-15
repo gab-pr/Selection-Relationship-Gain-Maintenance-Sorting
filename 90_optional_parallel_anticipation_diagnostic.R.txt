@@ -1,0 +1,1988 @@
+################################################################################
+# UKHLS PARALLEL ANTICIPATION WORKFLOW V1
+# COHABITATION AND MARRIAGE
+#
+# COMPLEMENTARY / EXPLORATORY ANALYSES
+#
+# PURPOSE
+# -------
+# To test anticipation of TWO formal relationship transitions with as nearly
+# parallel an analytic strategy as the UKHLS data permit.
+#
+# TRANSITION 1: LAT -> COHABITATION
+#   Objective estimand:
+#     Does recent psychological change become more favorable as cohabitation
+#     approaches among respondents already in a steady non-residential (LAT)
+#     relationship, relative to comparable LAT relationships that remain at
+#     risk over the same event horizon?
+#   Subjective estimand:
+#     Does NCRR11 intention to begin living together predict subsequent
+#     psychological improvement while the respondent is still in the same LAT
+#     relationship?
+#
+# TRANSITION 2: COHABITATION -> MARRIAGE
+#   Objective estimand:
+#     Does recent psychological change become more favorable as marriage
+#     approaches among respondents already cohabiting and unmarried, relative
+#     to comparable cohabiting relationships that remain unmarried and intact
+#     over the same event horizon?
+#   Subjective estimand:
+#     If UKHLS contains a repeated cohabiter-specific marriage-expectation item,
+#     does stronger expectation of marrying the CURRENT cohabiting partner
+#     predict subsequent psychological improvement while the respondent is
+#     still unmarried and in the same cohabiting relationship?
+#
+# IMPORTANT CONCEPTUAL DISTINCTIONS
+# ---------------------------------
+# * Psychological LEVEL differences are not primary anticipation evidence.
+#   They may reflect selection, differentiation, or sorting.
+# * Primary anticipation outcomes are RECENT WITHIN-PERSON CHANGES.
+# * Controls are NOT defined as never-transitioners. A control may cohabit or
+#   marry later; it must only remain transition-free and in the same risk state
+#   through the treated person's analogous event horizon.
+# * Objective anticipation is most convincing if the treated-control change
+#   contrast becomes increasingly favorable as the event approaches:
+#       beta_1-12m > beta_13-24m > beta_25-60m.
+# * Subjective anticipation is most convincing if an expectation measure that
+#   demonstrably predicts the transition also predicts subsequent PRE-EVENT
+#   psychological improvement.
+#
+# PRIMARY MATCHING CHANGE RELATIVE TO THE EARLIER COHABITATION WORKFLOW
+# --------------------------------------------------------------------
+# The primary risk-set estimator now requires >=1 outcome-complete control per
+# set. >=3 and >=5 controls are saved as sensitivities. This avoids the severe
+# information loss observed when >=5 controls was required as the primary rule.
+#
+# OUTCOME ORIENTATION
+# -------------------
+# Life satisfaction: higher = better.
+# GHQ well-being: -GHQ12, so higher = better / less distress.
+# Positive change always means more favorable psychological functioning.
+#
+# INFERENTIAL STATUS
+# ------------------
+# Post-hoc complementary/exploratory analyses. Holm-adjusted p values are saved
+# as descriptive multiplicity control; they do not make these analyses
+# confirmatory.
+################################################################################
+
+
+# =============================================================================
+# 0. PACKAGES
+# =============================================================================
+
+required_packages <- c(
+  "haven", "dplyr", "tidyr", "purrr", "tibble", "readr",
+  "stringr", "fixest", "splines"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop("Install these package(s): ", paste(missing_packages, collapse = ", "))
+}
+
+library(haven)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(readr)
+library(stringr)
+library(fixest)
+library(splines)
+
+fixest::setFixest_nthreads(max(1L, parallel::detectCores() - 1L))
+
+
+# =============================================================================
+# 1. PATHS AND USER-EDITABLE OPTIONS
+# =============================================================================
+
+UKHLS_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se/ukhls"
+)
+
+V42_OUT_DIR <- file.path(
+  getwd(),
+  "UKHLS_REVISED_selection_development_proximity_v4_2"
+)
+
+PANEL_RDS <- file.path(V42_OUT_DIR, "data", "01_panel_person_wave.rds")
+PHISTORY_RDS <- file.path(V42_OUT_DIR, "data", "02_phistory_clean.rds")
+
+# This workflow reuses the carefully constructed LAT rows and probable
+# LAT->cohabitation links from the already-run cohabitation anticipation workflow.
+COHAB_ANTICIPATION_DIR <- file.path(
+  getwd(),
+  "UKHLS_LAT_to_cohabitation_anticipation_v1"
+)
+
+LAT_ROWS_RDS <- file.path(
+  COHAB_ANTICIPATION_DIR, "data", "lat_rows_with_recent_change.rds"
+)
+COHAB_TREATED_RDS <- file.path(
+  COHAB_ANTICIPATION_DIR, "data", "objective_treated_landmarks.rds"
+)
+COHAB_CANDIDATES_RDS <- file.path(
+  COHAB_ANTICIPATION_DIR, "data", "objective_match_candidates.rds"
+)
+NCRR11_ROWS_RDS <- file.path(
+  COHAB_ANTICIPATION_DIR, "data", "NCRR11_subjective_anticipation_rows.rds"
+)
+
+RESULTS_DIR <- file.path(
+  getwd(),
+  "UKHLS_parallel_cohabitation_marriage_anticipation_v1"
+)
+dir.create(RESULTS_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(RESULTS_DIR, "data"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(RESULTS_DIR, "models"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(RESULTS_DIR, "diagnostics"), recursive = TRUE, showWarnings = FALSE)
+
+# Recent psychological-change interval.
+PRIOR_PSYCH_MIN_GAP_MONTHS <- 6L
+PRIOR_PSYCH_MAX_GAP_MONTHS <- 18L
+NEXT_PSYCH_MIN_GAP_MONTHS <- 6L
+NEXT_PSYCH_MAX_GAP_MONTHS <- 18L
+
+# Objective proximity windows, identical for cohabitation and marriage.
+PROXIMITY_WINDOWS <- tibble::tribble(
+  ~window,    ~lower, ~upper, ~window_order,
+  "1-12m",        1L,    12L,            1L,
+  "13-24m",      13L,    24L,            2L,
+  "25-60m",      25L,    60L,            3L
+)
+
+# Matching tolerances, identical in spirit for both transitions.
+MATCH_AGE_CALIPER <- 1
+MATCH_INTERVIEW_MONTH_CALIPER <- 3L
+MATCH_RELATIONSHIP_DURATION_CALIPER <- 6L
+
+# Primary + sensitivity minimum number of outcome-complete controls per set.
+MIN_CONTROLS_SPECS <- c(primary_1plus = 1L, sensitivity_3plus = 3L,
+                        sensitivity_5plus = 5L)
+
+# Exact marriage-date definition used in the objective marriage analysis.
+MARRIAGE_DATE_FLAGS_PRIMARY <- 0L
+MARRIAGE_DATE_FLAGS_SENSITIVITY <- c(0L, 1L)
+
+# Construct-validity horizon for subjective expectations.
+EXPECTATION_EVENT_HORIZON_MONTHS <- 36L
+
+# -----------------------------------------------------------------------------
+# Cohabiter-specific marriage-expectation variable
+# -----------------------------------------------------------------------------
+# IMPORTANT: NCRR12 is NOT used here. NCRR12 belongs to the non-residential
+# relationship module. The script searches the raw UKHLS individual-response
+# files for a DIFFERENT item that is actually answered by unmarried cohabiters.
+#
+# If you already know the common variable stem, enter it below without the wave
+# prefix (e.g., "examplevar"). Otherwise leave NA and the script will audit and
+# auto-select ONLY if it finds a clear repeated candidate with substantive
+# responses among cohabiters.
+MARRIAGE_EXPECTATION_STEM_OVERRIDE <- NA_character_
+
+# Conservative automatic candidate selection.
+AUTO_SELECT_MARRIAGE_EXPECTATION <- TRUE
+MIN_WAVES_FOR_AUTO_MARRIAGE_EXPECTATION <- 2L
+MIN_VALID_COHAB_RESPONSES_FOR_AUTO <- 100L
+
+SAVE_ANALYTIC_RDS <- TRUE
+
+
+# =============================================================================
+# 2. HELPERS
+# =============================================================================
+
+write_csv_quiet <- function(x, filename, subdir = NULL) {
+  path <- if (is.null(subdir)) {
+    file.path(RESULTS_DIR, filename)
+  } else {
+    dir.create(file.path(RESULTS_DIR, subdir), recursive = TRUE,
+               showWarnings = FALSE)
+    file.path(RESULTS_DIR, subdir, filename)
+  }
+  readr::write_csv(x, path, na = "")
+}
+
+num_clean <- function(x) {
+  z <- suppressWarnings(as.numeric(x))
+  z[z < 0] <- NA_real_
+  z
+}
+
+safe_sd <- function(x) {
+  z <- suppressWarnings(as.numeric(x))
+  z <- z[is.finite(z)]
+  if (length(z) < 2L) return(NA_real_)
+  stats::sd(z)
+}
+
+normal_ci <- function(est, se, level = .95) {
+  q <- qnorm(1 - (1 - level) / 2)
+  c(est - q * se, est + q * se)
+}
+
+safe_model_nobs <- function(model) {
+  if (is.null(model)) return(NA_integer_)
+  n1 <- tryCatch(stats::nobs(model), error = function(e) NA_real_)
+  if (length(n1) >= 1L && is.finite(n1[1])) return(as.integer(n1[1]))
+  n2 <- tryCatch(model$nobs, error = function(e) NULL)
+  if (!is.null(n2) && length(n2) >= 1L && is.finite(n2[1])) {
+    return(as.integer(n2[1]))
+  }
+  r <- tryCatch(model$residuals, error = function(e) NULL)
+  if (!is.null(r) && length(r) > 0L) return(as.integer(length(r)))
+  NA_integer_
+}
+
+safe_feols <- function(formula, data, weights = NULL, vcov = NULL) {
+  tryCatch(
+    fixest::feols(formula, data = data, weights = weights, vcov = vcov,
+                  warn = FALSE, notes = FALSE),
+    error = function(e) {
+      message("feols failed: ", conditionMessage(e))
+      NULL
+    }
+  )
+}
+
+safe_feglm <- function(formula, data, family, vcov = NULL) {
+  tryCatch(
+    fixest::feglm(formula, data = data, family = family, vcov = vcov,
+                  warn = FALSE, notes = FALSE),
+    error = function(e) {
+      message("feglm failed: ", conditionMessage(e))
+      NULL
+    }
+  )
+}
+
+extract_fixest_term <- function(model, term, model_name, outcome, analysis) {
+  if (is.null(model)) return(tibble())
+  ct <- tryCatch(as.data.frame(fixest::coeftable(model)),
+                 error = function(e) NULL)
+  if (is.null(ct) || nrow(ct) == 0L || !term %in% rownames(ct)) return(tibble())
+  est <- unname(ct[term, 1])
+  se <- unname(ct[term, 2])
+  p <- unname(ct[term, 4])
+  ci <- normal_ci(est, se)
+  tibble(
+    analysis = analysis,
+    model = model_name,
+    outcome = outcome,
+    term = term,
+    estimate = est,
+    std_error = se,
+    ci_low = ci[1],
+    ci_high = ci[2],
+    p_value = p,
+    n_obs = safe_model_nobs(model)
+  )
+}
+
+extract_fixest_all <- function(model, model_name, outcome, analysis) {
+  if (is.null(model)) return(tibble())
+  ct <- tryCatch(as.data.frame(fixest::coeftable(model)),
+                 error = function(e) NULL)
+  if (is.null(ct) || nrow(ct) == 0L) return(tibble())
+  out <- tibble(
+    term = rownames(ct),
+    estimate = ct[[1]],
+    std_error = ct[[2]],
+    statistic = ct[[3]],
+    p_value = ct[[4]]
+  ) %>%
+    rowwise() %>%
+    mutate(
+      ci_low = normal_ci(estimate, std_error)[1],
+      ci_high = normal_ci(estimate, std_error)[2]
+    ) %>%
+    ungroup() %>%
+    mutate(
+      analysis = analysis,
+      model = model_name,
+      outcome = outcome,
+      n_obs = safe_model_nobs(model),
+      .before = 1
+    )
+  out
+}
+
+linear_contrast <- function(model, weights_named, contrast_name, outcome,
+                            analysis) {
+  if (is.null(model)) return(tibble())
+  b <- stats::coef(model)
+  V <- tryCatch(stats::vcov(model), error = function(e) NULL)
+  if (is.null(V)) return(tibble())
+  needed <- names(weights_named)
+  if (!all(needed %in% names(b))) return(tibble())
+  w <- rep(0, length(b)); names(w) <- names(b)
+  w[needed] <- weights_named
+  est <- sum(w * b)
+  se <- sqrt(as.numeric(t(w) %*% V %*% w))
+  ci <- normal_ci(est, se)
+  z <- est / se
+  p <- 2 * pnorm(abs(z), lower.tail = FALSE)
+  tibble(
+    analysis = analysis,
+    model = "direct_proximity_gradient",
+    outcome = outcome,
+    contrast = contrast_name,
+    estimate = est,
+    std_error = se,
+    ci_low = ci[1],
+    ci_high = ci[2],
+    p_value = p,
+    n_obs = safe_model_nobs(model)
+  )
+}
+
+# Most recent nonmissing prior value within an episode/spell and gap restriction.
+attach_prior_within_group <- function(df, group_col, value_col, prefix) {
+  g <- rlang::sym(group_col)
+  v <- rlang::sym(value_col)
+  df %>%
+    arrange(!!g, interview_ym, wave_n) %>%
+    group_by(!!g) %>%
+    group_modify(~ {
+      x <- .x[[value_col]]
+      tt <- .x$interview_ym
+      prior_value <- rep(NA_real_, length(x))
+      prior_time <- rep(NA_real_, length(x))
+      last_val <- NA_real_
+      last_time <- NA_real_
+      for (i in seq_along(x)) {
+        prior_value[i] <- last_val
+        prior_time[i] <- last_time
+        if (!is.na(x[i])) {
+          last_val <- x[i]
+          last_time <- tt[i]
+        }
+      }
+      .x %>%
+        mutate(
+          "{prefix}_prior_value" := prior_value,
+          "{prefix}_prior_ym" := prior_time,
+          "{prefix}_prior_gap" := interview_ym - prior_time
+        )
+    }) %>%
+    ungroup()
+}
+
+# Next nonmissing outcome within same relationship episode/spell.
+attach_next_within_group <- function(df, group_col, value_col, prefix) {
+  g <- rlang::sym(group_col)
+  df %>%
+    arrange(!!g, interview_ym, wave_n) %>%
+    group_by(!!g) %>%
+    group_modify(~ {
+      x <- .x[[value_col]]
+      tt <- .x$interview_ym
+      next_value <- rep(NA_real_, length(x))
+      next_time <- rep(NA_real_, length(x))
+      next_val_seen <- NA_real_
+      next_time_seen <- NA_real_
+      for (i in rev(seq_along(x))) {
+        next_value[i] <- next_val_seen
+        next_time[i] <- next_time_seen
+        if (!is.na(x[i])) {
+          next_val_seen <- x[i]
+          next_time_seen <- tt[i]
+        }
+      }
+      .x %>%
+        mutate(
+          "{prefix}_next_value" := next_value,
+          "{prefix}_next_ym" := next_time,
+          "{prefix}_next_gap" := next_time - interview_ym
+        )
+    }) %>%
+    ungroup()
+}
+
+safe_read_names <- function(path) {
+  tryCatch(names(haven::read_dta(path, n_max = 1L)),
+           error = function(e) character(0))
+}
+
+wave_from_indresp_file <- function(path) {
+  tolower(sub("_indresp\\.dta$", "", basename(path), ignore.case = TRUE))
+}
+
+wave_number <- function(w) match(tolower(w), letters[1:15])
+
+strip_wave_prefix <- function(x) {
+  sub("^[a-o]_", "", tolower(x))
+}
+
+resolve_wave_variable <- function(nms, wave, stem) {
+  target1 <- paste0(tolower(wave), "_", tolower(stem))
+  nlow <- tolower(nms)
+  hit <- which(nlow == target1)
+  if (length(hit) == 1L) return(nms[hit])
+  hit2 <- which(strip_wave_prefix(nlow) == tolower(stem))
+  if (length(hit2) == 1L) return(nms[hit2])
+  NA_character_
+}
+
+
+# =============================================================================
+# 3. LOAD COMMON DATA + GLOBAL OUTCOME STANDARDIZATION
+# =============================================================================
+
+for (f in c(PANEL_RDS, PHISTORY_RDS, LAT_ROWS_RDS, COHAB_TREATED_RDS,
+            COHAB_CANDIDATES_RDS, NCRR11_ROWS_RDS)) {
+  if (!file.exists(f)) stop("Required file not found: ", f)
+}
+
+panel <- readRDS(PANEL_RDS)
+ph <- readRDS(PHISTORY_RDS)
+lat_rows <- readRDS(LAT_ROWS_RDS)
+cohab_treated_landmarks <- readRDS(COHAB_TREATED_RDS)
+cohab_objective_candidates <- readRDS(COHAB_CANDIDATES_RDS)
+ncrr11_analysis <- readRDS(NCRR11_ROWS_RDS)
+
+required_panel <- c(
+  "pidp", "wave", "wave_n", "interview_ym", "interview_year",
+  "interview_month", "age", "sex", "ghq", "life_satisfaction"
+)
+missing_panel <- setdiff(required_panel, names(panel))
+if (length(missing_panel) > 0L) {
+  stop("Panel missing: ", paste(missing_panel, collapse = ", "))
+}
+
+required_ph <- c(
+  "pidp", "spellno", "status", "partner", "start_ym", "end_ym",
+  "start_if", "end_if", "ongoing", "cohend", "next_status",
+  "next_partner", "next_start_ym", "next_start_if", "same_partner_next",
+  "valid_partner"
+)
+missing_ph <- setdiff(required_ph, names(ph))
+if (length(missing_ph) > 0L) {
+  stop("PHISTORY RDS missing: ", paste(missing_ph, collapse = ", "))
+}
+
+panel <- panel %>%
+  mutate(ghq_wb = if_else(!is.na(ghq), -ghq, NA_real_))
+
+# One common SD metric for both transitions, facilitating direct comparison.
+LS_SD_GLOBAL <- safe_sd(panel$life_satisfaction)
+GHQWB_SD_GLOBAL <- safe_sd(panel$ghq_wb)
+
+if (!is.finite(LS_SD_GLOBAL) || !is.finite(GHQWB_SD_GLOBAL)) {
+  stop("Unable to compute global outcome SDs.")
+}
+
+write_csv_quiet(
+  tibble(
+    outcome = c("Life satisfaction", "GHQ well-being (-GHQ12)"),
+    global_sd = c(LS_SD_GLOBAL, GHQWB_SD_GLOBAL),
+    standardization_population = "all nonmissing UKHLS panel observations"
+  ),
+  "00_common_outcome_standardization.csv",
+  "diagnostics"
+)
+
+
+# =============================================================================
+# 4. GENERIC MATCHED RISK-SET ESTIMATION
+# =============================================================================
+
+# This function takes transition-specific treated landmarks and candidate
+# controls already satisfying the design-specific eligibility/caliper rules.
+# Both transitions are then estimated identically.
+fit_parallel_objective_outcome <- function(
+    transition,
+    treated_df,
+    candidates_df,
+    treated_change_col,
+    control_change_col,
+    treated_prior_col,
+    control_prior_col,
+    outcome,
+    min_controls,
+    spec_name
+) {
+
+  treated_part <- treated_df %>%
+    transmute(
+      match_set_id,
+      proximity_window,
+      window_order,
+      pidp,
+      role = "treated",
+      treated = 1,
+      change_z = .data[[treated_change_col]],
+      prior_level_z = .data[[treated_prior_col]]
+    )
+
+  control_part <- candidates_df %>%
+    transmute(
+      match_set_id,
+      proximity_window,
+      window_order,
+      pidp = control_pidp,
+      role = "control",
+      treated = 0,
+      change_z = .data[[control_change_col]],
+      prior_level_z = .data[[control_prior_col]]
+    )
+
+  stack <- bind_rows(treated_part, control_part) %>%
+    filter(!is.na(change_z), !is.na(prior_level_z)) %>%
+    group_by(match_set_id) %>%
+    mutate(
+      n_treated = sum(role == "treated"),
+      n_controls = sum(role == "control")
+    ) %>%
+    ungroup() %>%
+    filter(n_treated == 1L, n_controls >= min_controls) %>%
+    group_by(match_set_id) %>%
+    mutate(att_weight = if_else(role == "treated", 1, 1 / n_controls)) %>%
+    ungroup()
+
+  results <- tibble()
+  models <- list()
+
+  for (w in PROXIMITY_WINDOWS$window) {
+    d <- stack %>% filter(proximity_window == w)
+    if (n_distinct(d$match_set_id) == 0L) next
+
+    m0 <- safe_feols(
+      change_z ~ treated | match_set_id,
+      data = d,
+      weights = ~att_weight,
+      vcov = ~pidp + match_set_id
+    )
+
+    m1 <- safe_feols(
+      change_z ~ treated + prior_level_z | match_set_id,
+      data = d,
+      weights = ~att_weight,
+      vcov = ~pidp + match_set_id
+    )
+
+    models[[paste0(w, "_unadjusted")]] <- m0
+    models[[paste0(w, "_prior_adjusted")]] <- m1
+
+    r0 <- extract_fixest_term(
+      m0, "treated", paste0(transition, "_", spec_name, "_", w),
+      outcome, paste0(transition, " objective proximity")
+    ) %>%
+      mutate(
+        transition = transition,
+        proximity_window = w,
+        specification = spec_name,
+        model_specification = "preferred matched recent change",
+        min_controls_required = min_controls,
+        matched_sets = n_distinct(d$match_set_id),
+        treated_people = n_distinct(d$pidp[d$role == "treated"]),
+        unique_controls = n_distinct(d$pidp[d$role == "control"])
+      )
+
+    r1 <- extract_fixest_term(
+      m1, "treated", paste0(transition, "_", spec_name, "_prior_", w),
+      outcome, paste0(transition, " objective proximity")
+    ) %>%
+      mutate(
+        transition = transition,
+        proximity_window = w,
+        specification = spec_name,
+        model_specification = "prior-level-adjusted sensitivity",
+        min_controls_required = min_controls,
+        matched_sets = n_distinct(d$match_set_id),
+        treated_people = n_distinct(d$pidp[d$role == "treated"]),
+        unique_controls = n_distinct(d$pidp[d$role == "control"])
+      )
+
+    results <- bind_rows(results, r0, r1)
+  }
+
+  list(results = results, stack = stack, models = models)
+}
+
+fit_direct_gradient <- function(stack, transition, outcome, spec_name) {
+  d <- stack %>%
+    mutate(
+      t_1_12 = as.numeric(treated == 1 & proximity_window == "1-12m"),
+      t_13_24 = as.numeric(treated == 1 & proximity_window == "13-24m"),
+      t_25_60 = as.numeric(treated == 1 & proximity_window == "25-60m")
+    )
+
+  if (n_distinct(d$proximity_window) < 2L) {
+    return(list(model = NULL, coefficients = tibble(), contrasts = tibble()))
+  }
+
+  m <- safe_feols(
+    change_z ~ t_1_12 + t_13_24 + t_25_60 | match_set_id,
+    data = d,
+    weights = ~att_weight,
+    vcov = ~pidp + match_set_id
+  )
+
+  coefs <- extract_fixest_all(
+    m,
+    paste0(transition, "_", spec_name, "_direct_gradient"),
+    outcome,
+    paste0(transition, " objective direct proximity gradient")
+  )
+
+  contrasts <- bind_rows(
+    linear_contrast(
+      m, c(t_1_12 = 1, t_13_24 = -1),
+      "1-12m minus 13-24m", outcome,
+      paste0(transition, " objective direct proximity gradient")
+    ),
+    linear_contrast(
+      m, c(t_1_12 = 1, t_25_60 = -1),
+      "1-12m minus 25-60m", outcome,
+      paste0(transition, " objective direct proximity gradient")
+    ),
+    linear_contrast(
+      m, c(t_13_24 = 1, t_25_60 = -1),
+      "13-24m minus 25-60m", outcome,
+      paste0(transition, " objective direct proximity gradient")
+    )
+  ) %>%
+    mutate(specification = spec_name)
+
+  list(model = m, coefficients = coefs, contrasts = contrasts)
+}
+
+
+# =============================================================================
+# 5. COHABITATION OBJECTIVE TEST: REFIT WITH >=1 / >=3 / >=5 CONTROLS
+# =============================================================================
+
+# Re-standardize the already-created LAT changes to the common global SD metric.
+# The RDS objects contain raw current/prior values as well as the old z changes.
+# To avoid dependence on the prior workflow's LAT-specific SD, reconstruct where
+# possible from raw values; otherwise rescale using the saved z values is avoided.
+
+required_cohab_treated <- c(
+  "match_set_id", "proximity_window", "window_order", "pidp",
+  "life_satisfaction", "ls_prior_value", "ghq_wb", "ghqwb_prior_value"
+)
+if (!all(required_cohab_treated %in% names(cohab_treated_landmarks))) {
+  stop(
+    "The saved cohabitation treated-landmark RDS lacks raw outcome/prior columns. ",
+    "Rerun UKHLS_LAT_to_cohabitation_anticipation_workflow_v1_1_nobsfix.R.txt ",
+    "using the original script, then rerun this parallel workflow."
+  )
+}
+
+cohab_treated_landmarks <- cohab_treated_landmarks %>%
+  mutate(
+    par_ls_recent_change_z = (life_satisfaction - ls_prior_value) / LS_SD_GLOBAL,
+    par_ghqwb_recent_change_z = (ghq_wb - ghqwb_prior_value) / GHQWB_SD_GLOBAL,
+    par_ls_prior_level_z = ls_prior_value / LS_SD_GLOBAL,
+    par_ghqwb_prior_level_z = ghqwb_prior_value / GHQWB_SD_GLOBAL
+  )
+
+# Reconstruct control raw current/prior values by joining saved control LAT row IDs
+# back to lat_rows. This ensures exactly the same standardization as marriage.
+control_raw <- lat_rows %>%
+  transmute(
+    control_lat_row_id = lat_row_id,
+    control_life_satisfaction = life_satisfaction,
+    control_ls_prior_value = ls_prior_value,
+    control_ghq_wb = ghq_wb,
+    control_ghqwb_prior_value = ghqwb_prior_value
+  )
+
+cohab_objective_candidates <- cohab_objective_candidates %>%
+  select(-any_of(c(
+    "control_life_satisfaction", "control_ls_prior_value",
+    "control_ghq_wb", "control_ghqwb_prior_value"
+  ))) %>%
+  left_join(control_raw, by = "control_lat_row_id", relationship = "many-to-one") %>%
+  mutate(
+    par_control_ls_recent_change_z =
+      (control_life_satisfaction - control_ls_prior_value) / LS_SD_GLOBAL,
+    par_control_ghqwb_recent_change_z =
+      (control_ghq_wb - control_ghqwb_prior_value) / GHQWB_SD_GLOBAL,
+    par_control_ls_prior_level_z = control_ls_prior_value / LS_SD_GLOBAL,
+    par_control_ghqwb_prior_level_z = control_ghqwb_prior_value / GHQWB_SD_GLOBAL
+  )
+
+cohab_candidate_audit <- cohab_objective_candidates %>%
+  count(match_set_id, proximity_window, name = "candidate_controls") %>%
+  right_join(
+    cohab_treated_landmarks %>%
+      select(match_set_id, proximity_window) %>% distinct(),
+    by = c("match_set_id", "proximity_window")
+  ) %>%
+  mutate(candidate_controls = coalesce(candidate_controls, 0L)) %>%
+  group_by(proximity_window) %>%
+  summarise(
+    treated_landmarks = n(),
+    retained_1plus_candidates = sum(candidate_controls >= 1),
+    retained_3plus_candidates = sum(candidate_controls >= 3),
+    retained_5plus_candidates = sum(candidate_controls >= 5),
+    median_candidate_controls = median(candidate_controls),
+    p10_candidate_controls = as.numeric(quantile(candidate_controls, .10)),
+    p90_candidate_controls = as.numeric(quantile(candidate_controls, .90)),
+    .groups = "drop"
+  )
+write_csv_quiet(cohab_candidate_audit,
+                "COH_A01_objective_candidate_summary_parallel.csv")
+
+coh_all_results <- tibble()
+coh_stacks <- list()
+coh_gradients <- tibble()
+
+for (sp in names(MIN_CONTROLS_SPECS)) {
+  mn <- unname(MIN_CONTROLS_SPECS[[sp]])
+
+  ls_fit <- fit_parallel_objective_outcome(
+    "cohabitation", cohab_treated_landmarks, cohab_objective_candidates,
+    "par_ls_recent_change_z", "par_control_ls_recent_change_z",
+    "par_ls_prior_level_z", "par_control_ls_prior_level_z",
+    "Life satisfaction", mn, sp
+  )
+  ghq_fit <- fit_parallel_objective_outcome(
+    "cohabitation", cohab_treated_landmarks, cohab_objective_candidates,
+    "par_ghqwb_recent_change_z", "par_control_ghqwb_recent_change_z",
+    "par_ghqwb_prior_level_z", "par_control_ghqwb_prior_level_z",
+    "GHQ well-being (-GHQ12)", mn, sp
+  )
+
+  coh_all_results <- bind_rows(coh_all_results, ls_fit$results, ghq_fit$results)
+  coh_stacks[[paste0(sp, "_LS")]] <- ls_fit$stack
+  coh_stacks[[paste0(sp, "_GHQ")]] <- ghq_fit$stack
+
+  if (sp == "primary_1plus") {
+    g_ls <- fit_direct_gradient(ls_fit$stack, "cohabitation", "Life satisfaction", sp)
+    g_ghq <- fit_direct_gradient(ghq_fit$stack, "cohabitation",
+                                 "GHQ well-being (-GHQ12)", sp)
+    coh_gradients <- bind_rows(
+      g_ls$coefficients, g_ls$contrasts,
+      g_ghq$coefficients, g_ghq$contrasts
+    )
+  }
+}
+
+coh_all_results <- coh_all_results %>%
+  group_by(specification, model_specification, proximity_window) %>%
+  mutate(p_holm_within_window_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+  ungroup() %>%
+  group_by(specification, model_specification) %>%
+  mutate(p_holm_across_6_tests = p.adjust(p_value, method = "holm")) %>%
+  ungroup()
+
+write_csv_quiet(coh_all_results,
+                "COH_A02_objective_proximity_parallel_results.csv")
+write_csv_quiet(coh_gradients,
+                "COH_A03_objective_direct_gradient_parallel.csv")
+
+# Absolute recent change among future cohabiters at each landmark.
+coh_abs <- bind_rows(
+  cohab_treated_landmarks %>%
+    filter(!is.na(par_ls_recent_change_z)) %>%
+    group_by(proximity_window, window_order) %>%
+    summarise(
+      outcome = "Life satisfaction",
+      n = n(), n_people = n_distinct(pidp),
+      mean_change_z = mean(par_ls_recent_change_z),
+      se_change_z = sd(par_ls_recent_change_z) / sqrt(n()),
+      .groups = "drop"
+    ),
+  cohab_treated_landmarks %>%
+    filter(!is.na(par_ghqwb_recent_change_z)) %>%
+    group_by(proximity_window, window_order) %>%
+    summarise(
+      outcome = "GHQ well-being (-GHQ12)",
+      n = n(), n_people = n_distinct(pidp),
+      mean_change_z = mean(par_ghqwb_recent_change_z),
+      se_change_z = sd(par_ghqwb_recent_change_z) / sqrt(n()),
+      .groups = "drop"
+    )
+) %>%
+  mutate(
+    ci_low = mean_change_z - 1.96 * se_change_z,
+    ci_high = mean_change_z + 1.96 * se_change_z
+  ) %>%
+  arrange(window_order, outcome)
+write_csv_quiet(coh_abs, "COH_A04_absolute_recent_change_future_cohabiters.csv")
+
+
+# =============================================================================
+# 6. COHABITATION SUBJECTIVE TEST: NCRR11 (PARALLEL RE-ESTIMATION)
+# =============================================================================
+
+# The saved rows from the earlier workflow already guarantee that the next
+# psychological observation occurs within the same LAT episode.
+required_ncrr11 <- c(
+  "pidp", "lat_episode_id", "wave", "age", "sex", "lat_duration_months",
+  "ncrr11_intend_yes", "life_satisfaction", "ghq_wb",
+  "ls_next_change", "ghqwb_next_change", "linked_cohab_within_36m"
+)
+missing_n11 <- setdiff(required_ncrr11, names(ncrr11_analysis))
+if (length(missing_n11) > 0L) {
+  stop("Saved NCRR11 rows missing: ", paste(missing_n11, collapse = ", "))
+}
+
+ncrr11_analysis <- ncrr11_analysis %>%
+  mutate(
+    par_ls_current_z = life_satisfaction / LS_SD_GLOBAL,
+    par_ghqwb_current_z = ghq_wb / GHQWB_SD_GLOBAL,
+    par_ls_next_change_z = ls_next_change / LS_SD_GLOBAL,
+    par_ghqwb_next_change_z = ghqwb_next_change / GHQWB_SD_GLOBAL
+  )
+
+COH_B_ls <- safe_feols(
+  par_ls_next_change_z ~ ncrr11_intend_yes + par_ls_current_z +
+    ns(lat_duration_months, df = 3) | lat_episode_id + wave,
+  data = ncrr11_analysis %>% filter(!is.na(par_ls_next_change_z)),
+  vcov = ~pidp
+)
+COH_B_ghq <- safe_feols(
+  par_ghqwb_next_change_z ~ ncrr11_intend_yes + par_ghqwb_current_z +
+    ns(lat_duration_months, df = 3) | lat_episode_id + wave,
+  data = ncrr11_analysis %>% filter(!is.na(par_ghqwb_next_change_z)),
+  vcov = ~pidp
+)
+
+COH_B_results <- bind_rows(
+  extract_fixest_term(
+    COH_B_ls, "ncrr11_intend_yes", "within_LAT_episode_FE",
+    "Life satisfaction", "cohabitation subjective expectation NCRR11"
+  ),
+  extract_fixest_term(
+    COH_B_ghq, "ncrr11_intend_yes", "within_LAT_episode_FE",
+    "GHQ well-being (-GHQ12)", "cohabitation subjective expectation NCRR11"
+  )
+) %>%
+  mutate(
+    transition = "cohabitation",
+    expectation_measure = "NCRR11: intends to live together within 3 years",
+    p_holm_2_outcomes = p.adjust(p_value, method = "holm")
+  )
+write_csv_quiet(COH_B_results,
+                "COH_B01_NCRR11_subjective_anticipation_parallel.csv")
+
+COH_C1 <- safe_feglm(
+  linked_cohab_within_36m ~ ncrr11_intend_yes +
+    ns(lat_duration_months, df = 3) + age + i(sex) | wave,
+  data = ncrr11_analysis %>% filter(!is.na(linked_cohab_within_36m)),
+  family = "binomial",
+  vcov = ~pidp
+)
+
+COH_C1_result <- extract_fixest_term(
+  COH_C1, "ncrr11_intend_yes", "NCRR11_predicts_cohabitation_36m",
+  "Observed probable cohabitation within 36m",
+  "cohabitation expectation construct validity"
+) %>%
+  mutate(
+    transition = "cohabitation",
+    odds_ratio = exp(estimate),
+    or_ci_low = exp(ci_low),
+    or_ci_high = exp(ci_high)
+  )
+write_csv_quiet(COH_C1_result,
+                "COH_C01_NCRR11_predicts_cohabitation_36m_parallel.csv")
+
+
+# =============================================================================
+# 7. BUILD COHABITATION SPELL PANEL FOR MARRIAGE ANTICIPATION
+# =============================================================================
+
+cohab_spells <- ph %>%
+  filter(status == 10, !is.na(start_ym), !is.na(end_ym)) %>%
+  mutate(
+    relationship_spell_id = paste0(
+      format(pidp, scientific = FALSE, trim = TRUE), "_COH_", spellno
+    ),
+    marriage_link_ok =
+      next_status == 2 &
+      (same_partner_next | !valid_partner | is.na(next_partner) | next_partner <= 0),
+    marriage_start_ym = if_else(marriage_link_ok, next_start_ym, NA_real_),
+    marriage_start_if = if_else(marriage_link_ok, next_start_if, NA_real_),
+    spell_outcome = case_when(
+      ongoing == 0 & cohend == 1 ~ "breakup",
+      ongoing == 0 & cohend == 2 & marriage_link_ok ~ "marriage",
+      ongoing == 1 ~ "ongoing",
+      TRUE ~ "other"
+    )
+  ) %>%
+  transmute(
+    pidp,
+    cohab_spellno = spellno,
+    relationship_spell_id,
+    cohab_partner = partner,
+    cohab_start_ym = start_ym,
+    cohab_end_ym = end_ym,
+    cohab_start_if = start_if,
+    cohab_end_if = end_if,
+    cohab_ongoing = ongoing,
+    cohend,
+    spell_outcome,
+    marriage_start_ym,
+    marriage_start_if,
+    exact_marriage_date = marriage_start_if %in% MARRIAGE_DATE_FLAGS_PRIMARY,
+    usable_marriage_date_sensitivity =
+      marriage_start_if %in% MARRIAGE_DATE_FLAGS_SENSITIVITY
+  )
+
+active_cohab_candidates <- panel %>%
+  inner_join(cohab_spells, by = "pidp", relationship = "many-to-many") %>%
+  filter(interview_ym >= cohab_start_ym, interview_ym <= cohab_end_ym)
+
+active_count <- active_cohab_candidates %>%
+  count(pidp, wave, interview_ym, name = "n_active_cohab_candidates")
+
+cohab_panel <- active_cohab_candidates %>%
+  left_join(active_count, by = c("pidp", "wave", "interview_ym")) %>%
+  mutate(ambiguous_active_cohab = n_active_cohab_candidates > 1L) %>%
+  group_by(pidp, wave, interview_ym) %>%
+  arrange(desc(cohab_start_ym), cohab_spellno, .by_group = TRUE) %>%
+  slice(1L) %>%
+  ungroup() %>%
+  filter(!ambiguous_active_cohab) %>%
+  mutate(
+    ghq_wb = if_else(!is.na(ghq), -ghq, NA_real_),
+    cohab_duration_months = interview_ym - cohab_start_ym,
+    months_to_marriage = marriage_start_ym - interview_ym
+  )
+
+# Attach recent prior outcomes WITHIN THE SAME COHABITING SPELL.
+cohab_panel <- attach_prior_within_group(
+  cohab_panel, "relationship_spell_id", "life_satisfaction", "ls"
+)
+cohab_panel <- attach_prior_within_group(
+  cohab_panel, "relationship_spell_id", "ghq_wb", "ghqwb"
+)
+
+cohab_panel <- cohab_panel %>%
+  mutate(
+    recent_prior_ls = !is.na(ls_prior_value) &
+      ls_prior_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+      ls_prior_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+    recent_prior_ghqwb = !is.na(ghqwb_prior_value) &
+      ghqwb_prior_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+      ghqwb_prior_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+
+    par_ls_recent_change_z = if_else(
+      recent_prior_ls & !is.na(life_satisfaction),
+      (life_satisfaction - ls_prior_value) / LS_SD_GLOBAL,
+      NA_real_
+    ),
+    par_ghqwb_recent_change_z = if_else(
+      recent_prior_ghqwb & !is.na(ghq_wb),
+      (ghq_wb - ghqwb_prior_value) / GHQWB_SD_GLOBAL,
+      NA_real_
+    ),
+    par_ls_prior_level_z = ls_prior_value / LS_SD_GLOBAL,
+    par_ghqwb_prior_level_z = ghqwb_prior_value / GHQWB_SD_GLOBAL,
+    par_ls_current_z = life_satisfaction / LS_SD_GLOBAL,
+    par_ghqwb_current_z = ghq_wb / GHQWB_SD_GLOBAL
+  )
+
+write_csv_quiet(
+  tibble(
+    metric = c(
+      "cohabitation-spell interview rows",
+      "unique cohabitation spells",
+      "exact linked marriages",
+      "rows with LS recent change",
+      "rows with GHQ recent change"
+    ),
+    value = c(
+      nrow(cohab_panel),
+      n_distinct(cohab_panel$relationship_spell_id),
+      n_distinct(cohab_panel$relationship_spell_id[
+        cohab_panel$spell_outcome == "marriage" & cohab_panel$exact_marriage_date
+      ]),
+      sum(!is.na(cohab_panel$par_ls_recent_change_z)),
+      sum(!is.na(cohab_panel$par_ghqwb_recent_change_z))
+    )
+  ),
+  "MAR_00_cohabitation_spell_panel_audit.csv",
+  "diagnostics"
+)
+
+
+# =============================================================================
+# 8. MARRIAGE OBJECTIVE PROXIMITY RISK SETS
+# =============================================================================
+
+marriage_event_rows <- cohab_panel %>%
+  filter(
+    spell_outcome == "marriage",
+    exact_marriage_date,
+    !is.na(months_to_marriage),
+    months_to_marriage > 0
+  )
+
+marriage_treated_landmarks <- PROXIMITY_WINDOWS %>%
+  split(.$window) %>%
+  imap_dfr(function(w, wname) {
+    marriage_event_rows %>%
+      filter(
+        months_to_marriage >= w$lower[[1]],
+        months_to_marriage <= w$upper[[1]]
+      ) %>%
+      group_by(relationship_spell_id) %>%
+      arrange(months_to_marriage, interview_ym, .by_group = TRUE) %>%
+      slice(1L) %>%
+      ungroup() %>%
+      mutate(
+        proximity_window = wname,
+        window_order = w$window_order[[1]]
+      )
+  }) %>%
+  arrange(window_order, pidp, interview_ym) %>%
+  mutate(
+    match_set_id = paste0(
+      "MARR_", proximity_window, "_", row_number()
+    )
+  )
+
+write_csv_quiet(
+  marriage_treated_landmarks %>%
+    count(proximity_window, name = "treated_landmarks") %>%
+    left_join(PROXIMITY_WINDOWS, by = c("proximity_window" = "window")),
+  "MAR_A00_objective_treated_landmark_counts.csv"
+)
+
+# Control pool: currently cohabiting and unmarried observations. A control may
+# marry later, but the SAME cohabiting spell must remain intact/unmarried beyond
+# the treated person's analogous pseudo-event date.
+marriage_control_pool <- cohab_panel %>%
+  transmute(
+    control_relationship_spell_id = relationship_spell_id,
+    control_pidp = pidp,
+    control_wave = wave,
+    control_wave_n = wave_n,
+    control_interview_ym = interview_ym,
+    control_age = age,
+    control_sex = sex,
+    control_cohab_duration_months = cohab_duration_months,
+    control_cohab_end_ym = cohab_end_ym,
+    control_marriage_start_ym = marriage_start_ym,
+    control_spell_outcome = spell_outcome,
+    control_ls_recent_change_z = par_ls_recent_change_z,
+    control_ghqwb_recent_change_z = par_ghqwb_recent_change_z,
+    control_ls_prior_level_z = par_ls_prior_level_z,
+    control_ghqwb_prior_level_z = par_ghqwb_prior_level_z
+  )
+
+marriage_candidates <- marriage_treated_landmarks %>%
+  transmute(
+    match_set_id,
+    proximity_window,
+    window_order,
+    treated_relationship_spell_id = relationship_spell_id,
+    treated_pidp = pidp,
+    treated_wave = wave,
+    treated_wave_n = wave_n,
+    treated_interview_ym = interview_ym,
+    treated_age = age,
+    treated_sex = sex,
+    treated_cohab_duration_months = cohab_duration_months,
+    months_to_marriage,
+    treated_marriage_start_ym = marriage_start_ym,
+    treated_ls_recent_change_z = par_ls_recent_change_z,
+    treated_ghqwb_recent_change_z = par_ghqwb_recent_change_z,
+    treated_ls_prior_level_z = par_ls_prior_level_z,
+    treated_ghqwb_prior_level_z = par_ghqwb_prior_level_z
+  ) %>%
+  inner_join(
+    marriage_control_pool,
+    by = c(
+      "treated_wave_n" = "control_wave_n",
+      "treated_sex" = "control_sex"
+    ),
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    control_pidp != treated_pidp,
+    abs(control_age - treated_age) <= MATCH_AGE_CALIPER,
+    abs(control_interview_ym - treated_interview_ym) <=
+      MATCH_INTERVIEW_MONTH_CALIPER,
+    abs(control_cohab_duration_months - treated_cohab_duration_months) <=
+      MATCH_RELATIONSHIP_DURATION_CALIPER
+  ) %>%
+  mutate(
+    control_pseudo_event_ym = control_interview_ym + months_to_marriage,
+
+    # Must remain in the SAME cohabiting spell strictly beyond pseudo-event.
+    control_same_cohab_through_pseudo_event =
+      !is.na(control_cohab_end_ym) &
+      control_cohab_end_ym > control_pseudo_event_ym,
+
+    # Redundant but transparent marriage safeguard.
+    control_no_marriage_through_pseudo_event =
+      is.na(control_marriage_start_ym) |
+      control_marriage_start_ym > control_pseudo_event_ym
+  ) %>%
+  filter(
+    control_same_cohab_through_pseudo_event,
+    control_no_marriage_through_pseudo_event
+  ) %>%
+  distinct(match_set_id, control_pidp, control_relationship_spell_id,
+           .keep_all = TRUE)
+
+mar_candidate_counts <- marriage_candidates %>%
+  count(match_set_id, proximity_window, name = "candidate_controls")
+
+mar_candidate_audit <- marriage_treated_landmarks %>%
+  select(match_set_id, proximity_window) %>%
+  distinct() %>%
+  left_join(mar_candidate_counts,
+            by = c("match_set_id", "proximity_window")) %>%
+  mutate(candidate_controls = coalesce(candidate_controls, 0L)) %>%
+  group_by(proximity_window) %>%
+  summarise(
+    treated_landmarks = n(),
+    retained_1plus_candidates = sum(candidate_controls >= 1),
+    retained_3plus_candidates = sum(candidate_controls >= 3),
+    retained_5plus_candidates = sum(candidate_controls >= 5),
+    median_candidate_controls = median(candidate_controls),
+    p10_candidate_controls = as.numeric(quantile(candidate_controls, .10)),
+    p90_candidate_controls = as.numeric(quantile(candidate_controls, .90)),
+    .groups = "drop"
+  )
+write_csv_quiet(mar_candidate_audit,
+                "MAR_A01_objective_candidate_summary.csv")
+
+# Match-balance audit independent of outcome missingness.
+mar_balance <- marriage_candidates %>%
+  mutate(
+    abs_age_diff = abs(control_age - treated_age),
+    abs_interview_month_diff = abs(control_interview_ym - treated_interview_ym),
+    abs_duration_diff = abs(
+      control_cohab_duration_months - treated_cohab_duration_months
+    )
+  ) %>%
+  group_by(proximity_window) %>%
+  summarise(
+    comparisons = n(),
+    mean_abs_age_diff = mean(abs_age_diff),
+    max_abs_age_diff = max(abs_age_diff),
+    mean_abs_interview_month_diff = mean(abs_interview_month_diff),
+    max_abs_interview_month_diff = max(abs_interview_month_diff),
+    mean_abs_cohab_duration_diff = mean(abs_duration_diff),
+    max_abs_cohab_duration_diff = max(abs_duration_diff),
+    exact_sex_match_pct = 100 * mean(control_sex == treated_sex),
+    exact_wave_match_pct = 100,
+    .groups = "drop"
+  )
+write_csv_quiet(mar_balance, "MAR_A02_matching_balance_audit.csv",
+                "diagnostics")
+
+mar_all_results <- tibble()
+mar_stacks <- list()
+mar_gradients <- tibble()
+
+for (sp in names(MIN_CONTROLS_SPECS)) {
+  mn <- unname(MIN_CONTROLS_SPECS[[sp]])
+
+  ls_fit <- fit_parallel_objective_outcome(
+    "marriage", marriage_treated_landmarks, marriage_candidates,
+    "par_ls_recent_change_z", "control_ls_recent_change_z",
+    "par_ls_prior_level_z", "control_ls_prior_level_z",
+    "Life satisfaction", mn, sp
+  )
+  ghq_fit <- fit_parallel_objective_outcome(
+    "marriage", marriage_treated_landmarks, marriage_candidates,
+    "par_ghqwb_recent_change_z", "control_ghqwb_recent_change_z",
+    "par_ghqwb_prior_level_z", "control_ghqwb_prior_level_z",
+    "GHQ well-being (-GHQ12)", mn, sp
+  )
+
+  mar_all_results <- bind_rows(mar_all_results, ls_fit$results, ghq_fit$results)
+  mar_stacks[[paste0(sp, "_LS")]] <- ls_fit$stack
+  mar_stacks[[paste0(sp, "_GHQ")]] <- ghq_fit$stack
+
+  if (sp == "primary_1plus") {
+    g_ls <- fit_direct_gradient(ls_fit$stack, "marriage", "Life satisfaction", sp)
+    g_ghq <- fit_direct_gradient(ghq_fit$stack, "marriage",
+                                 "GHQ well-being (-GHQ12)", sp)
+    mar_gradients <- bind_rows(
+      g_ls$coefficients, g_ls$contrasts,
+      g_ghq$coefficients, g_ghq$contrasts
+    )
+  }
+}
+
+mar_all_results <- mar_all_results %>%
+  group_by(specification, model_specification, proximity_window) %>%
+  mutate(p_holm_within_window_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+  ungroup() %>%
+  group_by(specification, model_specification) %>%
+  mutate(p_holm_across_6_tests = p.adjust(p_value, method = "holm")) %>%
+  ungroup()
+
+write_csv_quiet(mar_all_results,
+                "MAR_A03_objective_proximity_parallel_results.csv")
+write_csv_quiet(mar_gradients,
+                "MAR_A04_objective_direct_gradient.csv")
+
+mar_abs <- bind_rows(
+  marriage_treated_landmarks %>%
+    filter(!is.na(par_ls_recent_change_z)) %>%
+    group_by(proximity_window, window_order) %>%
+    summarise(
+      outcome = "Life satisfaction",
+      n = n(), n_people = n_distinct(pidp),
+      mean_change_z = mean(par_ls_recent_change_z),
+      se_change_z = sd(par_ls_recent_change_z) / sqrt(n()),
+      .groups = "drop"
+    ),
+  marriage_treated_landmarks %>%
+    filter(!is.na(par_ghqwb_recent_change_z)) %>%
+    group_by(proximity_window, window_order) %>%
+    summarise(
+      outcome = "GHQ well-being (-GHQ12)",
+      n = n(), n_people = n_distinct(pidp),
+      mean_change_z = mean(par_ghqwb_recent_change_z),
+      se_change_z = sd(par_ghqwb_recent_change_z) / sqrt(n()),
+      .groups = "drop"
+    )
+) %>%
+  mutate(
+    ci_low = mean_change_z - 1.96 * se_change_z,
+    ci_high = mean_change_z + 1.96 * se_change_z
+  ) %>%
+  arrange(window_order, outcome)
+write_csv_quiet(mar_abs, "MAR_A05_absolute_recent_change_future_marriers.csv")
+
+# Exact-date sensitivity coverage.
+marriage_sens_ids <- cohab_panel %>%
+  filter(
+    spell_outcome == "marriage",
+    usable_marriage_date_sensitivity,
+    !is.na(marriage_start_ym)
+  ) %>%
+  distinct(relationship_spell_id)
+
+mar_date_coverage <- marriage_treated_landmarks %>%
+  mutate(
+    usable_flag01 = relationship_spell_id %in%
+      marriage_sens_ids$relationship_spell_id
+  ) %>%
+  group_by(proximity_window) %>%
+  summarise(
+    primary_exact_landmarks = n(),
+    also_usable_flag01 = sum(usable_flag01),
+    pct = 100 * mean(usable_flag01),
+    .groups = "drop"
+  )
+write_csv_quiet(mar_date_coverage,
+                "MAR_A06_marriage_date_sensitivity_coverage.csv",
+                "diagnostics")
+
+
+# =============================================================================
+# 9. AUXILIARY TREATED-ONLY WITHIN-RELATIONSHIP PROXIMITY GRADIENTS
+# =============================================================================
+
+fit_treated_only_gradient <- function(df, outcome_col, outcome_label, transition,
+                                      group_id) {
+  d <- df %>%
+    filter(!is.na(.data[[outcome_col]])) %>%
+    mutate(
+      proximity_window = factor(
+        proximity_window,
+        levels = c("25-60m", "13-24m", "1-12m")
+      )
+    )
+
+  if (nrow(d) == 0L || n_distinct(d$proximity_window) < 2L) return(tibble())
+
+  f <- stats::as.formula(
+    paste0(outcome_col, " ~ proximity_window | ", group_id)
+  )
+  m <- safe_feols(f, data = d, vcov = ~pidp)
+  extract_fixest_all(
+    m, paste0(transition, "_treated_only_within_relationship_gradient"),
+    outcome_label,
+    paste0(transition, " auxiliary treated-only proximity gradient")
+  )
+}
+
+COH_aux_grad <- bind_rows(
+  fit_treated_only_gradient(
+    cohab_treated_landmarks, "par_ls_recent_change_z", "Life satisfaction",
+    "cohabitation", "lat_episode_id"
+  ),
+  fit_treated_only_gradient(
+    cohab_treated_landmarks, "par_ghqwb_recent_change_z",
+    "GHQ well-being (-GHQ12)", "cohabitation", "lat_episode_id"
+  )
+)
+write_csv_quiet(COH_aux_grad,
+                "COH_A05_auxiliary_treated_only_within_relationship_gradient.csv")
+
+MAR_aux_grad <- bind_rows(
+  fit_treated_only_gradient(
+    marriage_treated_landmarks, "par_ls_recent_change_z", "Life satisfaction",
+    "marriage", "relationship_spell_id"
+  ),
+  fit_treated_only_gradient(
+    marriage_treated_landmarks, "par_ghqwb_recent_change_z",
+    "GHQ well-being (-GHQ12)", "marriage", "relationship_spell_id"
+  )
+)
+write_csv_quiet(MAR_aux_grad,
+                "MAR_A07_auxiliary_treated_only_within_relationship_gradient.csv")
+
+
+# =============================================================================
+# 10. DISCOVER COHABITER-SPECIFIC MARRIAGE-EXPECTATION VARIABLES
+# =============================================================================
+
+if (!dir.exists(UKHLS_DIR)) {
+  stop("UKHLS_DIR does not exist; required for marriage-expectation audit: ",
+       UKHLS_DIR)
+}
+
+all_dta <- list.files(
+  UKHLS_DIR, pattern = "\\.dta$", recursive = TRUE,
+  full.names = TRUE, ignore.case = TRUE
+)
+wave_files <- all_dta[
+  grepl("^[a-o]_indresp\\.dta$", tolower(basename(all_dta)))
+]
+wave_index <- tibble(
+  file = wave_files,
+  wave = map_chr(wave_files, wave_from_indresp_file)
+) %>%
+  filter(wave %in% letters[1:15]) %>%
+  mutate(wave_n = wave_number(wave)) %>%
+  arrange(wave_n)
+
+if (nrow(wave_index) == 0L) {
+  stop("No a_indresp.dta ... o_indresp.dta files found under UKHLS_DIR.")
+}
+
+scan_wave_labels <- function(path, wave, wave_n) {
+  d <- tryCatch(haven::read_dta(path, n_max = 1L), error = function(e) NULL)
+  if (is.null(d)) return(tibble())
+  nms <- names(d)
+  labs <- vapply(
+    d,
+    function(x) {
+      z <- attr(x, "label", exact = TRUE)
+      if (is.null(z)) "" else as.character(z)
+    },
+    character(1)
+  )
+  tibble(
+    wave = wave,
+    wave_n = wave_n,
+    file = path,
+    variable = nms,
+    stem = strip_wave_prefix(nms),
+    label = labs,
+    label_lower = tolower(labs)
+  )
+}
+
+label_catalog <- pmap_dfr(
+  wave_index,
+  function(file, wave, wave_n) scan_wave_labels(file, wave, wave_n)
+)
+
+marriage_expectation_candidates <- label_catalog %>%
+  filter(
+    !grepl("^ncrr", stem),
+    grepl("marr", label_lower),
+    grepl("partner", label_lower),
+    grepl("likely|likelihood|plan|intend|intention|expect", label_lower)
+  ) %>%
+  mutate(
+    score =
+      4 * grepl("current partner", label_lower) +
+      3 * grepl("how likely|likelihood", label_lower) +
+      2 * grepl("plan|intend|intention|expect", label_lower) +
+      1 * grepl("marry", label_lower)
+  )
+
+write_csv_quiet(
+  marriage_expectation_candidates %>%
+    select(wave, wave_n, variable, stem, label, score),
+  "MAR_B00_raw_marriage_expectation_candidate_labels.csv",
+  "diagnostics"
+)
+
+candidate_stem_summary <- marriage_expectation_candidates %>%
+  group_by(stem) %>%
+  summarise(
+    n_waves = n_distinct(wave),
+    waves = paste(sort(unique(wave_n)), collapse = ","),
+    max_score = max(score),
+    example_label = first(label),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(max_score), desc(n_waves), stem)
+
+write_csv_quiet(candidate_stem_summary,
+                "MAR_B01_candidate_stem_summary.csv", "diagnostics")
+
+# Read a candidate stem across all waves and merge to cohab_panel to determine
+# whether it actually has substantive responses among cohabiters.
+read_candidate_stem <- function(stem) {
+  map2_dfr(wave_index$file, wave_index$wave, function(path, wave) {
+    nms <- safe_read_names(path)
+    pidp_var <- resolve_wave_variable(nms, wave, "pidp")
+    target_var <- resolve_wave_variable(nms, wave, stem)
+    if (is.na(pidp_var) || is.na(target_var)) return(tibble())
+    dat <- haven::read_dta(path, col_select = any_of(c(pidp_var, target_var)))
+    tibble(
+      wave = wave,
+      pidp = suppressWarnings(as.numeric(dat[[pidp_var]])),
+      marriage_expect_raw = suppressWarnings(as.numeric(dat[[target_var]]))
+    )
+  })
+}
+
+candidate_validity <- tibble()
+candidate_data_cache <- list()
+
+for (stem in candidate_stem_summary$stem) {
+  dd <- read_candidate_stem(stem)
+  candidate_data_cache[[stem]] <- dd
+  if (nrow(dd) == 0L) next
+
+  chk <- cohab_panel %>%
+    select(pidp, wave, relationship_spell_id) %>%
+    inner_join(dd, by = c("pidp", "wave"))
+
+  vals <- chk$marriage_expect_raw
+  substantive_1_5 <- vals %in% 1:5
+
+  candidate_validity <- bind_rows(
+    candidate_validity,
+    tibble(
+      stem = stem,
+      cohab_rows_with_any_nonnegative = sum(!is.na(vals) & vals >= 0),
+      cohab_rows_with_codes_1_to_5 = sum(substantive_1_5, na.rm = TRUE),
+      cohab_spells_with_codes_1_to_5 = n_distinct(
+        chk$relationship_spell_id[substantive_1_5]
+      ),
+      observed_min = ifelse(any(substantive_1_5), min(vals[substantive_1_5]), NA),
+      observed_max = ifelse(any(substantive_1_5), max(vals[substantive_1_5]), NA)
+    )
+  )
+}
+
+candidate_validity <- candidate_stem_summary %>%
+  left_join(candidate_validity, by = "stem") %>%
+  mutate(
+    cohab_rows_with_codes_1_to_5 = coalesce(cohab_rows_with_codes_1_to_5, 0L),
+    auto_eligible =
+      n_waves >= MIN_WAVES_FOR_AUTO_MARRIAGE_EXPECTATION &
+      cohab_rows_with_codes_1_to_5 >= MIN_VALID_COHAB_RESPONSES_FOR_AUTO
+  ) %>%
+  arrange(desc(auto_eligible), desc(cohab_rows_with_codes_1_to_5),
+          desc(max_score), desc(n_waves), stem)
+
+write_csv_quiet(candidate_validity,
+                "MAR_B02_candidate_validity_among_cohabiters.csv",
+                "diagnostics")
+
+selected_marriage_stem <- NA_character_
+selection_reason <- "none"
+
+if (!is.na(MARRIAGE_EXPECTATION_STEM_OVERRIDE) &&
+    nzchar(MARRIAGE_EXPECTATION_STEM_OVERRIDE)) {
+  selected_marriage_stem <- tolower(MARRIAGE_EXPECTATION_STEM_OVERRIDE)
+  selection_reason <- "user override"
+} else if (AUTO_SELECT_MARRIAGE_EXPECTATION) {
+  eligible <- candidate_validity %>% filter(auto_eligible)
+  if (nrow(eligible) > 0L) {
+    # Auto-select only if the top candidate has strictly more valid cohabiter
+    # responses than the runner-up OR is the only eligible candidate.
+    if (nrow(eligible) == 1L ||
+        eligible$cohab_rows_with_codes_1_to_5[1] >
+          eligible$cohab_rows_with_codes_1_to_5[2]) {
+      selected_marriage_stem <- eligible$stem[1]
+      selection_reason <- "unique strongest repeated candidate among cohabiters"
+    } else {
+      selection_reason <- "ambiguous: multiple similarly supported candidates"
+    }
+  } else {
+    selection_reason <- "no repeated candidate with sufficient cohabiter responses"
+  }
+}
+
+selection_status <- tibble(
+  selected_stem = selected_marriage_stem,
+  selection_reason = selection_reason,
+  subjective_marriage_module_will_run = !is.na(selected_marriage_stem),
+  note = paste(
+    "NCRR12 is intentionally excluded because it is a LAT/non-residential item.",
+    "If no cohabiter-specific repeated marriage-expectation item is found,",
+    "the subjective marriage test is not identified in UKHLS and is skipped."
+  )
+)
+write_csv_quiet(selection_status,
+                "MAR_B03_marriage_expectation_selection_status.csv",
+                "diagnostics")
+
+
+# =============================================================================
+# 11. MARRIAGE SUBJECTIVE EXPECTATION TEST (ONLY IF VALID ITEM FOUND)
+# =============================================================================
+
+MAR_B_results <- tibble()
+MAR_B_change_results <- tibble()
+MAR_C1_result <- tibble()
+MAR_B_variation <- tibble()
+
+if (!is.na(selected_marriage_stem)) {
+
+  if (!selected_marriage_stem %in% names(candidate_data_cache)) {
+    selected_data <- read_candidate_stem(selected_marriage_stem)
+  } else {
+    selected_data <- candidate_data_cache[[selected_marriage_stem]]
+  }
+
+  cohab_expect <- cohab_panel %>%
+    left_join(selected_data, by = c("pidp", "wave"), relationship = "many-to-one") %>%
+    mutate(
+      marriage_expect_code = if_else(
+        marriage_expect_raw %in% 1:5,
+        as.numeric(marriage_expect_raw), NA_real_
+      ),
+      # Typical coding for this question family: 1 very likely ... 5 very unlikely.
+      # Higher favorable score therefore means stronger expectation.
+      marriage_expect_favorable = if_else(
+        !is.na(marriage_expect_code), 6 - marriage_expect_code, NA_real_
+      ),
+      marriage_expect_high = case_when(
+        marriage_expect_code %in% c(1, 2) ~ 1,
+        marriage_expect_code %in% c(3, 4, 5) ~ 0,
+        TRUE ~ NA_real_
+      )
+    )
+
+  # Attach next psychology within the SAME cohabiting spell. Because cohab_panel
+  # contains only interviews while the spell is active, this is pre-marriage.
+  cohab_expect <- attach_next_within_group(
+    cohab_expect, "relationship_spell_id", "life_satisfaction", "ls"
+  )
+  cohab_expect <- attach_next_within_group(
+    cohab_expect, "relationship_spell_id", "ghq_wb", "ghqwb"
+  )
+
+  cohab_expect <- cohab_expect %>%
+    mutate(
+      ls_next_change = if_else(
+        !is.na(ls_next_value) &
+          ls_next_gap >= NEXT_PSYCH_MIN_GAP_MONTHS &
+          ls_next_gap <= NEXT_PSYCH_MAX_GAP_MONTHS &
+          !is.na(life_satisfaction),
+        ls_next_value - life_satisfaction,
+        NA_real_
+      ),
+      ghqwb_next_change = if_else(
+        !is.na(ghqwb_next_value) &
+          ghqwb_next_gap >= NEXT_PSYCH_MIN_GAP_MONTHS &
+          ghqwb_next_gap <= NEXT_PSYCH_MAX_GAP_MONTHS &
+          !is.na(ghq_wb),
+        ghqwb_next_value - ghq_wb,
+        NA_real_
+      ),
+      par_ls_next_change_z = ls_next_change / LS_SD_GLOBAL,
+      par_ghqwb_next_change_z = ghqwb_next_change / GHQWB_SD_GLOBAL,
+
+      marriage_within_36m = case_when(
+        spell_outcome == "marriage" &
+          !is.na(marriage_start_ym) &
+          marriage_start_ym > interview_ym &
+          marriage_start_ym <= interview_ym + EXPECTATION_EVENT_HORIZON_MONTHS ~ 1,
+
+        # Observed breakup before 36m proves no marriage in that relationship.
+        spell_outcome == "breakup" &
+          cohab_end_ym > interview_ym &
+          cohab_end_ym <= interview_ym + EXPECTATION_EVENT_HORIZON_MONTHS ~ 0,
+
+        # Same cohabiting spell survives at least 36m without marriage.
+        cohab_end_ym >= interview_ym + EXPECTATION_EVENT_HORIZON_MONTHS ~ 0,
+        TRUE ~ NA_real_
+      )
+    )
+
+  # Within-spell variation audit.
+  MAR_B_variation <- cohab_expect %>%
+    filter(!is.na(marriage_expect_high)) %>%
+    group_by(relationship_spell_id) %>%
+    summarise(
+      pidp = first(pidp),
+      n_expect_obs = n(),
+      n_distinct_binary = n_distinct(marriage_expect_high),
+      n_distinct_ordinal = n_distinct(marriage_expect_favorable),
+      binary_varies = n_distinct_binary >= 2,
+      ordinal_varies = n_distinct_ordinal >= 2,
+      .groups = "drop"
+    ) %>%
+    summarise(
+      selected_stem = selected_marriage_stem,
+      cohab_spells_with_expectation = n(),
+      spells_with_2plus_expectation_obs = sum(n_expect_obs >= 2),
+      spells_with_binary_change = sum(binary_varies),
+      spells_with_ordinal_change = sum(ordinal_varies),
+      pct_binary_change = 100 * mean(binary_varies),
+      pct_ordinal_change = 100 * mean(ordinal_varies),
+      people = n_distinct(pidp)
+    )
+  write_csv_quiet(MAR_B_variation,
+                  "MAR_B04_within_cohab_marriage_expectation_variation.csv")
+
+  # Primary: binary high expectation, directly analogous to NCRR11 yes/no.
+  MAR_B_ls <- safe_feols(
+    par_ls_next_change_z ~ marriage_expect_high + par_ls_current_z +
+      ns(cohab_duration_months, df = 3) | relationship_spell_id + wave,
+    data = cohab_expect %>%
+      filter(!is.na(par_ls_next_change_z), !is.na(marriage_expect_high)),
+    vcov = ~pidp
+  )
+  MAR_B_ghq <- safe_feols(
+    par_ghqwb_next_change_z ~ marriage_expect_high + par_ghqwb_current_z +
+      ns(cohab_duration_months, df = 3) | relationship_spell_id + wave,
+    data = cohab_expect %>%
+      filter(!is.na(par_ghqwb_next_change_z), !is.na(marriage_expect_high)),
+    vcov = ~pidp
+  )
+
+  # Ordinal favorable-score sensitivity.
+  MAR_B_ls_ord <- safe_feols(
+    par_ls_next_change_z ~ marriage_expect_favorable + par_ls_current_z +
+      ns(cohab_duration_months, df = 3) | relationship_spell_id + wave,
+    data = cohab_expect %>%
+      filter(!is.na(par_ls_next_change_z), !is.na(marriage_expect_favorable)),
+    vcov = ~pidp
+  )
+  MAR_B_ghq_ord <- safe_feols(
+    par_ghqwb_next_change_z ~ marriage_expect_favorable + par_ghqwb_current_z +
+      ns(cohab_duration_months, df = 3) | relationship_spell_id + wave,
+    data = cohab_expect %>%
+      filter(!is.na(par_ghqwb_next_change_z), !is.na(marriage_expect_favorable)),
+    vcov = ~pidp
+  )
+
+  MAR_B_results <- bind_rows(
+    extract_fixest_term(
+      MAR_B_ls, "marriage_expect_high", "within_cohab_spell_FE_binary",
+      "Life satisfaction", "marriage subjective expectation"
+    ) %>% mutate(specification = "binary likely/very likely vs other"),
+    extract_fixest_term(
+      MAR_B_ghq, "marriage_expect_high", "within_cohab_spell_FE_binary",
+      "GHQ well-being (-GHQ12)", "marriage subjective expectation"
+    ) %>% mutate(specification = "binary likely/very likely vs other"),
+    extract_fixest_term(
+      MAR_B_ls_ord, "marriage_expect_favorable", "within_cohab_spell_FE_ordinal",
+      "Life satisfaction", "marriage subjective expectation"
+    ) %>% mutate(specification = "ordinal higher = more likely"),
+    extract_fixest_term(
+      MAR_B_ghq_ord, "marriage_expect_favorable", "within_cohab_spell_FE_ordinal",
+      "GHQ well-being (-GHQ12)", "marriage subjective expectation"
+    ) %>% mutate(specification = "ordinal higher = more likely")
+  ) %>%
+    group_by(specification) %>%
+    mutate(p_holm_2_outcomes = p.adjust(p_value, method = "holm")) %>%
+    ungroup() %>%
+    mutate(
+      transition = "marriage",
+      selected_expectation_stem = selected_marriage_stem
+    )
+
+  write_csv_quiet(MAR_B_results,
+                  "MAR_B05_subjective_marriage_anticipation_results.csv")
+
+  # Stronger auxiliary estimand: CHANGE in expectation predicts NEXT psychology.
+  cohab_expect_change <- cohab_expect %>%
+    arrange(relationship_spell_id, interview_ym) %>%
+    group_by(relationship_spell_id) %>%
+    mutate(
+      prior_expect_favorable = lag(marriage_expect_favorable),
+      prior_expect_ym = lag(interview_ym),
+      expect_gap = interview_ym - prior_expect_ym,
+      change_expect_favorable = if_else(
+        !is.na(prior_expect_favorable) &
+          expect_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+          expect_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS &
+          !is.na(marriage_expect_favorable),
+        marriage_expect_favorable - prior_expect_favorable,
+        NA_real_
+      )
+    ) %>%
+    ungroup()
+
+  MAR_Bchg_ls <- safe_feols(
+    par_ls_next_change_z ~ change_expect_favorable + par_ls_current_z +
+      ns(cohab_duration_months, df = 3) | relationship_spell_id + wave,
+    data = cohab_expect_change %>%
+      filter(!is.na(par_ls_next_change_z), !is.na(change_expect_favorable)),
+    vcov = ~pidp
+  )
+  MAR_Bchg_ghq <- safe_feols(
+    par_ghqwb_next_change_z ~ change_expect_favorable + par_ghqwb_current_z +
+      ns(cohab_duration_months, df = 3) | relationship_spell_id + wave,
+    data = cohab_expect_change %>%
+      filter(!is.na(par_ghqwb_next_change_z), !is.na(change_expect_favorable)),
+    vcov = ~pidp
+  )
+
+  MAR_B_change_results <- bind_rows(
+    extract_fixest_term(
+      MAR_Bchg_ls, "change_expect_favorable", "change_in_expectation_FE",
+      "Life satisfaction", "marriage change-in-expectation anticipation"
+    ),
+    extract_fixest_term(
+      MAR_Bchg_ghq, "change_expect_favorable", "change_in_expectation_FE",
+      "GHQ well-being (-GHQ12)",
+      "marriage change-in-expectation anticipation"
+    )
+  ) %>%
+    mutate(
+      selected_expectation_stem = selected_marriage_stem,
+      p_holm_2_outcomes = p.adjust(p_value, method = "holm")
+    )
+  write_csv_quiet(MAR_B_change_results,
+                  "MAR_B06_change_in_expectation_predicts_next_psychology.csv")
+
+  # Construct validity: does high expectation predict marriage within 36m?
+  MAR_C1 <- safe_feglm(
+    marriage_within_36m ~ marriage_expect_high +
+      ns(cohab_duration_months, df = 3) + age + i(sex) | wave,
+    data = cohab_expect %>%
+      filter(!is.na(marriage_within_36m), !is.na(marriage_expect_high)),
+    family = "binomial",
+    vcov = ~pidp
+  )
+
+  MAR_C1_result <- extract_fixest_term(
+    MAR_C1, "marriage_expect_high", "expectation_predicts_marriage_36m",
+    "Observed marriage within 36m",
+    "marriage expectation construct validity"
+  ) %>%
+    mutate(
+      transition = "marriage",
+      selected_expectation_stem = selected_marriage_stem,
+      odds_ratio = exp(estimate),
+      or_ci_low = exp(ci_low),
+      or_ci_high = exp(ci_high)
+    )
+  write_csv_quiet(MAR_C1_result,
+                  "MAR_C01_expectation_predicts_marriage_36m.csv")
+
+  # Save the selected variable code distribution among cohabiters for manual
+  # verification of coding before manuscript use.
+  expectation_code_audit <- cohab_expect %>%
+    filter(!is.na(marriage_expect_raw)) %>%
+    count(wave, marriage_expect_raw, name = "n") %>%
+    arrange(wave, marriage_expect_raw)
+  write_csv_quiet(expectation_code_audit,
+                  "MAR_B07_selected_expectation_code_audit.csv",
+                  "diagnostics")
+
+  if (SAVE_ANALYTIC_RDS) {
+    saveRDS(cohab_expect,
+            file.path(RESULTS_DIR, "data", "marriage_subjective_rows.rds"))
+  }
+
+} else {
+  # Explicit non-error output: objective marriage analysis remains valid, but a
+  # parallel subjective marriage test cannot be fabricated if UKHLS lacks the
+  # required cohabiter-specific item.
+  write_csv_quiet(
+    tibble(
+      status = "subjective marriage analysis skipped",
+      reason = selection_reason,
+      instruction = paste(
+        "Inspect MAR_B00-MAR_B03. If a valid cohabiter-specific repeated",
+        "marriage-expectation variable exists, set",
+        "MARRIAGE_EXPECTATION_STEM_OVERRIDE and rerun. Do not substitute NCRR12."
+      )
+    ),
+    "MAR_B99_subjective_marriage_module_skipped.csv"
+  )
+}
+
+
+# =============================================================================
+# 12. PARALLEL SYNTHESIS TABLES
+# =============================================================================
+
+# Primary objective estimates only: >=1 controls + unadjusted recent-change model.
+COH_primary_obj <- coh_all_results %>%
+  filter(
+    specification == "primary_1plus",
+    model_specification == "preferred matched recent change"
+  ) %>%
+  transmute(
+    transition,
+    evidence_type = "objective proximity",
+    proximity_window,
+    outcome,
+    estimate, std_error, ci_low, ci_high, p_value,
+    p_holm = p_holm_across_6_tests,
+    matched_sets, treated_people, unique_controls
+  )
+
+MAR_primary_obj <- mar_all_results %>%
+  filter(
+    specification == "primary_1plus",
+    model_specification == "preferred matched recent change"
+  ) %>%
+  transmute(
+    transition,
+    evidence_type = "objective proximity",
+    proximity_window,
+    outcome,
+    estimate, std_error, ci_low, ci_high, p_value,
+    p_holm = p_holm_across_6_tests,
+    matched_sets, treated_people, unique_controls
+  )
+
+parallel_objective <- bind_rows(COH_primary_obj, MAR_primary_obj) %>%
+  arrange(transition, match(proximity_window, PROXIMITY_WINDOWS$window), outcome)
+write_csv_quiet(parallel_objective,
+                "PAR_01_primary_objective_anticipation_results.csv")
+
+parallel_subjective <- bind_rows(
+  COH_B_results %>%
+    transmute(
+      transition,
+      expectation_measure,
+      specification = "within-relationship FE",
+      outcome,
+      estimate, std_error, ci_low, ci_high, p_value,
+      p_holm = p_holm_2_outcomes,
+      n_obs
+    ),
+  if (nrow(MAR_B_results) > 0L) {
+    MAR_B_results %>%
+      filter(specification == "binary likely/very likely vs other") %>%
+      transmute(
+        transition,
+        expectation_measure = paste0(
+          "cohabiter marriage expectation: ", selected_expectation_stem
+        ),
+        specification = "within-relationship FE",
+        outcome,
+        estimate, std_error, ci_low, ci_high, p_value,
+        p_holm = p_holm_2_outcomes,
+        n_obs
+      )
+  } else {
+    tibble()
+  }
+)
+write_csv_quiet(parallel_subjective,
+                "PAR_02_primary_subjective_anticipation_results.csv")
+
+parallel_construct_validity <- bind_rows(
+  COH_C1_result %>%
+    transmute(
+      transition,
+      expectation_measure = "NCRR11",
+      estimate_log_odds = estimate,
+      odds_ratio, or_ci_low, or_ci_high, p_value, n_obs
+    ),
+  if (nrow(MAR_C1_result) > 0L) {
+    MAR_C1_result %>%
+      transmute(
+        transition,
+        expectation_measure = selected_expectation_stem,
+        estimate_log_odds = estimate,
+        odds_ratio, or_ci_low, or_ci_high, p_value, n_obs
+      )
+  } else {
+    tibble()
+  }
+)
+write_csv_quiet(parallel_construct_validity,
+                "PAR_03_expectation_construct_validity.csv")
+
+# Interpretation guide based on estimand rather than statistical significance.
+interpretation_guide <- tibble::tribble(
+  ~pattern, ~preferred_interpretation,
+  "Higher psychological levels only",
+  "Selection/differentiation/sorting; not sufficient evidence of anticipation",
+  "Positive recent-change contrast only at all distances with no gradient",
+  "General pathway differentiation; weak evidence for transition-specific anticipation",
+  "Increasingly favorable matched recent change as event approaches",
+  "Objective pattern consistent with transition-specific anticipation",
+  "Expectation strongly predicts transition but not next pre-event psychological change",
+  "Behaviorally valid expectation but no affirmative evidence for anticipatory psychological improvement",
+  "Expectation predicts transition and next pre-event psychological improvement",
+  "Subjective evidence consistent with anticipation",
+  "Both objective gradient and subjective expectation effects positive",
+  "Strongest convergence consistent with anticipation",
+  "Objective and subjective tests null with reasonably narrow CIs",
+  "Little affirmative evidence for anticipation-as-improvement"
+)
+write_csv_quiet(interpretation_guide, "PAR_04_interpretation_guide.csv")
+
+
+# =============================================================================
+# 13. SAVE ANALYTIC OBJECTS + OUTPUT CHECK
+# =============================================================================
+
+if (SAVE_ANALYTIC_RDS) {
+  saveRDS(marriage_treated_landmarks,
+          file.path(RESULTS_DIR, "data", "marriage_treated_landmarks.rds"))
+  saveRDS(marriage_candidates,
+          file.path(RESULTS_DIR, "data", "marriage_match_candidates.rds"))
+  saveRDS(cohab_panel,
+          file.path(RESULTS_DIR, "data", "cohabitation_spell_panel_for_marriage.rds"))
+  saveRDS(coh_stacks,
+          file.path(RESULTS_DIR, "data", "cohabitation_parallel_matched_stacks.rds"))
+  saveRDS(mar_stacks,
+          file.path(RESULTS_DIR, "data", "marriage_parallel_matched_stacks.rds"))
+}
+
+expected_outputs <- c(
+  "COH_A02_objective_proximity_parallel_results.csv",
+  "COH_A03_objective_direct_gradient_parallel.csv",
+  "COH_A04_absolute_recent_change_future_cohabiters.csv",
+  "COH_B01_NCRR11_subjective_anticipation_parallel.csv",
+  "COH_C01_NCRR11_predicts_cohabitation_36m_parallel.csv",
+  "MAR_A03_objective_proximity_parallel_results.csv",
+  "MAR_A04_objective_direct_gradient.csv",
+  "MAR_A05_absolute_recent_change_future_marriers.csv",
+  "MAR_B03_marriage_expectation_selection_status.csv",
+  "PAR_01_primary_objective_anticipation_results.csv",
+  "PAR_02_primary_subjective_anticipation_results.csv",
+  "PAR_03_expectation_construct_validity.csv"
+)
+
+output_check <- tibble(
+  file = expected_outputs,
+  exists = file.exists(file.path(RESULTS_DIR, expected_outputs))
+)
+write_csv_quiet(output_check, "PAR_98_output_check.csv")
+
+cat("\nParallel anticipation workflow complete.\n")
+cat("Results directory:\n", RESULTS_DIR, "\n\n")
+cat("KEY FILES TO REVIEW/UPLOAD:\n")
+cat("  COH_A02_objective_proximity_parallel_results.csv\n")
+cat("  COH_A03_objective_direct_gradient_parallel.csv\n")
+cat("  COH_A04_absolute_recent_change_future_cohabiters.csv\n")
+cat("  COH_B01_NCRR11_subjective_anticipation_parallel.csv\n")
+cat("  COH_C01_NCRR11_predicts_cohabitation_36m_parallel.csv\n")
+cat("  MAR_A01_objective_candidate_summary.csv\n")
+cat("  MAR_A02_matching_balance_audit.csv\n")
+cat("  MAR_A03_objective_proximity_parallel_results.csv\n")
+cat("  MAR_A04_objective_direct_gradient.csv\n")
+cat("  MAR_A05_absolute_recent_change_future_marriers.csv\n")
+cat("  MAR_B00_raw_marriage_expectation_candidate_labels.csv\n")
+cat("  MAR_B02_candidate_validity_among_cohabiters.csv\n")
+cat("  MAR_B03_marriage_expectation_selection_status.csv\n")
+cat("  MAR_B05_subjective_marriage_anticipation_results.csv (if identified)\n")
+cat("  MAR_C01_expectation_predicts_marriage_36m.csv (if identified)\n")
+cat("  PAR_01_primary_objective_anticipation_results.csv\n")
+cat("  PAR_02_primary_subjective_anticipation_results.csv\n")
+cat("  PAR_03_expectation_construct_validity.csv\n")
+cat("  PAR_98_output_check.csv\n")
+################################################################################

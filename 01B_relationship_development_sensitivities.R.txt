@@ -1,0 +1,1779 @@
+################################################################################
+# UKHLS ADDITIONAL RELATIONSHIP-DEVELOPMENT SENSITIVITIES - VERSION 1
+# Add-on to executed v4.1 + corrected targeted relationship-development analysis
+#
+# PURPOSE
+# -------
+# This script implements three follow-up analyses motivated by the corrected
+# C1/C2 results:
+#
+#   B. BALANCED / COMMON-SPELL C1-C2 SENSITIVITY
+#      For each later relationship-duration bin through 60-83 months, retain
+#      only relationship spells with the relevant outcome observed both at
+#      0-11 months and in that later bin. Re-estimate the within-spell change
+#      and marriage/breakup-vs-ongoing differential change using relationship-
+#      spell FE + wave FE and respondent-clustered SEs.
+#
+#   R. RDAS MARRIAGE-PROXIMITY ANALYSES
+#      Test whether RDAS satisfaction/cohesion are already different in LEVEL
+#      and/or show RECENT CHANGE as marriage approaches (25-60, 13-24, 1-12m).
+#      R1 reproduces the v4.1 stable-60m comparator logic; R2 is an at-risk
+#      landmark sensitivity that does NOT require controls to remain intact and
+#      unmarried for 60 further months.
+#
+#   N. STRICT NON-OVERLAPPING LAGGED CHANGE SENSITIVITY
+#      Re-run C3/C4 only when the predictor-change interval has completely ended
+#      by the start of the outcome-change interval.
+#
+# IMPORTANT INTERPRETATION
+# ------------------------
+# These analyses are observational diagnostics/sensitivities. They do NOT
+# identify causal relationship-development effects, causal mediation, or causal
+# anticipation effects. RDAS proximity is especially informative when level and
+# recent-change results are considered together.
+################################################################################
+
+
+# ==============================================================================
+# 0. USER CONFIGURATION
+# ==============================================================================
+
+# Executed v4.1 output directory.
+V41_DIR <- file.path(
+  getwd(),
+  "UKHLS_REVISED_selection_development_proximity_v4_1"
+)
+
+# New output directory. Existing v4.1 and corrected-targeted outputs are not
+# overwritten.
+OUT_DIR <- file.path(
+  getwd(),
+  "UKHLS_ADDITIONAL_relationship_development_sensitivities_v1"
+)
+
+PRIMARY_DURATION_MIN <- 0L
+PRIMARY_DURATION_MAX <- 179L
+
+# Balanced/common-spell analysis is intentionally restricted to bins with
+# reasonable direct overlap with the 0-11m reference period.
+BALANCED_TARGET_BINS <- c("12-23", "24-35", "36-59", "60-83")
+
+# Same coarsened risk-set dimensions as v4.1 D analyses.
+RISKSET_DURATION_BIN_MONTHS <- 6L
+RISKSET_AGE_BIN_YEARS <- 2L
+
+# Multiplicity adjustment for diagnostic families.
+DIAGNOSTIC_P_ADJUST <- "holm"
+
+# v4.1 primary marriage date definition.
+EXCLUDE_SAME_MONTH_MARRIAGE <- TRUE
+
+# RDAS recent-change interval inherited from v4.1 data construction:
+# prior RDAS level was required 6-30 months earlier.
+# This script does not reconstruct the change variables; it audits their timing.
+
+for (d in c(
+  OUT_DIR,
+  file.path(OUT_DIR, "data"),
+  file.path(OUT_DIR, "models"),
+  file.path(OUT_DIR, "tables"),
+  file.path(OUT_DIR, "diagnostics")
+)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+
+# ==============================================================================
+# 1. PACKAGES
+# ==============================================================================
+
+required_packages <- c(
+  "dplyr", "tidyr", "purrr", "readr", "tibble", "stringr",
+  "fixest", "splines"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Please install these package(s) before running this script: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(tibble)
+library(stringr)
+library(fixest)
+library(splines)
+
+options(dplyr.summarise.inform = FALSE)
+fixest::setFixest_nthreads(0)
+
+
+# ==============================================================================
+# 2. HELPERS
+# ==============================================================================
+
+zsafe <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  s <- stats::sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - mean(x, na.rm = TRUE)) / s
+}
+
+scale_params <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  list(
+    mean = mean(x, na.rm = TRUE),
+    sd = stats::sd(x, na.rm = TRUE)
+  )
+}
+
+z_with_params <- function(x, pars) {
+  x <- suppressWarnings(as.numeric(x))
+  if (is.null(pars) || is.na(pars$sd) || pars$sd == 0) {
+    return(rep(NA_real_, length(x)))
+  }
+  (x - pars$mean) / pars$sd
+}
+
+finite_num <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x[is.finite(x) & !is.na(x)]
+}
+
+safe_min <- function(x) {
+  x <- finite_num(x)
+  if (length(x) == 0L) NA_real_ else min(x)
+}
+
+safe_median <- function(x) {
+  x <- finite_num(x)
+  if (length(x) == 0L) NA_real_ else stats::median(x)
+}
+
+safe_max <- function(x) {
+  x <- finite_num(x)
+  if (length(x) == 0L) NA_real_ else max(x)
+}
+
+safe_quantile <- function(x, prob) {
+  x <- finite_num(x)
+  if (length(x) == 0L) {
+    NA_real_
+  } else {
+    as.numeric(stats::quantile(x, probs = prob, na.rm = TRUE, names = FALSE))
+  }
+}
+
+write_csv_quiet <- function(x, filename, subdir = "tables") {
+  path <- file.path(OUT_DIR, subdir, filename)
+  readr::write_csv(x, path, na = "", progress = FALSE)
+  invisible(path)
+}
+
+write_txt <- function(x, filename, subdir = "tables") {
+  path <- file.path(OUT_DIR, subdir, filename)
+  writeLines(as.character(x), path, useBytes = TRUE)
+  invisible(path)
+}
+
+safe_model_nobs <- function(model) {
+  if (is.null(model)) return(NA_integer_)
+
+  n_direct <- tryCatch(model$nobs, error = function(e) NULL)
+  if (!is.null(n_direct) && length(n_direct) >= 1L) {
+    n_direct <- suppressWarnings(as.integer(n_direct[[1L]]))
+    if (!is.na(n_direct)) return(n_direct)
+  }
+
+  n_resid <- tryCatch(
+    length(stats::residuals(model)),
+    error = function(e) NA_integer_
+  )
+  n_resid <- suppressWarnings(as.integer(n_resid))
+  if (!is.na(n_resid) && n_resid > 0L) return(n_resid)
+
+  NA_integer_
+}
+
+save_fixest_model <- function(model, name) {
+  if (is.null(model)) return(invisible(NULL))
+
+  saveRDS(model, file.path(OUT_DIR, "models", paste0(name, ".rds")))
+
+  cf <- stats::coef(model)
+  se_ <- fixest::se(model)
+  p_ <- fixest::pvalue(model)
+  ci_ <- stats::confint(model)
+
+  out <- tibble(
+    term = names(cf),
+    estimate = as.numeric(cf),
+    std_error = as.numeric(se_),
+    conf_low = as.numeric(ci_[, 1]),
+    conf_high = as.numeric(ci_[, 2]),
+    p_value = as.numeric(p_)
+  )
+
+  write_csv_quiet(out, paste0(name, "_coefficients.csv"))
+  write_txt(capture.output(summary(model)), paste0(name, "_summary.txt"))
+
+  invisible(model)
+}
+
+safe_feols <- function(formula, data, name, ...) {
+  model <- tryCatch(
+    fixest::feols(formula, data = data, ...),
+    error = function(e) e
+  )
+
+  if (inherits(model, "error")) {
+    write_txt(
+      paste0("MODEL FAILED\n\n", conditionMessage(model)),
+      paste0(name, "_ERROR.txt")
+    )
+    return(NULL)
+  }
+
+  save_fixest_model(model, name)
+}
+
+extract_term_row <- function(
+  model,
+  term,
+  analysis,
+  outcome,
+  window = NA_character_,
+  comparator = NA_character_,
+  estimand = NA_character_
+) {
+  base <- tibble(
+    analysis = analysis,
+    outcome = outcome,
+    window = window,
+    comparator = comparator,
+    estimand = estimand,
+    term = term,
+    estimate = NA_real_,
+    std_error = NA_real_,
+    conf_low = NA_real_,
+    conf_high = NA_real_,
+    p_value = NA_real_,
+    nobs = if (is.null(model)) NA_integer_ else safe_model_nobs(model),
+    status = if (is.null(model)) "model_missing" else "term_missing"
+  )
+
+  if (is.null(model)) return(base)
+
+  b <- stats::coef(model)
+  if (!term %in% names(b)) return(base)
+
+  se_ <- fixest::se(model)
+  p_ <- fixest::pvalue(model)
+  ci_ <- stats::confint(model)
+
+  tibble(
+    analysis = analysis,
+    outcome = outcome,
+    window = window,
+    comparator = comparator,
+    estimand = estimand,
+    term = term,
+    estimate = as.numeric(b[term]),
+    std_error = as.numeric(se_[term]),
+    conf_low = as.numeric(ci_[term, 1]),
+    conf_high = as.numeric(ci_[term, 2]),
+    p_value = as.numeric(p_[term]),
+    nobs = safe_model_nobs(model),
+    status = "estimated"
+  )
+}
+
+lincom_row <- function(
+  model,
+  weights_named,
+  analysis,
+  outcome,
+  duration_bin = NA_character_,
+  spell_outcome = NA_character_,
+  contrast = NA_character_
+) {
+  empty <- tibble(
+    analysis = analysis,
+    outcome = outcome,
+    duration_bin = duration_bin,
+    spell_outcome = spell_outcome,
+    contrast = contrast,
+    estimate = NA_real_,
+    std_error = NA_real_,
+    conf_low = NA_real_,
+    conf_high = NA_real_,
+    z = NA_real_,
+    p_value = NA_real_,
+    nobs = if (is.null(model)) NA_integer_ else safe_model_nobs(model),
+    status = if (is.null(model)) "model_missing" else "term_missing"
+  )
+
+  if (is.null(model)) return(empty)
+
+  b <- stats::coef(model)
+  V <- stats::vcov(model)
+  needed <- names(weights_named)
+
+  if (any(!needed %in% names(b))) {
+    empty$status <- paste0(
+      "term_missing: ",
+      paste(setdiff(needed, names(b)), collapse = " | ")
+    )
+    return(empty)
+  }
+
+  w <- as.numeric(weights_named)
+  bb <- as.numeric(b[needed])
+  VV <- as.matrix(V[needed, needed, drop = FALSE])
+
+  est <- sum(w * bb)
+  var_est <- as.numeric(t(w) %*% VV %*% w)
+
+  if (!is.finite(var_est) || var_est < 0) {
+    empty$estimate <- est
+    empty$status <- "invalid_variance"
+    return(empty)
+  }
+
+  se_est <- sqrt(var_est)
+  z <- ifelse(se_est > 0, est / se_est, NA_real_)
+  p <- ifelse(
+    is.finite(z),
+    2 * stats::pnorm(abs(z), lower.tail = FALSE),
+    NA_real_
+  )
+
+  tibble(
+    analysis = analysis,
+    outcome = outcome,
+    duration_bin = duration_bin,
+    spell_outcome = spell_outcome,
+    contrast = contrast,
+    estimate = est,
+    std_error = se_est,
+    conf_low = est - 1.96 * se_est,
+    conf_high = est + 1.96 * se_est,
+    z = z,
+    p_value = p,
+    nobs = safe_model_nobs(model),
+    status = "estimated"
+  )
+}
+
+safe_wald_row <- function(
+  model,
+  keep,
+  test_name,
+  outcome,
+  analysis
+) {
+  empty <- tibble(
+    analysis = analysis,
+    test = test_name,
+    outcome = outcome,
+    stat = NA_real_,
+    p_value = NA_real_,
+    df = NA_real_,
+    n_terms = NA_integer_,
+    vcov_rank = NA_integer_,
+    matched_terms = NA_character_,
+    nobs = if (is.null(model)) NA_integer_ else safe_model_nobs(model),
+    status = if (is.null(model)) "model_missing" else "no_matching_coefficients"
+  )
+
+  if (is.null(model)) return(empty)
+
+  b_all <- tryCatch(stats::coef(model), error = function(e) NULL)
+  V_all <- tryCatch(stats::vcov(model), error = function(e) NULL)
+  if (is.null(b_all) || is.null(V_all)) {
+    empty$status <- "coef_or_vcov_unavailable"
+    return(empty)
+  }
+
+  idx <- grep(keep, names(b_all), perl = TRUE)
+  if (length(idx) == 0L) return(empty)
+
+  terms <- names(b_all)[idx]
+  b <- as.numeric(b_all[terms])
+  V <- as.matrix(V_all[terms, terms, drop = FALSE])
+
+  if (any(!is.finite(b)) || any(!is.finite(V))) {
+    empty$n_terms <- length(terms)
+    empty$matched_terms <- paste(terms, collapse = " | ")
+    empty$status <- "nonfinite_coef_or_vcov"
+    return(empty)
+  }
+
+  ee <- tryCatch(eigen(V, symmetric = TRUE), error = function(e) NULL)
+  if (is.null(ee)) {
+    empty$n_terms <- length(terms)
+    empty$matched_terms <- paste(terms, collapse = " | ")
+    empty$status <- "vcov_eigendecomposition_failed"
+    return(empty)
+  }
+
+  max_eig <- max(abs(ee$values), na.rm = TRUE)
+  tol <- max(1, nrow(V)) * max(max_eig, 1) * .Machine$double.eps * 100
+  keep_eig <- which(ee$values > tol)
+  rank_v <- length(keep_eig)
+
+  if (rank_v == 0L) {
+    empty$n_terms <- length(terms)
+    empty$vcov_rank <- 0L
+    empty$matched_terms <- paste(terms, collapse = " | ")
+    empty$status <- "vcov_rank_zero"
+    return(empty)
+  }
+
+  Q <- ee$vectors[, keep_eig, drop = FALSE]
+  V_inv <- Q %*% diag(1 / ee$values[keep_eig], nrow = rank_v) %*% t(Q)
+  W <- as.numeric(t(b) %*% V_inv %*% b)
+  p <- stats::pchisq(W, df = rank_v, lower.tail = FALSE)
+
+  tibble(
+    analysis = analysis,
+    test = test_name,
+    outcome = outcome,
+    stat = W,
+    p_value = p,
+    df = as.numeric(rank_v),
+    n_terms = as.integer(length(terms)),
+    vcov_rank = as.integer(rank_v),
+    matched_terms = paste(terms, collapse = " | "),
+    nobs = safe_model_nobs(model),
+    status = if_else(
+      rank_v == length(terms),
+      "estimated",
+      "estimated_reduced_rank"
+    )
+  )
+}
+
+add_riskset_id <- function(dat) {
+  dat %>%
+    mutate(
+      duration_stratum = floor(cohab_duration_months / RISKSET_DURATION_BIN_MONTHS),
+      age_stratum = floor(age / RISKSET_AGE_BIN_YEARS),
+      riskset_stratum = interaction(
+        wave, sex, duration_stratum, age_stratum, drop = TRUE
+      )
+    )
+}
+
+make_att_riskset <- function(dat, treated_var = "treated") {
+  dat <- dat %>%
+    filter(
+      !is.na(riskset_stratum),
+      !is.na(.data[[treated_var]])
+    )
+
+  counts <- dat %>%
+    group_by(riskset_stratum) %>%
+    summarise(
+      n_treated = sum(.data[[treated_var]] == 1, na.rm = TRUE),
+      n_control = sum(.data[[treated_var]] == 0, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(n_treated > 0, n_control > 0)
+
+  dat %>%
+    inner_join(counts, by = "riskset_stratum") %>%
+    mutate(
+      att_weight = if_else(
+        .data[[treated_var]] == 1,
+        1,
+        n_treated / n_control
+      )
+    )
+}
+
+
+# ==============================================================================
+# 3. LOAD SAVED V4.1 DATA
+# ==============================================================================
+
+development_path <- file.path(
+  V41_DIR,
+  "data",
+  "20_C_relationship_development.rds"
+)
+
+cohab_panel_path <- file.path(
+  V41_DIR,
+  "data",
+  "03_cohabitation_person_spell_wave.rds"
+)
+
+missing_inputs <- c(development_path, cohab_panel_path)[
+  !file.exists(c(development_path, cohab_panel_path))
+]
+
+if (length(missing_inputs) > 0L) {
+  stop(
+    "Required executed-v4.1 RDS file(s) not found:\n",
+    paste(missing_inputs, collapse = "\n"),
+    "\n\nSet V41_DIR to the directory produced by the EXECUTED v4.1 workflow."
+  )
+}
+
+development <- readRDS(development_path)
+cohab_panel <- readRDS(cohab_panel_path)
+
+required_development <- c(
+  "pidp", "wave", "interview_ym", "relationship_spell_id", "spell_outcome",
+  "cohab_duration_months", "ghq", "life_satisfaction",
+  "rdas_satisfaction", "rdas_cohesion",
+  "spell_ghq_change", "spell_ls_change",
+  "prior_spell_ghq", "prior_spell_ls",
+  "prior_spell_ghq_ym", "prior_spell_ls_ym",
+  "rdas_satisfaction_change", "rdas_cohesion_change",
+  "prior_rdas_satisfaction", "prior_rdas_cohesion",
+  "prior_rdas_satisfaction_ym", "prior_rdas_cohesion_ym",
+  "prior_rdas_sat_change", "prior_rdas_coh_change",
+  "prior_rdas_sat_change_ym", "prior_rdas_coh_change_ym",
+  "usable_prior_rdas_change",
+  "prior_ghq_change", "prior_ls_change",
+  "prior_ghq_change_ym", "prior_ls_change_ym",
+  "usable_prior_ghq_change", "usable_prior_ls_change"
+)
+
+missing_development <- setdiff(required_development, names(development))
+if (length(missing_development) > 0L) {
+  stop(
+    "20_C_relationship_development.rds is missing required variables:\n",
+    paste(missing_development, collapse = ", ")
+  )
+}
+
+required_cohab <- c(
+  "pidp", "wave", "interview_ym", "relationship_spell_id",
+  "ambiguous_active_cohab", "cohab_duration_months", "age", "sex",
+  "spell_outcome", "marriage_horizon_state", "months_to_marriage",
+  "marriage_start_ym", "marriage_start_if", "exact_marriage_date",
+  "continued_cohab_60m",
+  "rdas_satisfaction", "rdas_cohesion",
+  "rdas_satisfaction_change", "rdas_cohesion_change",
+  "prior_rdas_satisfaction", "prior_rdas_cohesion",
+  "prior_rdas_satisfaction_ym", "prior_rdas_cohesion_ym"
+)
+
+missing_cohab <- setdiff(required_cohab, names(cohab_panel))
+if (length(missing_cohab) > 0L) {
+  stop(
+    "03_cohabitation_person_spell_wave.rds is missing required variables:\n",
+    paste(missing_cohab, collapse = ", ")
+  )
+}
+
+input_audit <- tibble(
+  object = c("development", "cohab_panel"),
+  source_file = c(development_path, cohab_panel_path),
+  n_rows = c(nrow(development), nrow(cohab_panel)),
+  n_persons = c(
+    dplyr::n_distinct(development$pidp),
+    dplyr::n_distinct(cohab_panel$pidp)
+  ),
+  n_relationship_spells = c(
+    dplyr::n_distinct(development$relationship_spell_id),
+    dplyr::n_distinct(cohab_panel$relationship_spell_id)
+  )
+)
+
+write_csv_quiet(input_audit, "00_input_audit.csv", subdir = "diagnostics")
+
+
+# ==============================================================================
+# 4. COMMON PREPARATION
+# ==============================================================================
+
+development <- development %>%
+  mutate(
+    duration_bin = cut(
+      cohab_duration_months,
+      breaks = c(-Inf, 11, 23, 35, 59, 83, 119, 179),
+      labels = c(
+        "0-11", "12-23", "24-35", "36-59",
+        "60-83", "84-119", "120-179"
+      )
+    ),
+    duration_bin = factor(
+      duration_bin,
+      levels = c(
+        "0-11", "12-23", "24-35", "36-59",
+        "60-83", "84-119", "120-179"
+      )
+    ),
+    spell_outcome = relevel(factor(spell_outcome), ref = "ongoing"),
+    ghq_z = zsafe(ghq),
+    ls_z = zsafe(life_satisfaction),
+    rdas_satisfaction_z = zsafe(rdas_satisfaction),
+    rdas_cohesion_z = zsafe(rdas_cohesion)
+  )
+
+primary_support <- cohab_panel %>%
+  filter(
+    !ambiguous_active_cohab,
+    cohab_duration_months >= PRIMARY_DURATION_MIN,
+    cohab_duration_months <= PRIMARY_DURATION_MAX
+  ) %>%
+  mutate(
+    # Common standardization across the full primary-support pool.
+    rdas_satisfaction_z_all = zsafe(rdas_satisfaction),
+    rdas_cohesion_z_all = zsafe(rdas_cohesion),
+    rdas_satisfaction_change_z_all = zsafe(rdas_satisfaction_change),
+    rdas_cohesion_change_z_all = zsafe(rdas_cohesion_change),
+    prior_rdas_satisfaction_z_all = zsafe(prior_rdas_satisfaction),
+    prior_rdas_cohesion_z_all = zsafe(prior_rdas_cohesion)
+  )
+
+write_csv_quiet(
+  tibble(
+    metric = c(
+      "primary_support_rows",
+      "primary_support_persons",
+      "primary_support_relationship_spells"
+    ),
+    value = c(
+      nrow(primary_support),
+      dplyr::n_distinct(primary_support$pidp),
+      dplyr::n_distinct(primary_support$relationship_spell_id)
+    )
+  ),
+  "01_primary_support_reconstruction.csv",
+  subdir = "diagnostics"
+)
+
+
+# ==============================================================================
+# 5. B: BALANCED / COMMON-SPELL C1-C2 SENSITIVITY
+# ==============================================================================
+#
+# For each target duration bin, a relationship spell is included only if the
+# relevant outcome is observed at least once in BOTH 0-11m and the target bin.
+# The model then uses all nonmissing observations from those two bins:
+#
+#   outcome_z ~ target + marriage_x_target + breakup_x_target |
+#               relationship_spell_id + wave
+#
+# Therefore:
+#   target                  = within-spell change for ongoing cohabitations
+#   target + marriage_x     = within-spell change for future-marriage spells
+#   target + breakup_x      = within-spell change for future-breakup spells
+#   marriage_x              = differential change: marriage vs ongoing
+#   breakup_x               = differential change: breakup vs ongoing
+#
+# This is a balanced-overlap sensitivity, not a new primary estimator.
+# ==============================================================================
+
+balanced_outcomes <- tribble(
+  ~outcome_var, ~outcome_label, ~stub,
+  "ghq_z", "GHQ distress", "GHQ",
+  "ls_z", "Life satisfaction", "LS",
+  "rdas_satisfaction_z", "RDAS satisfaction", "RDAS_SAT",
+  "rdas_cohesion_z", "RDAS cohesion", "RDAS_COH"
+)
+
+balanced_models <- list()
+balanced_counts <- list()
+balanced_contrasts <- list()
+
+fit_balanced_one <- function(outcome_var, outcome_label, stub, target_bin) {
+
+  nonmissing <- development %>%
+    filter(
+      spell_outcome %in% c("ongoing", "marriage", "breakup"),
+      duration_bin %in% c("0-11", target_bin),
+      !is.na(.data[[outcome_var]])
+    )
+
+  eligible_spells <- nonmissing %>%
+    distinct(relationship_spell_id, duration_bin) %>%
+    group_by(relationship_spell_id) %>%
+    summarise(
+      has_ref = any(duration_bin == "0-11"),
+      has_target = any(as.character(duration_bin) == target_bin),
+      .groups = "drop"
+    ) %>%
+    filter(has_ref, has_target) %>%
+    pull(relationship_spell_id)
+
+  dat <- nonmissing %>%
+    filter(relationship_spell_id %in% eligible_spells) %>%
+    mutate(
+      target_bin_indicator = as.integer(as.character(duration_bin) == target_bin),
+      marriage_x_target = as.integer(spell_outcome == "marriage") * target_bin_indicator,
+      breakup_x_target = as.integer(spell_outcome == "breakup") * target_bin_indicator
+    )
+
+  counts <- dat %>%
+    distinct(pidp, relationship_spell_id, spell_outcome) %>%
+    count(spell_outcome, name = "n_relationship_spells") %>%
+    mutate(
+      outcome = outcome_label,
+      target_bin = target_bin,
+      n_rows_model_pool = nrow(dat),
+      n_persons_model_pool = dplyr::n_distinct(dat$pidp)
+    ) %>%
+    select(
+      outcome, target_bin, spell_outcome,
+      n_relationship_spells, n_rows_model_pool, n_persons_model_pool
+    )
+
+  model_name <- paste0(
+    "B_BALANCED_", stub, "_0_11_vs_", gsub("-", "_", target_bin)
+  )
+
+  model <- safe_feols(
+    stats::as.formula(
+      paste0(
+        outcome_var,
+        " ~ target_bin_indicator + marriage_x_target + breakup_x_target | ",
+        "relationship_spell_id + wave"
+      )
+    ),
+    data = dat,
+    name = model_name,
+    vcov = ~pidp
+  )
+
+  contrasts <- bind_rows(
+    lincom_row(
+      model,
+      c(target_bin_indicator = 1),
+      analysis = "balanced_common_spell",
+      outcome = outcome_label,
+      duration_bin = target_bin,
+      spell_outcome = "ongoing",
+      contrast = "within-spell change from 0-11m"
+    ),
+    lincom_row(
+      model,
+      c(target_bin_indicator = 1, marriage_x_target = 1),
+      analysis = "balanced_common_spell",
+      outcome = outcome_label,
+      duration_bin = target_bin,
+      spell_outcome = "marriage",
+      contrast = "within-spell change from 0-11m"
+    ),
+    lincom_row(
+      model,
+      c(target_bin_indicator = 1, breakup_x_target = 1),
+      analysis = "balanced_common_spell",
+      outcome = outcome_label,
+      duration_bin = target_bin,
+      spell_outcome = "breakup",
+      contrast = "within-spell change from 0-11m"
+    ),
+    lincom_row(
+      model,
+      c(marriage_x_target = 1),
+      analysis = "balanced_common_spell",
+      outcome = outcome_label,
+      duration_bin = target_bin,
+      spell_outcome = "marriage",
+      contrast = "incremental change vs ongoing"
+    ),
+    lincom_row(
+      model,
+      c(breakup_x_target = 1),
+      analysis = "balanced_common_spell",
+      outcome = outcome_label,
+      duration_bin = target_bin,
+      spell_outcome = "breakup",
+      contrast = "incremental change vs ongoing"
+    )
+  )
+
+  list(model = model, counts = counts, contrasts = contrasts)
+}
+
+for (i in seq_len(nrow(balanced_outcomes))) {
+  for (target_bin in BALANCED_TARGET_BINS) {
+    zz <- fit_balanced_one(
+      balanced_outcomes$outcome_var[i],
+      balanced_outcomes$outcome_label[i],
+      balanced_outcomes$stub[i],
+      target_bin
+    )
+
+    key <- paste(balanced_outcomes$stub[i], target_bin, sep = "__")
+    balanced_models[[key]] <- zz$model
+    balanced_counts[[key]] <- zz$counts
+    balanced_contrasts[[key]] <- zz$contrasts
+  }
+}
+
+B_balanced_counts <- bind_rows(balanced_counts)
+B_balanced_contrasts <- bind_rows(balanced_contrasts) %>%
+  group_by(outcome, spell_outcome, contrast) %>%
+  mutate(
+    p_holm_across_4_bins = if_else(
+      status == "estimated",
+      stats::p.adjust(p_value, method = DIAGNOSTIC_P_ADJUST),
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+
+B_balanced_incremental <- B_balanced_contrasts %>%
+  filter(contrast == "incremental change vs ongoing")
+
+write_csv_quiet(
+  B_balanced_counts,
+  "B01_balanced_common_spell_sample_counts.csv",
+  subdir = "diagnostics"
+)
+
+write_csv_quiet(
+  B_balanced_contrasts,
+  "B02_balanced_common_spell_interpretable_contrasts.csv"
+)
+
+write_csv_quiet(
+  B_balanced_incremental,
+  "B03_balanced_common_spell_incremental_tests.csv"
+)
+
+
+# ==============================================================================
+# 6. R: RDAS MARRIAGE-PROXIMITY ANALYSES
+# ==============================================================================
+#
+# We estimate both:
+#   LEVEL: current standardized RDAS level ~ treated | risk-set stratum
+#   CHANGE: standardized recent RDAS change ~ treated + prior RDAS level |
+#           risk-set stratum
+#
+# The CHANGE model is the more direct diagnostic of a proximal increase.
+# The LEVEL model shows whether relationship-quality differences are already
+# present at that proximity window.
+#
+# Two comparator definitions are reported:
+#
+# R1 stable60:
+#   exact v4.1 logic: marriage in target window vs continued cohabitation >=60m.
+#
+# R2 at_risk:
+#   treated = exact marriage in target window;
+#   controls = currently cohabiting observations with NO KNOWN linked marriage
+#              within the upper bound of that window. Controls may later marry
+#              or may dissolve; no 60m future-survival condition is imposed.
+#
+# R2 is a sensitivity to selection induced by the stable-60m control definition.
+# ==============================================================================
+
+windows <- tribble(
+  ~window, ~lower, ~upper, ~treated_state,
+  "1-12m", 1L, 12L, "marriage_1_12m",
+  "13-24m", 13L, 24L, "marriage_13_24m",
+  "25-60m", 25L, 60L, "marriage_25_60m"
+)
+
+rdas_specs <- tribble(
+  ~outcome, ~level_var, ~change_var, ~prior_level_var, ~prior_time_var,
+  "RDAS satisfaction", "rdas_satisfaction_z_all", "rdas_satisfaction_change_z_all",
+  "prior_rdas_satisfaction_z_all", "prior_rdas_satisfaction_ym",
+  "RDAS cohesion", "rdas_cohesion_z_all", "rdas_cohesion_change_z_all",
+  "prior_rdas_cohesion_z_all", "prior_rdas_cohesion_ym"
+)
+
+R_counts <- list()
+R_level_results <- list()
+R_change_unadjusted_results <- list()
+R_change_adjusted_results <- list()
+R_timing <- list()
+R_models <- list()
+
+prepare_rdas_pair <- function(
+  comparator_type = c("stable60", "at_risk"),
+  lower,
+  upper,
+  treated_state,
+  level_var,
+  change_var,
+  prior_level_var
+) {
+  comparator_type <- match.arg(comparator_type)
+
+  if (comparator_type == "stable60") {
+    dat <- primary_support %>%
+      filter(
+        marriage_horizon_state %in% c(treated_state, "continued_cohab_60m")
+      ) %>%
+      mutate(
+        treated = as.integer(marriage_horizon_state == treated_state)
+      )
+  } else {
+    # Landmark risk-set sensitivity. Controls are cohabiting at the current
+    # interview and have no KNOWN linked marriage by the upper edge of the
+    # target window. They are NOT required to remain together for 60 months.
+    # Rows with any known marriage inside <= upper months are excluded from the
+    # control pool even if its date flag is not exact; this avoids knowingly
+    # classifying near-marriage rows as controls.
+    dat <- primary_support %>%
+      mutate(
+        treated = as.integer(
+          exact_marriage_date &
+            !is.na(months_to_marriage) &
+            months_to_marriage >= lower &
+            months_to_marriage <= upper
+        ),
+        eligible_at_risk_control =
+          treated == 0 &
+          (
+            is.na(months_to_marriage) |
+              months_to_marriage > upper
+          )
+      ) %>%
+      filter(treated == 1 | eligible_at_risk_control)
+  }
+
+  dat %>%
+    mutate(
+      outcome_level = .data[[level_var]],
+      outcome_change = .data[[change_var]],
+      prior_level = .data[[prior_level_var]]
+    )
+}
+
+summarise_arm_counts <- function(dat, model_label) {
+  if (nrow(dat) == 0L) {
+    return(
+      tibble(
+        treated = integer(),
+        n_rows = integer(),
+        n_persons = integer(),
+        n_spells = integer(),
+        weighted_mass_ATT = numeric(),
+        model = character()
+      )
+    )
+  }
+
+  dat %>%
+    group_by(treated) %>%
+    summarise(
+      n_rows = n(),
+      n_persons = dplyr::n_distinct(pidp),
+      n_spells = dplyr::n_distinct(relationship_spell_id),
+      weighted_mass_ATT = sum(att_weight, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(model = model_label)
+}
+
+run_rdas_one <- function(
+  comparator_type,
+  window_name,
+  lower,
+  upper,
+  treated_state,
+  outcome_label,
+  level_var,
+  change_var,
+  prior_level_var,
+  prior_time_var
+) {
+
+  pair <- prepare_rdas_pair(
+    comparator_type = comparator_type,
+    lower = lower,
+    upper = upper,
+    treated_state = treated_state,
+    level_var = level_var,
+    change_var = change_var,
+    prior_level_var = prior_level_var
+  ) %>%
+    add_riskset_id()
+
+  level_pool <- pair %>%
+    filter(!is.na(outcome_level))
+  level_rs <- make_att_riskset(level_pool)
+
+  # Both recent-change models use the same complete sample so the difference
+  # between them is due only to adjustment for the prior RDAS level.
+  change_pool <- pair %>%
+    filter(!is.na(outcome_change), !is.na(prior_level))
+  change_rs <- make_att_riskset(change_pool)
+
+  stub <- paste0(
+    "R_", comparator_type, "_",
+    ifelse(outcome_label == "RDAS satisfaction", "SAT", "COH"), "_",
+    gsub("-", "_", window_name)
+  )
+
+  level_model <- safe_feols(
+    outcome_level ~ treated | riskset_stratum,
+    data = level_rs,
+    name = paste0(stub, "_LEVEL"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  change_unadjusted_model <- safe_feols(
+    outcome_change ~ treated | riskset_stratum,
+    data = change_rs,
+    name = paste0(stub, "_CHANGE_unadjusted"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  change_adjusted_model <- safe_feols(
+    outcome_change ~ treated + prior_level | riskset_stratum,
+    data = change_rs,
+    name = paste0(stub, "_CHANGE_plus_prior_level"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  level_result <- extract_term_row(
+    level_model,
+    "treated",
+    analysis = "RDAS_marriage_proximity_level",
+    outcome = outcome_label,
+    window = window_name,
+    comparator = comparator_type,
+    estimand = "ATT-oriented current-level contrast"
+  )
+
+  change_unadjusted_result <- extract_term_row(
+    change_unadjusted_model,
+    "treated",
+    analysis = "RDAS_marriage_proximity_recent_change_unadjusted",
+    outcome = outcome_label,
+    window = window_name,
+    comparator = comparator_type,
+    estimand = "ATT-oriented recent-change contrast"
+  )
+
+  change_adjusted_result <- extract_term_row(
+    change_adjusted_model,
+    "treated",
+    analysis = "RDAS_marriage_proximity_recent_change_prior_level_adjusted",
+    outcome = outcome_label,
+    window = window_name,
+    comparator = comparator_type,
+    estimand = "ATT-oriented recent-change contrast adjusted for prior RDAS level"
+  )
+
+  counts <- bind_rows(
+    summarise_arm_counts(level_rs, "level"),
+    summarise_arm_counts(change_rs, "recent_change_common_sample")
+  ) %>%
+    mutate(
+      comparator = comparator_type,
+      window = window_name,
+      outcome = outcome_label,
+      treatment_group = if_else(treated == 1, "marriage_window", "control")
+    ) %>%
+    select(
+      comparator, window, outcome, model, treatment_group,
+      n_rows, n_persons, n_spells, weighted_mass_ATT
+    )
+
+  # Timing audit for treated recent-change observations. The prior RDAS level
+  # time is the START of the recent RDAS change interval.
+  timing_dat <- change_rs %>%
+    filter(treated == 1) %>%
+    mutate(
+      prior_measurement_ym = .data[[prior_time_var]],
+      change_gap_months = interview_ym - prior_measurement_ym,
+      months_to_marriage_at_change_start = marriage_start_ym - prior_measurement_ym,
+      months_to_marriage_at_change_end = months_to_marriage
+    )
+
+  timing <- tibble(
+    comparator = comparator_type,
+    window = window_name,
+    outcome = outcome_label,
+    n = nrow(timing_dat),
+    n_persons = dplyr::n_distinct(timing_dat$pidp),
+    n_spells = dplyr::n_distinct(timing_dat$relationship_spell_id),
+    gap_min = safe_min(timing_dat$change_gap_months),
+    gap_median = safe_median(timing_dat$change_gap_months),
+    gap_p90 = safe_quantile(timing_dat$change_gap_months, .90),
+    start_mte_min = safe_min(timing_dat$months_to_marriage_at_change_start),
+    start_mte_median = safe_median(timing_dat$months_to_marriage_at_change_start),
+    start_mte_p90 = safe_quantile(timing_dat$months_to_marriage_at_change_start, .90),
+    end_mte_min = safe_min(timing_dat$months_to_marriage_at_change_end),
+    end_mte_median = safe_median(timing_dat$months_to_marriage_at_change_end),
+    end_mte_max = safe_max(timing_dat$months_to_marriage_at_change_end)
+  )
+
+  list(
+    level_model = level_model,
+    change_unadjusted_model = change_unadjusted_model,
+    change_adjusted_model = change_adjusted_model,
+    level_result = level_result,
+    change_unadjusted_result = change_unadjusted_result,
+    change_adjusted_result = change_adjusted_result,
+    counts = counts,
+    timing = timing
+  )
+}
+
+for (comp in c("stable60", "at_risk")) {
+  for (wi in seq_len(nrow(windows))) {
+    for (oi in seq_len(nrow(rdas_specs))) {
+
+      rr <- run_rdas_one(
+        comparator_type = comp,
+        window_name = windows$window[wi],
+        lower = windows$lower[wi],
+        upper = windows$upper[wi],
+        treated_state = windows$treated_state[wi],
+        outcome_label = rdas_specs$outcome[oi],
+        level_var = rdas_specs$level_var[oi],
+        change_var = rdas_specs$change_var[oi],
+        prior_level_var = rdas_specs$prior_level_var[oi],
+        prior_time_var = rdas_specs$prior_time_var[oi]
+      )
+
+      key <- paste(comp, windows$window[wi], rdas_specs$outcome[oi], sep = "__")
+      R_models[[paste0(key, "__LEVEL")]] <- rr$level_model
+      R_models[[paste0(key, "__CHANGE_UNADJ")]] <- rr$change_unadjusted_model
+      R_models[[paste0(key, "__CHANGE_ADJ")]] <- rr$change_adjusted_model
+      R_level_results[[key]] <- rr$level_result
+      R_change_unadjusted_results[[key]] <- rr$change_unadjusted_result
+      R_change_adjusted_results[[key]] <- rr$change_adjusted_result
+      R_counts[[key]] <- rr$counts
+      R_timing[[key]] <- rr$timing
+    }
+  }
+}
+
+adjust_six <- function(x) {
+  x %>%
+    group_by(comparator) %>%
+    mutate(
+      p_holm_6 = stats::p.adjust(p_value, method = DIAGNOSTIC_P_ADJUST)
+    ) %>%
+    ungroup()
+}
+
+R_level_results_df <- adjust_six(bind_rows(R_level_results))
+R_change_unadjusted_results_df <- adjust_six(bind_rows(R_change_unadjusted_results))
+R_change_adjusted_results_df <- adjust_six(bind_rows(R_change_adjusted_results))
+R_counts_df <- bind_rows(R_counts)
+R_timing_df <- bind_rows(R_timing)
+
+write_csv_quiet(
+  R_level_results_df,
+  "R01_RDAS_marriage_proximity_LEVEL_results.csv"
+)
+
+write_csv_quiet(
+  R_change_unadjusted_results_df,
+  "R02a_RDAS_marriage_proximity_RECENT_CHANGE_unadjusted.csv"
+)
+
+write_csv_quiet(
+  R_change_adjusted_results_df,
+  "R02b_RDAS_marriage_proximity_RECENT_CHANGE_prior_level_adjusted.csv"
+)
+
+write_csv_quiet(
+  R_counts_df,
+  "R03_RDAS_marriage_proximity_sample_counts.csv",
+  subdir = "diagnostics"
+)
+
+write_csv_quiet(
+  R_timing_df,
+  "R04_RDAS_treated_change_interval_timing_audit.csv",
+  subdir = "diagnostics"
+)
+
+# Compact side-by-side comparison across comparator and change specification.
+R_comparator_comparison <- bind_rows(
+  R_level_results_df %>% mutate(model_type = "level"),
+  R_change_unadjusted_results_df %>% mutate(model_type = "recent_change_unadjusted"),
+  R_change_adjusted_results_df %>% mutate(model_type = "recent_change_prior_level_adjusted")
+) %>%
+  select(
+    model_type, outcome, window, comparator,
+    estimate, std_error, conf_low, conf_high,
+    p_value, p_holm_6, nobs, status
+  ) %>%
+  arrange(
+    model_type,
+    outcome,
+    factor(window, levels = c("25-60m", "13-24m", "1-12m")),
+    comparator
+  )
+
+write_csv_quiet(
+  R_comparator_comparison,
+  "R05_RDAS_stable60_vs_atrisk_comparison.csv"
+)
+
+
+# ==============================================================================
+# 7. N: STRICT NON-OVERLAPPING C3/C4 SENSITIVITY
+# ==============================================================================
+#
+# C3 strict rule:
+#   both prior RDAS-change endpoints <= start of current psychological-change
+#   interval.
+#
+# C4 strict rule:
+#   prior psychological-change endpoint <= start of current RDAS-change interval.
+#
+# Equality is allowed: an interval ending in the same month that the outcome
+# interval begins is treated as non-overlapping.
+# ==============================================================================
+
+# ----------------------------------------------------------------------------
+# 7A. C3 original timing and strict non-overlap
+# ----------------------------------------------------------------------------
+
+build_C3_ghq_pair <- function() {
+  base <- development %>%
+    filter(
+      !is.na(spell_ghq_change),
+      usable_prior_rdas_change,
+      !is.na(prior_spell_ghq),
+      !is.na(prior_spell_ghq_ym),
+      !is.na(prior_rdas_sat_change_ym),
+      !is.na(prior_rdas_coh_change_ym)
+    )
+
+  pars_y <- scale_params(base$spell_ghq_change)
+  pars_level <- scale_params(base$prior_spell_ghq)
+  pars_sat <- scale_params(base$prior_rdas_sat_change)
+  pars_coh <- scale_params(base$prior_rdas_coh_change)
+
+  original <- base %>%
+    mutate(
+      ghq_change_z = z_with_params(spell_ghq_change, pars_y),
+      prior_ghq_level_z = z_with_params(prior_spell_ghq, pars_level),
+      prior_rdas_sat_change_z = z_with_params(prior_rdas_sat_change, pars_sat),
+      prior_rdas_coh_change_z = z_with_params(prior_rdas_coh_change, pars_coh)
+    )
+
+  strict <- original %>%
+    filter(
+      prior_rdas_sat_change_ym <= prior_spell_ghq_ym,
+      prior_rdas_coh_change_ym <= prior_spell_ghq_ym
+    )
+
+  list(original = original, strict = strict)
+}
+
+build_C3_ls_pair <- function() {
+  base <- development %>%
+    filter(
+      !is.na(spell_ls_change),
+      usable_prior_rdas_change,
+      !is.na(prior_spell_ls),
+      !is.na(prior_spell_ls_ym),
+      !is.na(prior_rdas_sat_change_ym),
+      !is.na(prior_rdas_coh_change_ym)
+    )
+
+  pars_y <- scale_params(base$spell_ls_change)
+  pars_level <- scale_params(base$prior_spell_ls)
+  pars_sat <- scale_params(base$prior_rdas_sat_change)
+  pars_coh <- scale_params(base$prior_rdas_coh_change)
+
+  original <- base %>%
+    mutate(
+      ls_change_z = z_with_params(spell_ls_change, pars_y),
+      prior_ls_level_z = z_with_params(prior_spell_ls, pars_level),
+      prior_rdas_sat_change_z = z_with_params(prior_rdas_sat_change, pars_sat),
+      prior_rdas_coh_change_z = z_with_params(prior_rdas_coh_change, pars_coh)
+    )
+
+  strict <- original %>%
+    filter(
+      prior_rdas_sat_change_ym <= prior_spell_ls_ym,
+      prior_rdas_coh_change_ym <= prior_spell_ls_ym
+    )
+
+  list(original = original, strict = strict)
+}
+
+fit_C3_ghq <- function(dat, name) {
+  safe_feols(
+    ghq_change_z ~
+      prior_rdas_sat_change_z +
+      prior_rdas_coh_change_z +
+      prior_ghq_level_z +
+      splines::ns(cohab_duration_months, df = 4) |
+      relationship_spell_id + wave,
+    data = dat,
+    name = name,
+    vcov = ~pidp
+  )
+}
+
+fit_C3_ls <- function(dat, name) {
+  safe_feols(
+    ls_change_z ~
+      prior_rdas_sat_change_z +
+      prior_rdas_coh_change_z +
+      prior_ls_level_z +
+      splines::ns(cohab_duration_months, df = 4) |
+      relationship_spell_id + wave,
+    data = dat,
+    name = name,
+    vcov = ~pidp
+  )
+}
+
+C3_GHQ_pair <- build_C3_ghq_pair()
+C3_LS_pair <- build_C3_ls_pair()
+
+C3_GHQ_original_dat <- C3_GHQ_pair$original
+C3_GHQ_strict_dat <- C3_GHQ_pair$strict
+C3_LS_original_dat <- C3_LS_pair$original
+C3_LS_strict_dat <- C3_LS_pair$strict
+
+C3_GHQ_original <- fit_C3_ghq(C3_GHQ_original_dat, "N_C3_GHQ_ORIGINAL_TIMING")
+C3_GHQ_strict <- fit_C3_ghq(C3_GHQ_strict_dat, "N_C3_GHQ_STRICT_NONOVERLAP")
+C3_LS_original <- fit_C3_ls(C3_LS_original_dat, "N_C3_LS_ORIGINAL_TIMING")
+C3_LS_strict <- fit_C3_ls(C3_LS_strict_dat, "N_C3_LS_STRICT_NONOVERLAP")
+
+C3_joint <- bind_rows(
+  safe_wald_row(
+    C3_GHQ_original,
+    "^prior_rdas_(sat|coh)_change_z$",
+    "Joint prior RDAS-change association",
+    "GHQ distress change",
+    "C3_original_timing"
+  ),
+  safe_wald_row(
+    C3_GHQ_strict,
+    "^prior_rdas_(sat|coh)_change_z$",
+    "Joint prior RDAS-change association",
+    "GHQ distress change",
+    "C3_strict_nonoverlap"
+  ),
+  safe_wald_row(
+    C3_LS_original,
+    "^prior_rdas_(sat|coh)_change_z$",
+    "Joint prior RDAS-change association",
+    "Life-satisfaction change",
+    "C3_original_timing"
+  ),
+  safe_wald_row(
+    C3_LS_strict,
+    "^prior_rdas_(sat|coh)_change_z$",
+    "Joint prior RDAS-change association",
+    "Life-satisfaction change",
+    "C3_strict_nonoverlap"
+  )
+)
+
+# ----------------------------------------------------------------------------
+# 7B. C4 original timing and strict non-overlap
+# ----------------------------------------------------------------------------
+
+build_C4_pair <- function(
+  outcome_change_var,
+  prior_psych_change_var,
+  prior_psych_ok_var,
+  prior_psych_change_time_var,
+  prior_rdas_level_var,
+  outcome_interval_start_var
+) {
+  base <- development %>%
+    mutate(
+      y_raw = .data[[outcome_change_var]],
+      psych_change_raw = .data[[prior_psych_change_var]],
+      psych_ok = .data[[prior_psych_ok_var]],
+      psych_change_end_ym = .data[[prior_psych_change_time_var]],
+      prior_rdas_level_raw = .data[[prior_rdas_level_var]],
+      outcome_start_ym = .data[[outcome_interval_start_var]]
+    ) %>%
+    filter(
+      !is.na(y_raw),
+      psych_ok,
+      !is.na(psych_change_raw),
+      !is.na(psych_change_end_ym),
+      !is.na(prior_rdas_level_raw),
+      !is.na(outcome_start_ym)
+    )
+
+  pars_y <- scale_params(base$y_raw)
+  pars_psych <- scale_params(base$psych_change_raw)
+  pars_level <- scale_params(base$prior_rdas_level_raw)
+
+  original <- base %>%
+    mutate(
+      y_z = z_with_params(y_raw, pars_y),
+      prior_psych_change_z = z_with_params(psych_change_raw, pars_psych),
+      prior_rdas_level_z = z_with_params(prior_rdas_level_raw, pars_level)
+    )
+
+  strict <- original %>%
+    filter(psych_change_end_ym <= outcome_start_ym)
+
+  list(original = original, strict = strict)
+}
+
+fit_C4 <- function(dat, name) {
+  safe_feols(
+    y_z ~
+      prior_psych_change_z +
+      prior_rdas_level_z +
+      splines::ns(cohab_duration_months, df = 4) |
+      relationship_spell_id + wave,
+    data = dat,
+    name = name,
+    vcov = ~pidp
+  )
+}
+
+C4_specs <- tribble(
+  ~outcome_label, ~psych_label, ~outcome_change_var, ~prior_psych_change_var,
+  ~prior_psych_ok_var, ~prior_psych_change_time_var,
+  ~prior_rdas_level_var, ~outcome_interval_start_var, ~stub,
+
+  "RDAS satisfaction change", "prior GHQ change",
+  "rdas_satisfaction_change", "prior_ghq_change",
+  "usable_prior_ghq_change", "prior_ghq_change_ym",
+  "prior_rdas_satisfaction", "prior_rdas_satisfaction_ym", "SAT_FROM_GHQ",
+
+  "RDAS cohesion change", "prior GHQ change",
+  "rdas_cohesion_change", "prior_ghq_change",
+  "usable_prior_ghq_change", "prior_ghq_change_ym",
+  "prior_rdas_cohesion", "prior_rdas_cohesion_ym", "COH_FROM_GHQ",
+
+  "RDAS satisfaction change", "prior LS change",
+  "rdas_satisfaction_change", "prior_ls_change",
+  "usable_prior_ls_change", "prior_ls_change_ym",
+  "prior_rdas_satisfaction", "prior_rdas_satisfaction_ym", "SAT_FROM_LS",
+
+  "RDAS cohesion change", "prior LS change",
+  "rdas_cohesion_change", "prior_ls_change",
+  "usable_prior_ls_change", "prior_ls_change_ym",
+  "prior_rdas_cohesion", "prior_rdas_cohesion_ym", "COH_FROM_LS"
+)
+
+C4_results <- list()
+C4_counts <- list()
+C4_models <- list()
+
+for (i in seq_len(nrow(C4_specs))) {
+  spec <- C4_specs[i, ]
+
+  c4_pair <- build_C4_pair(
+    spec$outcome_change_var,
+    spec$prior_psych_change_var,
+    spec$prior_psych_ok_var,
+    spec$prior_psych_change_time_var,
+    spec$prior_rdas_level_var,
+    spec$outcome_interval_start_var
+  )
+
+  dat_orig <- c4_pair$original
+  dat_strict <- c4_pair$strict
+
+  m_orig <- fit_C4(dat_orig, paste0("N_C4_", spec$stub, "_ORIGINAL_TIMING"))
+  m_strict <- fit_C4(dat_strict, paste0("N_C4_", spec$stub, "_STRICT_NONOVERLAP"))
+
+  C4_models[[paste0(spec$stub, "__original")]] <- m_orig
+  C4_models[[paste0(spec$stub, "__strict")]] <- m_strict
+
+  C4_results[[paste0(spec$stub, "__original")]] <- extract_term_row(
+    m_orig,
+    "prior_psych_change_z",
+    analysis = "C4_original_timing",
+    outcome = paste0(spec$outcome_label, " from ", spec$psych_label),
+    estimand = "lagged coupled-change association"
+  )
+
+  C4_results[[paste0(spec$stub, "__strict")]] <- extract_term_row(
+    m_strict,
+    "prior_psych_change_z",
+    analysis = "C4_strict_nonoverlap",
+    outcome = paste0(spec$outcome_label, " from ", spec$psych_label),
+    estimand = "strict temporally ordered change association"
+  )
+
+  C4_counts[[spec$stub]] <- tibble(
+    analysis_pair = spec$stub,
+    outcome = spec$outcome_label,
+    predictor = spec$psych_label,
+    n_original_rows = nrow(dat_orig),
+    n_strict_rows = nrow(dat_strict),
+    pct_retained_rows = if_else(
+      nrow(dat_orig) > 0,
+      100 * nrow(dat_strict) / nrow(dat_orig),
+      NA_real_
+    ),
+    n_original_persons = dplyr::n_distinct(dat_orig$pidp),
+    n_strict_persons = dplyr::n_distinct(dat_strict$pidp),
+    n_original_spells = dplyr::n_distinct(dat_orig$relationship_spell_id),
+    n_strict_spells = dplyr::n_distinct(dat_strict$relationship_spell_id)
+  )
+}
+
+C4_results_df <- bind_rows(C4_results)
+C4_counts_df <- bind_rows(C4_counts)
+
+C3_counts <- tibble(
+  analysis = c("C3_GHQ", "C3_LS"),
+  n_original_rows = c(nrow(C3_GHQ_original_dat), nrow(C3_LS_original_dat)),
+  n_strict_rows = c(nrow(C3_GHQ_strict_dat), nrow(C3_LS_strict_dat)),
+  pct_retained_rows = c(
+    ifelse(nrow(C3_GHQ_original_dat) > 0,
+           100 * nrow(C3_GHQ_strict_dat) / nrow(C3_GHQ_original_dat), NA_real_),
+    ifelse(nrow(C3_LS_original_dat) > 0,
+           100 * nrow(C3_LS_strict_dat) / nrow(C3_LS_original_dat), NA_real_)
+  ),
+  n_original_persons = c(
+    dplyr::n_distinct(C3_GHQ_original_dat$pidp),
+    dplyr::n_distinct(C3_LS_original_dat$pidp)
+  ),
+  n_strict_persons = c(
+    dplyr::n_distinct(C3_GHQ_strict_dat$pidp),
+    dplyr::n_distinct(C3_LS_strict_dat$pidp)
+  ),
+  n_original_spells = c(
+    dplyr::n_distinct(C3_GHQ_original_dat$relationship_spell_id),
+    dplyr::n_distinct(C3_LS_original_dat$relationship_spell_id)
+  ),
+  n_strict_spells = c(
+    dplyr::n_distinct(C3_GHQ_strict_dat$relationship_spell_id),
+    dplyr::n_distinct(C3_LS_strict_dat$relationship_spell_id)
+  )
+)
+
+C3_terms <- bind_rows(
+  extract_term_row(
+    C3_GHQ_original, "prior_rdas_sat_change_z",
+    "C3_original_timing", "GHQ distress change",
+    estimand = "prior RDAS satisfaction change"
+  ),
+  extract_term_row(
+    C3_GHQ_original, "prior_rdas_coh_change_z",
+    "C3_original_timing", "GHQ distress change",
+    estimand = "prior RDAS cohesion change"
+  ),
+  extract_term_row(
+    C3_GHQ_strict, "prior_rdas_sat_change_z",
+    "C3_strict_nonoverlap", "GHQ distress change",
+    estimand = "prior RDAS satisfaction change"
+  ),
+  extract_term_row(
+    C3_GHQ_strict, "prior_rdas_coh_change_z",
+    "C3_strict_nonoverlap", "GHQ distress change",
+    estimand = "prior RDAS cohesion change"
+  ),
+  extract_term_row(
+    C3_LS_original, "prior_rdas_sat_change_z",
+    "C3_original_timing", "Life-satisfaction change",
+    estimand = "prior RDAS satisfaction change"
+  ),
+  extract_term_row(
+    C3_LS_original, "prior_rdas_coh_change_z",
+    "C3_original_timing", "Life-satisfaction change",
+    estimand = "prior RDAS cohesion change"
+  ),
+  extract_term_row(
+    C3_LS_strict, "prior_rdas_sat_change_z",
+    "C3_strict_nonoverlap", "Life-satisfaction change",
+    estimand = "prior RDAS satisfaction change"
+  ),
+  extract_term_row(
+    C3_LS_strict, "prior_rdas_coh_change_z",
+    "C3_strict_nonoverlap", "Life-satisfaction change",
+    estimand = "prior RDAS cohesion change"
+  )
+)
+
+write_csv_quiet(
+  C3_counts,
+  "N01_C3_nonoverlap_sample_retention.csv",
+  subdir = "diagnostics"
+)
+
+write_csv_quiet(
+  C4_counts_df,
+  "N02_C4_nonoverlap_sample_retention.csv",
+  subdir = "diagnostics"
+)
+
+write_csv_quiet(
+  C3_joint,
+  "N03_C3_original_vs_strict_joint_tests.csv"
+)
+
+write_csv_quiet(
+  C3_terms,
+  "N04_C3_original_vs_strict_coefficients.csv"
+)
+
+write_csv_quiet(
+  C4_results_df,
+  "N05_C4_original_vs_strict_coefficients.csv"
+)
+
+
+# ==============================================================================
+# 8. COMPACT EVIDENCE TABLES
+# ==============================================================================
+
+# Principal tests for interpretation. These remain diagnostic rather than
+# confirmatory; the p-adjusted columns are supplied to discourage selective
+# emphasis on isolated nominal findings.
+
+KEY_BALANCED <- B_balanced_incremental %>%
+  transmute(
+    domain = "balanced_common_spell",
+    analysis = paste(outcome, duration_bin, spell_outcome, sep = " | "),
+    estimate,
+    conf_low,
+    conf_high,
+    p_value,
+    p_adjusted = p_holm_across_4_bins,
+    note = "Incremental within-spell change vs ongoing cohabitation"
+  )
+
+KEY_RDAS_CHANGE <- bind_rows(
+  R_change_unadjusted_results_df %>%
+    mutate(specification = "unadjusted"),
+  R_change_adjusted_results_df %>%
+    mutate(specification = "prior_level_adjusted")
+) %>%
+  transmute(
+    domain = "RDAS_marriage_proximity_recent_change",
+    analysis = paste(comparator, specification, outcome, window, sep = " | "),
+    estimate,
+    conf_low,
+    conf_high,
+    p_value,
+    p_adjusted = p_holm_6,
+    note = "Positive estimate = more favorable RDAS change for imminent marriers"
+  )
+
+KEY_NONOVERLAP_C3 <- C3_joint %>%
+  filter(analysis == "C3_strict_nonoverlap") %>%
+  transmute(
+    domain = "strict_nonoverlap_C3",
+    analysis = outcome,
+    estimate = NA_real_,
+    conf_low = NA_real_,
+    conf_high = NA_real_,
+    p_value,
+    p_adjusted = NA_real_,
+    note = "Joint test of prior RDAS satisfaction/cohesion changes"
+  )
+
+KEY_NONOVERLAP_C4 <- C4_results_df %>%
+  filter(analysis == "C4_strict_nonoverlap") %>%
+  transmute(
+    domain = "strict_nonoverlap_C4",
+    analysis = outcome,
+    estimate,
+    conf_low,
+    conf_high,
+    p_value,
+    p_adjusted = NA_real_,
+    note = "Prior psychological change -> later RDAS change"
+  )
+
+KEY_TESTS <- bind_rows(
+  KEY_BALANCED,
+  KEY_RDAS_CHANGE,
+  KEY_NONOVERLAP_C3,
+  KEY_NONOVERLAP_C4
+)
+
+write_csv_quiet(
+  KEY_TESTS,
+  "Z90_additional_relationship_development_key_tests.csv"
+)
+
+
+# ==============================================================================
+# 9. OUTPUT CHECK + README
+# ==============================================================================
+
+expected_outputs <- c(
+  "tables/B02_balanced_common_spell_interpretable_contrasts.csv",
+  "tables/B03_balanced_common_spell_incremental_tests.csv",
+  "diagnostics/B01_balanced_common_spell_sample_counts.csv",
+  "tables/R01_RDAS_marriage_proximity_LEVEL_results.csv",
+  "tables/R02a_RDAS_marriage_proximity_RECENT_CHANGE_unadjusted.csv",
+  "tables/R02b_RDAS_marriage_proximity_RECENT_CHANGE_prior_level_adjusted.csv",
+  "diagnostics/R03_RDAS_marriage_proximity_sample_counts.csv",
+  "diagnostics/R04_RDAS_treated_change_interval_timing_audit.csv",
+  "tables/R05_RDAS_stable60_vs_atrisk_comparison.csv",
+  "diagnostics/N01_C3_nonoverlap_sample_retention.csv",
+  "diagnostics/N02_C4_nonoverlap_sample_retention.csv",
+  "tables/N03_C3_original_vs_strict_joint_tests.csv",
+  "tables/N04_C3_original_vs_strict_coefficients.csv",
+  "tables/N05_C4_original_vs_strict_coefficients.csv",
+  "tables/Z90_additional_relationship_development_key_tests.csv"
+)
+
+output_check <- tibble(
+  file = expected_outputs,
+  exists = file.exists(file.path(OUT_DIR, expected_outputs))
+)
+
+write_csv_quiet(output_check, "98_output_check.csv", subdir = "diagnostics")
+
+readme <- c(
+  "UKHLS ADDITIONAL RELATIONSHIP-DEVELOPMENT SENSITIVITIES V1",
+  "",
+  "INTERPRET FIRST:",
+  "1. tables/B03_balanced_common_spell_incremental_tests.csv",
+  "2. tables/R02a_RDAS_marriage_proximity_RECENT_CHANGE_unadjusted.csv",
+  "3. tables/R02b_RDAS_marriage_proximity_RECENT_CHANGE_prior_level_adjusted.csv",
+  "4. tables/R01_RDAS_marriage_proximity_LEVEL_results.csv",
+  "5. tables/R05_RDAS_stable60_vs_atrisk_comparison.csv",
+  "6. diagnostics/R04_RDAS_treated_change_interval_timing_audit.csv",
+  "7. tables/N03_C3_original_vs_strict_joint_tests.csv",
+  "8. tables/N04_C3_original_vs_strict_coefficients.csv",
+  "9. tables/N05_C4_original_vs_strict_coefficients.csv",
+  "10. tables/Z90_additional_relationship_development_key_tests.csv",
+  "",
+  "INTERPRETIVE RULES:",
+  "- Balanced/common-spell analyses are sensitivity analyses through 60-83m.",
+  "- RDAS recent-change, not level alone, is the more direct proximity diagnostic.",
+  "- stable60 matches v4.1 control logic; at_risk relaxes future-survival selection.",
+  "- A positive RDAS recent-change treated coefficient means relatively more",
+  "  favorable relationship-quality change among respondents nearing marriage.",
+  "- Inspect interval timing before calling a 1-12m result highly proximal.",
+  "- Strict C3/C4 non-overlap is required for stronger temporal-order language.",
+  "- None of these analyses establishes causal mediation or causal anticipation."
+)
+
+write_txt(readme, "00_READ_ME_FIRST.txt", subdir = ".")
+
+capture.output(
+  sessionInfo(),
+  file = file.path(OUT_DIR, "diagnostics", "99_sessionInfo.txt")
+)
+
+cat("\n============================================================\n")
+cat("ADDITIONAL RELATIONSHIP-DEVELOPMENT SENSITIVITIES COMPLETE\n")
+cat("Output directory:\n", normalizePath(OUT_DIR, winslash = "/", mustWork = FALSE), "\n", sep = "")
+cat("============================================================\n\n")
+
+if (any(!output_check$exists)) {
+  warning(
+    "Some expected outputs are missing. Inspect diagnostics/98_output_check.csv."
+  )
+}
+
+################################################################################
+# END
+################################################################################

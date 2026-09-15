@@ -1,0 +1,3569 @@
+# =============================================================================
+# BHPS + UKHLS
+# FIRST-MARRIAGE CALENDAR-TIME DIAGNOSTIC
+#
+# PURPOSE
+# -------
+# Diagnose whether nominal wave-based event time (T-5,...,T0) adequately
+# represents elapsed calendar time in the first-marriage study.
+#
+# The script:
+#
+#   1. Re-reads BHPS and UKHLS INDRESP files and extracts interview day/month/year.
+#   2. Audits which interview-date variables are available in every wave.
+#   3. Describes actual elapsed months between consecutive interviews.
+#   4. For first-observed marriers, compares nominal T-k with actual months
+#      before the T0 interview.
+#   5. Quantifies how often nominal T-1 is actually 9-15, >15-21, or >21
+#      months before T0, and provides analogous diagnostics for T-2,...,T-5.
+#   6. Re-evaluates control support using CALENDAR-TIME T0 calipers of
+#      +/-3, +/-6, and +/-12 months, without requiring the same wave number,
+#      while retaining exact sex and age +/-1-year matching.
+#   7. Optionally reads the Understanding Society marital/cohabitation history
+#      file (phistory_long) and evaluates completeness of actual first-marriage
+#      start month/year and whether that date falls between T-1 and T0.
+#
+# IMPORTANT
+# ---------
+# This is a DIAGNOSTIC. It does not overwrite the existing wave-based analysis.
+# Its purpose is to determine the preferred calendar-time specification before
+# the main models are rewritten.
+#
+# Interview date documentation:
+#   UKHLS derived interview month/year:
+#   https://www.understandingsociety.ac.uk/documentation/mainstage/variables/intdatm_dv/
+#
+# Marital/cohabitation histories:
+#   phistory_long contains status, starty, startm, start_if, etc.
+#   https://www.understandingsociety.ac.uk/documentation/mainstage/user-guides/
+#
+# =============================================================================
+
+
+# =============================================================================
+# 0. PACKAGES
+# =============================================================================
+
+required_packages <- c(
+  "haven",
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "stringr",
+  "readr",
+  "tibble"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following packages before running this script:\n",
+    paste(
+      missing_packages,
+      collapse = ", "
+    )
+  )
+}
+
+library(haven)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(readr)
+library(tibble)
+
+
+# =============================================================================
+# 1. PATHS
+# =============================================================================
+
+ukhls_dir <- "D:/Documenti/psicologia/big data/Understanding Society+BHPS/UKDA-6614-stata/stata/stata14_se/ukhls"
+
+bhps_dir <- "D:/Documenti/psicologia/big data/Understanding Society+BHPS/UKDA-6614-stata/stata/stata14_se/bhps"
+
+common_stata_dir <- dirname(
+  ukhls_dir
+)
+
+first_marriage_diagnostic_dir <- file.path(
+  common_stata_dir,
+  "first_marriage_Tminus5_T0_diagnostic"
+)
+
+output_dir <- file.path(
+  common_stata_dir,
+  "first_marriage_calendar_timing_diagnostic"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# OPTIONAL:
+# If you have downloaded the separate marital/cohabitation history dataset,
+# put the complete path to phistory_long.dta (or .sav) here.
+#
+# If left as NA, the script searches recursively under common_stata_dir and
+# its parent directory. If the file is not found, the timing diagnostic still
+# runs and simply reports that the marriage-history analysis was unavailable.
+
+phistory_path <- NA_character_
+
+
+# =============================================================================
+# 2. BASIC SETTINGS
+# =============================================================================
+
+N_BHPS  <- 18L
+N_UKHLS <- 15L
+
+event_times <- -5:0
+
+calendar_control_calipers <- c(
+  3L,
+  6L,
+  12L
+)
+
+age_caliper_years <- 1L
+
+
+# =============================================================================
+# 3. REQUIRED EXISTING FIRST-MARRIAGE DIAGNOSTIC OBJECTS
+# =============================================================================
+
+required_rds <- c(
+
+  combined_panel =
+    "combined_person_wave_panel.rds",
+
+  first_observed_treated =
+    "marriage_treated_first_observed.rds",
+
+  primary_controls =
+    "first_marriage_risk_set_unmarried_controls.rds",
+
+  primary_event_rows =
+    "first_marriage_Tminus5_T0_primary_event_rows.rds"
+)
+
+missing_rds <- required_rds[
+  !file.exists(
+    file.path(
+      first_marriage_diagnostic_dir,
+      required_rds
+    )
+  )
+]
+
+if (length(missing_rds) > 0L) {
+  stop(
+    "Missing first-marriage diagnostic RDS file(s):\n",
+    paste(
+      missing_rds,
+      collapse = "\n"
+    ),
+    "\n\nRun BHPS_UKHLS_first_marriage_Tminus5_T0_eligibility_diagnostic.txt first."
+  )
+}
+
+combined_panel <- readRDS(
+  file.path(
+    first_marriage_diagnostic_dir,
+    required_rds[["combined_panel"]]
+  )
+)
+
+first_observed_treated <- readRDS(
+  file.path(
+    first_marriage_diagnostic_dir,
+    required_rds[["first_observed_treated"]]
+  )
+)
+
+primary_controls <- readRDS(
+  file.path(
+    first_marriage_diagnostic_dir,
+    required_rds[["primary_controls"]]
+  )
+)
+
+primary_event_rows <- readRDS(
+  file.path(
+    first_marriage_diagnostic_dir,
+    required_rds[["primary_event_rows"]]
+  )
+)
+
+
+# =============================================================================
+# 4. FILE AND VARIABLE UTILITIES
+# =============================================================================
+
+read_data_file <- function(
+    path
+) {
+
+  ext <- tolower(
+    tools::file_ext(
+      path
+    )
+  )
+
+  if (ext == "dta") {
+    return(
+      haven::read_dta(
+        path
+      )
+    )
+  }
+
+  if (ext == "sav") {
+    return(
+      haven::read_sav(
+        path
+      )
+    )
+  }
+
+  stop(
+    "Unsupported file extension: ",
+    ext
+  )
+}
+
+
+find_indresp_file <- function(
+    root,
+    survey,
+    wave_letter
+) {
+
+  survey <- match.arg(
+    survey,
+    c(
+      "BHPS",
+      "UKHLS"
+    )
+  )
+
+  prefixes <- if (
+    survey == "BHPS"
+  ) {
+    c(
+      wave_letter,
+      paste0(
+        "b",
+        wave_letter
+      )
+    )
+  } else {
+    wave_letter
+  }
+
+  patterns <- paste0(
+    "^",
+    prefixes,
+    "_indresp\\.(dta|sav)$"
+  )
+
+  all_files <- list.files(
+    root,
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+
+  hits <- all_files[
+    Reduce(
+      `|`,
+      lapply(
+        patterns,
+        function(p) {
+          grepl(
+            p,
+            basename(
+              all_files
+            ),
+            ignore.case = TRUE
+          )
+        }
+      )
+    )
+  ]
+
+  if (length(hits) == 0L) {
+    stop(
+      "No INDRESP file found for ",
+      survey,
+      " wave ",
+      wave_letter,
+      " under:\n",
+      root
+    )
+  }
+
+  if (length(hits) > 1L) {
+    stop(
+      "More than one INDRESP file found for ",
+      survey,
+      " wave ",
+      wave_letter,
+      ":\n",
+      paste(
+        hits,
+        collapse = "\n"
+      )
+    )
+  }
+
+  hits
+}
+
+
+prefix_from_indresp_filename <- function(
+    path
+) {
+
+  nm <- basename(
+    path
+  )
+
+  stringr::str_match(
+    nm,
+    "^(.+?)_indresp\\.(dta|sav)$"
+  )[, 2]
+}
+
+
+# Flexible finder because BHPS legacy variables can appear with different
+# prefix conventions across releases.
+
+find_variable_flexible <- function(
+    dat,
+    file_prefix,
+    basenames,
+    required = TRUE
+) {
+
+  short_prefix <- sub(
+    "^b",
+    "",
+    file_prefix
+  )
+
+  candidates <- unique(
+    unlist(
+      lapply(
+        basenames,
+        function(v) {
+          c(
+            paste0(
+              file_prefix,
+              "_",
+              v
+            ),
+            paste0(
+              file_prefix,
+              v
+            ),
+            paste0(
+              short_prefix,
+              "_",
+              v
+            ),
+            paste0(
+              short_prefix,
+              v
+            ),
+            v
+          )
+        }
+      )
+    )
+  )
+
+  hit <- candidates[
+    candidates %in%
+      names(
+        dat
+      )
+  ]
+
+  if (length(hit) == 0L) {
+
+    if (required) {
+      stop(
+        "Could not find any candidate variable:\n",
+        paste(
+          candidates,
+          collapse = ", "
+        )
+      )
+    }
+
+    return(
+      NA_character_
+    )
+  }
+
+  hit[1L]
+}
+
+
+clean_integer <- function(
+    x
+) {
+
+  z <- suppressWarnings(
+    as.integer(
+      as.numeric(
+        x
+      )
+    )
+  )
+
+  z[
+    !is.na(z) &
+      z < 0
+  ] <- NA_integer_
+
+  z
+}
+
+
+clean_day <- function(
+    x
+) {
+
+  z <- clean_integer(
+    x
+  )
+
+  z[
+    !is.na(z) &
+      !z %in%
+        1:31
+  ] <- NA_integer_
+
+  z
+}
+
+
+clean_month <- function(
+    x
+) {
+
+  z <- clean_integer(
+    x
+  )
+
+  z[
+    !is.na(z) &
+      !z %in%
+        1:12
+  ] <- NA_integer_
+
+  z
+}
+
+
+clean_year <- function(
+    x
+) {
+
+  z <- clean_integer(
+    x
+  )
+
+  # Accommodate occasional two-digit legacy year fields.
+  z[
+    !is.na(z) &
+      z >= 0L &
+      z <= 30L
+  ] <-
+    2000L +
+    z[
+      !is.na(z) &
+        z >= 0L &
+        z <= 30L
+    ]
+
+  z[
+    !is.na(z) &
+      z >= 31L &
+      z <= 99L
+  ] <-
+    1900L +
+    z[
+      !is.na(z) &
+        z >= 31L &
+        z <= 99L
+    ]
+
+  z[
+    !is.na(z) &
+      (
+        z < 1980L |
+          z > 2035L
+      )
+  ] <- NA_integer_
+
+  z
+}
+
+
+make_interview_date <- function(
+    year,
+    month,
+    day
+) {
+
+  out <- rep(
+    as.Date(
+      NA
+    ),
+    length(
+      year
+    )
+  )
+
+  complete_ym <- !is.na(
+    year
+  ) &
+    !is.na(
+      month
+    )
+
+  exact <- complete_ym &
+    !is.na(
+      day
+    )
+
+  if (any(
+    exact
+  )) {
+
+    exact_chr <- sprintf(
+      "%04d-%02d-%02d",
+      year[
+        exact
+      ],
+      month[
+        exact
+      ],
+      day[
+        exact
+      ]
+    )
+
+    out[
+      exact
+    ] <- suppressWarnings(
+      as.Date(
+        exact_chr
+      )
+    )
+  }
+
+  fallback <- complete_ym &
+    is.na(
+      out
+    )
+
+  if (any(
+    fallback
+  )) {
+
+    out[
+      fallback
+    ] <- as.Date(
+      sprintf(
+        "%04d-%02d-15",
+        year[
+          fallback
+        ],
+        month[
+          fallback
+        ]
+      )
+    )
+  }
+
+  out
+}
+
+
+month_index <- function(
+    year,
+    month
+) {
+
+  ifelse(
+    !is.na(
+      year
+    ) &
+      !is.na(
+        month
+      ),
+    year *
+      12L +
+      month,
+    NA_real_
+  )
+}
+
+
+q_safe <- function(
+    x,
+    prob
+) {
+
+  x <- x[
+    is.finite(
+      x
+    )
+  ]
+
+  if (length(x) == 0L) {
+    return(
+      NA_real_
+    )
+  }
+
+  as.numeric(
+    quantile(
+      x,
+      probs =
+        prob,
+      na.rm =
+        TRUE,
+      names =
+        FALSE
+    )
+  )
+}
+
+
+# =============================================================================
+# 5. INTERVIEW-DATE VARIABLE CANDIDATES
+# =============================================================================
+#
+# UKHLS:
+#   intdatm_dv / intdaty_dv are preferred derived personal interview dates.
+#
+# BHPS:
+#   the harmonised release may contain intdatm_dv/intdaty_dv in later waves.
+#   Harmonised BHPS files commonly use istrtdatd / istrtdatm / istrtdaty.
+#   Legacy doim / doiy4 names are retained only as lower-priority fallbacks.
+#
+# Additional candidates are retained as conservative fallbacks.
+# =============================================================================
+
+interview_date_candidates <- list(
+
+  UKHLS = list(
+
+    day =
+      c(
+        "istrtdatd",
+        "intdatd_dv",
+        "intdated",
+        "intdatd"
+      ),
+
+    month =
+      c(
+        "istrtdatm",
+        "intdatm_dv",
+        "intdatem",
+        "intdatm",
+        "doim"
+      ),
+
+    year =
+      c(
+        "istrtdaty",
+        "intdaty_dv",
+        "intdatey",
+        "intdaty",
+        "doiy4",
+        "doiy"
+      )
+  ),
+
+  BHPS = list(
+
+    day =
+      c(
+        "istrtdatd",
+        "intdatd_dv",
+        "intdated",
+        "intdatd",
+        "doid"
+      ),
+
+    month =
+      c(
+        "istrtdatm",
+        "intdatm_dv",
+        "intdatem",
+        "intdatm",
+        "doim",
+        "hhmoi"
+      ),
+
+    year =
+      c(
+        "istrtdaty",
+        "intdaty_dv",
+        "intdatey",
+        "intdaty",
+        "doiy4",
+        "doiy",
+        "hhyoi4"
+      )
+  )
+)
+
+
+# =============================================================================
+# 6. READ INTERVIEW MONTH/YEAR FROM ONE WAVE
+# =============================================================================
+
+read_timing_wave <- function(
+    survey,
+    wave_num,
+    root
+) {
+
+  wave_letter <- letters[
+    wave_num
+  ]
+
+  f <- find_indresp_file(
+    root =
+      root,
+    survey =
+      survey,
+    wave_letter =
+      wave_letter
+  )
+
+  file_prefix <- prefix_from_indresp_filename(
+    f
+  )
+
+  message(
+    "Timing read: ",
+    survey,
+    " wave ",
+    wave_num,
+    " (",
+    wave_letter,
+    "): ",
+    basename(
+      f
+    )
+  )
+
+  dat <- read_data_file(
+    f
+  )
+
+  pidp_var <- find_variable_flexible(
+    dat,
+    file_prefix,
+    "pidp",
+    required =
+      TRUE
+  )
+
+  day_var <- find_variable_flexible(
+    dat,
+    file_prefix,
+    interview_date_candidates[[
+      survey
+    ]][[
+      "day"
+    ]],
+    required =
+      FALSE
+  )
+
+  month_var <- find_variable_flexible(
+    dat,
+    file_prefix,
+    interview_date_candidates[[
+      survey
+    ]][[
+      "month"
+    ]],
+    required =
+      FALSE
+  )
+
+  year_var <- find_variable_flexible(
+    dat,
+    file_prefix,
+    interview_date_candidates[[
+      survey
+    ]][[
+      "year"
+    ]],
+    required =
+      FALSE
+  )
+
+  n <- nrow(
+    dat
+  )
+
+  interview_day <- if (
+    is.na(
+      day_var
+    )
+  ) {
+    rep(
+      NA_integer_,
+      n
+    )
+  } else {
+    clean_day(
+      dat[[
+        day_var
+      ]]
+    )
+  }
+
+  interview_month <- if (
+    is.na(
+      month_var
+    )
+  ) {
+    rep(
+      NA_integer_,
+      n
+    )
+  } else {
+    clean_month(
+      dat[[
+        month_var
+      ]]
+    )
+  }
+
+  interview_year <- if (
+    is.na(
+      year_var
+    )
+  ) {
+    rep(
+      NA_integer_,
+      n
+    )
+  } else {
+    clean_year(
+      dat[[
+        year_var
+      ]]
+    )
+  }
+
+  timing <- tibble(
+    pidp =
+      dat[[
+        pidp_var
+      ]],
+
+    survey =
+      survey,
+
+    wave_num =
+      wave_num,
+
+    wave_letter =
+      wave_letter,
+
+    interview_year =
+      interview_year,
+
+    interview_month =
+      interview_month,
+
+    interview_day =
+      interview_day,
+
+    interview_month_index =
+      month_index(
+        interview_year,
+        interview_month
+      ),
+
+    interview_date =
+      make_interview_date(
+        interview_year,
+        interview_month,
+        interview_day
+      ),
+
+    interview_date_exact =
+      !is.na(
+        interview_year
+      ) &
+        !is.na(
+          interview_month
+        ) &
+        !is.na(
+          interview_day
+        )
+  )
+
+  audit <- tibble(
+    survey =
+      survey,
+    wave_num =
+      wave_num,
+    wave_letter =
+      wave_letter,
+    file =
+      basename(
+        f
+      ),
+    file_prefix =
+      file_prefix,
+    pidp_var =
+      pidp_var,
+    day_var_found =
+      day_var,
+    month_var_found =
+      month_var,
+    year_var_found =
+      year_var,
+    n_indresp_rows =
+      n,
+    n_day_observed =
+      sum(
+        !is.na(
+          interview_day
+        )
+      ),
+    pct_day_observed =
+      100 *
+        mean(
+          !is.na(
+            interview_day
+          )
+        ),
+    n_year_observed =
+      sum(
+        !is.na(
+          interview_year
+        )
+      ),
+    pct_year_observed =
+      100 *
+        mean(
+          !is.na(
+            interview_year
+          )
+        ),
+    n_month_observed =
+      sum(
+        !is.na(
+          interview_month
+        )
+      ),
+    pct_month_observed =
+      100 *
+        mean(
+          !is.na(
+            interview_month
+          )
+        ),
+    n_complete_month_year =
+      sum(
+        !is.na(
+          interview_year
+        ) &
+          !is.na(
+            interview_month
+          )
+      ),
+    pct_complete_month_year =
+      100 *
+        mean(
+          !is.na(
+            interview_year
+          ) &
+            !is.na(
+              interview_month
+            )
+        )
+  )
+
+  rm(
+    dat
+  )
+
+  list(
+    timing =
+      timing,
+    audit =
+      audit
+  )
+}
+
+
+# =============================================================================
+# 7. READ ALL BHPS + UKHLS INTERVIEW DATES
+# =============================================================================
+
+bhps_timing_list <- map(
+  1:N_BHPS,
+  ~ read_timing_wave(
+    survey =
+      "BHPS",
+    wave_num =
+      .x,
+    root =
+      bhps_dir
+  )
+)
+
+ukhls_timing_list <- map(
+  1:N_UKHLS,
+  ~ read_timing_wave(
+    survey =
+      "UKHLS",
+    wave_num =
+      .x,
+    root =
+      ukhls_dir
+  )
+)
+
+timing_panel <- bind_rows(
+  map(
+    bhps_timing_list,
+    "timing"
+  ),
+  map(
+    ukhls_timing_list,
+    "timing"
+  )
+) |>
+  arrange(
+    pidp,
+    survey,
+    wave_num
+  )
+
+date_variable_audit <- bind_rows(
+  map(
+    bhps_timing_list,
+    "audit"
+  ),
+  map(
+    ukhls_timing_list,
+    "audit"
+  )
+)
+
+write_csv(
+  date_variable_audit,
+  file.path(
+    output_dir,
+    "interview_date_variable_audit.csv"
+  )
+)
+
+saveRDS(
+  timing_panel,
+  file.path(
+    output_dir,
+    "combined_interview_timing_panel.rds"
+  )
+)
+
+
+# =============================================================================
+# 8. DUPLICATE PERSON-WAVE CHECK
+# =============================================================================
+
+duplicate_person_wave_check <- timing_panel |>
+  count(
+    pidp,
+    survey,
+    wave_num,
+    name =
+      "n"
+  ) |>
+  filter(
+    n != 1L
+  )
+
+write_csv(
+  duplicate_person_wave_check,
+  file.path(
+    output_dir,
+    "interview_timing_duplicate_person_wave_check.csv"
+  )
+)
+
+if (nrow(
+  duplicate_person_wave_check
+) > 0L) {
+  stop(
+    "Interview timing extraction produced duplicate person-wave records. ",
+    "Inspect interview_timing_duplicate_person_wave_check.csv."
+  )
+}
+
+
+# =============================================================================
+# 9. ACTUAL ELAPSED MONTHS BETWEEN CONSECUTIVE INTERVIEWS
+# =============================================================================
+
+consecutive_intervals <- timing_panel |>
+  arrange(
+    pidp,
+    survey,
+    wave_num
+  ) |>
+  group_by(
+    pidp,
+    survey
+  ) |>
+  mutate(
+
+    previous_wave =
+      lag(
+        wave_num
+      ),
+
+    previous_year =
+      lag(
+        interview_year
+      ),
+
+    previous_month =
+      lag(
+        interview_month
+      ),
+
+    previous_month_index =
+      lag(
+        interview_month_index
+      ),
+
+    consecutive_wave =
+      !is.na(
+        previous_wave
+      ) &
+        wave_num ==
+          previous_wave +
+            1L,
+
+    months_since_previous_interview =
+      if_else(
+        consecutive_wave &
+          !is.na(
+            interview_month_index
+          ) &
+          !is.na(
+            previous_month_index
+          ),
+        interview_month_index -
+          previous_month_index,
+        NA_real_
+      ),
+
+    same_calendar_year_as_previous =
+      consecutive_wave &
+        !is.na(
+          interview_year
+        ) &
+        !is.na(
+          previous_year
+        ) &
+        interview_year ==
+          previous_year
+  ) |>
+  ungroup() |>
+  filter(
+    consecutive_wave
+  ) |>
+  mutate(
+    interval_category =
+      case_when(
+
+        is.na(
+          months_since_previous_interview
+        ) ~
+          "Missing month/year",
+
+        months_since_previous_interview < 9 ~
+          "<9 months",
+
+        months_since_previous_interview <= 15 ~
+          "9-15 months",
+
+        months_since_previous_interview <= 21 ~
+          ">15-21 months",
+
+        TRUE ~
+          ">21 months"
+      )
+  )
+
+write_csv(
+  consecutive_intervals,
+  file.path(
+    output_dir,
+    "consecutive_interview_intervals_person_level.csv"
+  )
+)
+
+
+consecutive_interval_summary <- consecutive_intervals |>
+  group_by(
+    survey
+  ) |>
+  summarise(
+    consecutive_wave_pairs =
+      n(),
+    complete_month_year_pairs =
+      sum(
+        !is.na(
+          months_since_previous_interview
+        )
+      ),
+    pct_complete_month_year_pairs =
+      100 *
+        mean(
+          !is.na(
+            months_since_previous_interview
+          )
+        ),
+    mean_months =
+      mean(
+        months_since_previous_interview,
+        na.rm =
+          TRUE
+      ),
+    sd_months =
+      sd(
+        months_since_previous_interview,
+        na.rm =
+          TRUE
+      ),
+    p10_months =
+      q_safe(
+        months_since_previous_interview,
+        0.10
+      ),
+    p25_months =
+      q_safe(
+        months_since_previous_interview,
+        0.25
+      ),
+    median_months =
+      q_safe(
+        months_since_previous_interview,
+        0.50
+      ),
+    p75_months =
+      q_safe(
+        months_since_previous_interview,
+        0.75
+      ),
+    p90_months =
+      q_safe(
+        months_since_previous_interview,
+        0.90
+      ),
+    pct_9_to_15_months =
+      100 *
+        mean(
+          months_since_previous_interview >= 9 &
+            months_since_previous_interview <= 15,
+          na.rm =
+            TRUE
+        ),
+    pct_over_15_to_21_months =
+      100 *
+        mean(
+          months_since_previous_interview > 15 &
+            months_since_previous_interview <= 21,
+          na.rm =
+            TRUE
+        ),
+    pct_over_21_months =
+      100 *
+        mean(
+          months_since_previous_interview > 21,
+          na.rm =
+            TRUE
+        ),
+    pct_same_calendar_year =
+      100 *
+        mean(
+          same_calendar_year_as_previous,
+          na.rm =
+            TRUE
+        ),
+    .groups =
+      "drop"
+  )
+
+write_csv(
+  consecutive_interval_summary,
+  file.path(
+    output_dir,
+    "consecutive_interview_interval_summary.csv"
+  )
+)
+
+
+consecutive_interval_by_wave_pair <- consecutive_intervals |>
+  mutate(
+    wave_pair =
+      paste0(
+        "W",
+        previous_wave,
+        "->W",
+        wave_num
+      )
+  ) |>
+  group_by(
+    survey,
+    previous_wave,
+    wave_num,
+    wave_pair
+  ) |>
+  summarise(
+    n_pairs =
+      n(),
+    n_complete =
+      sum(
+        !is.na(
+          months_since_previous_interview
+        )
+      ),
+    median_months =
+      q_safe(
+        months_since_previous_interview,
+        0.50
+      ),
+    p10_months =
+      q_safe(
+        months_since_previous_interview,
+        0.10
+      ),
+    p90_months =
+      q_safe(
+        months_since_previous_interview,
+        0.90
+      ),
+    pct_9_to_15_months =
+      100 *
+        mean(
+          months_since_previous_interview >= 9 &
+            months_since_previous_interview <= 15,
+          na.rm =
+            TRUE
+        ),
+    pct_over_15_to_21_months =
+      100 *
+        mean(
+          months_since_previous_interview > 15 &
+            months_since_previous_interview <= 21,
+          na.rm =
+            TRUE
+        ),
+    pct_over_21_months =
+      100 *
+        mean(
+          months_since_previous_interview > 21,
+          na.rm =
+            TRUE
+        ),
+    .groups =
+      "drop"
+  )
+
+write_csv(
+  consecutive_interval_by_wave_pair,
+  file.path(
+    output_dir,
+    "consecutive_interview_interval_by_wave_pair.csv"
+  )
+)
+
+
+consecutive_interval_categories <- consecutive_intervals |>
+  count(
+    survey,
+    interval_category,
+    name =
+      "n"
+  ) |>
+  group_by(
+    survey
+  ) |>
+  mutate(
+    percent =
+      100 *
+        n /
+        sum(
+          n
+        )
+  ) |>
+  ungroup()
+
+write_csv(
+  consecutive_interval_categories,
+  file.path(
+    output_dir,
+    "consecutive_interview_interval_categories.csv"
+  )
+)
+
+
+# =============================================================================
+# 10. FIRST-MARRIAGE T-5:T0 ROWS WITH ACTUAL INTERVIEW DATES
+# =============================================================================
+
+treated_event_calendar <- first_observed_treated |>
+  select(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  distinct() |>
+  tidyr::crossing(
+    event_time =
+      event_times
+  ) |>
+  mutate(
+    wave_num =
+      event_wave +
+        event_time
+  ) |>
+  left_join(
+    timing_panel |>
+      select(
+        pidp,
+        survey,
+        wave_num,
+        interview_year,
+        interview_month,
+        interview_month_index,
+        interview_date
+      ),
+    by = c(
+      "pidp",
+      "survey",
+      "wave_num"
+    ),
+    relationship =
+      "many-to-one"
+  )
+
+
+treated_T0_time <- treated_event_calendar |>
+  filter(
+    event_time == 0L
+  ) |>
+  transmute(
+    pidp,
+    survey,
+    event_wave,
+    T0_interview_year =
+      interview_year,
+    T0_interview_month =
+      interview_month,
+    T0_month_index =
+      interview_month_index,
+    T0_interview_date =
+      interview_date
+  )
+
+
+treated_event_calendar <- treated_event_calendar |>
+  left_join(
+    treated_T0_time,
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  mutate(
+
+    target_months_before_T0 =
+      abs(
+        event_time
+      ) *
+        12,
+
+    months_before_T0 =
+      T0_month_index -
+        interview_month_index,
+
+    deviation_from_nominal_months =
+      months_before_T0 -
+        target_months_before_T0,
+
+    absolute_deviation_from_nominal_months =
+      abs(
+        deviation_from_nominal_months
+      ),
+
+    timing_category =
+      case_when(
+
+        event_time == 0L &
+          !is.na(
+            months_before_T0
+          ) ~
+          "T0",
+
+        is.na(
+          months_before_T0
+        ) ~
+          "Missing interview month/year",
+
+        deviation_from_nominal_months < -3 ~
+          "Closer to T0 than nominal by >3 months",
+
+        deviation_from_nominal_months <= 3 ~
+          "Within nominal +/-3 months",
+
+        deviation_from_nominal_months <= 9 ~
+          "Farther from T0 by >3 to 9 months",
+
+        TRUE ~
+          "Farther from T0 by >9 months"
+      )
+  )
+
+
+write_csv(
+  treated_event_calendar,
+  file.path(
+    output_dir,
+    "first_marriers_nominal_vs_calendar_event_time_person_level.csv"
+  )
+)
+
+
+# =============================================================================
+# 11. NOMINAL T-k VS ACTUAL MONTHS BEFORE T0
+# =============================================================================
+
+nominal_vs_calendar_summary <- treated_event_calendar |>
+  group_by(
+    survey,
+    event_time
+  ) |>
+  summarise(
+    treated_events =
+      n(),
+    complete_interview_dates =
+      sum(
+        !is.na(
+          months_before_T0
+        )
+      ),
+    pct_complete_interview_dates =
+      100 *
+        mean(
+          !is.na(
+            months_before_T0
+          )
+        ),
+    nominal_months_before_T0 =
+      first(
+        target_months_before_T0
+      ),
+    mean_actual_months_before_T0 =
+      mean(
+        months_before_T0,
+        na.rm =
+          TRUE
+      ),
+    sd_actual_months_before_T0 =
+      sd(
+        months_before_T0,
+        na.rm =
+          TRUE
+      ),
+    p10_actual_months_before_T0 =
+      q_safe(
+        months_before_T0,
+        0.10
+      ),
+    p25_actual_months_before_T0 =
+      q_safe(
+        months_before_T0,
+        0.25
+      ),
+    median_actual_months_before_T0 =
+      q_safe(
+        months_before_T0,
+        0.50
+      ),
+    p75_actual_months_before_T0 =
+      q_safe(
+        months_before_T0,
+        0.75
+      ),
+    p90_actual_months_before_T0 =
+      q_safe(
+        months_before_T0,
+        0.90
+      ),
+    mean_absolute_deviation_from_nominal =
+      mean(
+        absolute_deviation_from_nominal_months,
+        na.rm =
+          TRUE
+      ),
+    pct_within_nominal_pm3_months =
+      100 *
+        mean(
+          absolute_deviation_from_nominal_months <= 3,
+          na.rm =
+            TRUE
+        ),
+    pct_closer_than_nominal_by_over3_months =
+      100 *
+        mean(
+          deviation_from_nominal_months < -3,
+          na.rm =
+            TRUE
+        ),
+    pct_farther_by_over3_to9_months =
+      100 *
+        mean(
+          deviation_from_nominal_months > 3 &
+            deviation_from_nominal_months <= 9,
+          na.rm =
+            TRUE
+        ),
+    pct_farther_by_over9_months =
+      100 *
+        mean(
+          deviation_from_nominal_months > 9,
+          na.rm =
+            TRUE
+        ),
+    pct_nonpositive_elapsed_time_for_pre_event_wave =
+      if_else(
+        first(
+          event_time
+        ) < 0,
+        100 *
+          mean(
+            months_before_T0 <= 0,
+            na.rm =
+              TRUE
+          ),
+        NA_real_
+      ),
+    .groups =
+      "drop"
+  )
+
+write_csv(
+  nominal_vs_calendar_summary,
+  file.path(
+    output_dir,
+    "first_marriers_nominal_vs_calendar_event_time_summary.csv"
+  )
+)
+
+
+nominal_vs_calendar_categories <- treated_event_calendar |>
+  count(
+    survey,
+    event_time,
+    timing_category,
+    name =
+      "n"
+  ) |>
+  group_by(
+    survey,
+    event_time
+  ) |>
+  mutate(
+    percent =
+      100 *
+        n /
+        sum(
+          n
+        )
+  ) |>
+  ungroup()
+
+write_csv(
+  nominal_vs_calendar_categories,
+  file.path(
+    output_dir,
+    "first_marriers_nominal_vs_calendar_event_time_categories.csv"
+  )
+)
+
+
+# =============================================================================
+# 12. SPECIFIC T-1 DIAGNOSTIC REQUESTED
+# =============================================================================
+#
+# For nominal T-1:
+#   <9 months
+#   9-15 months
+#   >15-21 months
+#   >21 months
+#
+# The same fixed categories are also saved for all nominal event times.
+# =============================================================================
+
+fixed_elapsed_category <- function(
+    x
+) {
+
+  case_when(
+
+    is.na(
+      x
+    ) ~
+      "Missing",
+
+    x < 9 ~
+      "<9 months",
+
+    x <= 15 ~
+      "9-15 months",
+
+    x <= 21 ~
+      ">15-21 months",
+
+    TRUE ~
+      ">21 months"
+  )
+}
+
+
+Tminus1_specific <- treated_event_calendar |>
+  filter(
+    event_time == -1L
+  ) |>
+  mutate(
+    elapsed_category =
+      fixed_elapsed_category(
+        months_before_T0
+      )
+  ) |>
+  count(
+    survey,
+    elapsed_category,
+    name =
+      "n"
+  ) |>
+  group_by(
+    survey
+  ) |>
+  mutate(
+    percent =
+      100 *
+        n /
+        sum(
+          n
+        )
+  ) |>
+  ungroup()
+
+write_csv(
+  Tminus1_specific,
+  file.path(
+    output_dir,
+    "first_marriers_Tminus1_actual_interval_categories.csv"
+  )
+)
+
+
+# =============================================================================
+# 13. TREATED T0 AND CONTROL ANCHOR TABLES FOR CALENDAR-TIME SUPPORT
+# =============================================================================
+
+panel_demo <- combined_panel |>
+  select(
+    pidp,
+    survey,
+    wave_num,
+    age,
+    sex,
+    status
+  ) |>
+  distinct()
+
+
+treated_T0_demo <- first_observed_treated |>
+  select(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  distinct() |>
+  left_join(
+    timing_panel |>
+      select(
+        pidp,
+        survey,
+        wave_num,
+        interview_year,
+        interview_month,
+        interview_month_index
+      ),
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave" =
+        "wave_num"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  left_join(
+    panel_demo |>
+      select(
+        pidp,
+        survey,
+        wave_num,
+        age,
+        sex
+      ),
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave" =
+        "wave_num"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  transmute(
+    treated_pidp =
+      pidp,
+    survey,
+    treated_event_wave =
+      event_wave,
+    treated_year =
+      interview_year,
+    treated_month =
+      interview_month,
+    treated_month_index =
+      interview_month_index,
+    treated_age =
+      age,
+    treated_sex =
+      sex,
+    treated_age_key =
+      as.integer(
+        round(
+          age
+        )
+      ),
+    treated_event_id =
+      paste(
+        survey,
+        treated_event_wave,
+        treated_pidp,
+        sep =
+          "__"
+      )
+  )
+
+
+control_anchor_demo <- primary_controls |>
+  select(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  distinct() |>
+  left_join(
+    timing_panel |>
+      select(
+        pidp,
+        survey,
+        wave_num,
+        interview_year,
+        interview_month,
+        interview_month_index
+      ),
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave" =
+        "wave_num"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  left_join(
+    panel_demo |>
+      select(
+        pidp,
+        survey,
+        wave_num,
+        age,
+        sex
+      ),
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave" =
+        "wave_num"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  transmute(
+    control_pidp =
+      pidp,
+    survey,
+    control_anchor_wave =
+      event_wave,
+    control_year =
+      interview_year,
+    control_month =
+      interview_month,
+    control_month_index =
+      interview_month_index,
+    control_age =
+      age,
+    control_sex =
+      sex,
+    control_age_key =
+      as.integer(
+        round(
+          age
+        )
+      )
+  )
+
+
+# =============================================================================
+# 14. CALENDAR-TIME CONTROL SUPPORT:
+#     SAME SURVEY + EXACT SEX + AGE +/-1 YEAR + DATE CALIPER
+# =============================================================================
+#
+# Important:
+# The join below intentionally does NOT require the same wave number.
+# A control anchor from another wave is allowed if its interview date is close
+# to the treated person's T0 date.
+#
+# The current primary-control RDS still ensures that each candidate control
+# anchor:
+#   - is unmarried through its focal T0,
+#   - has complete T-5:T0 status,
+#   - has no previously observed marriage by that focal T0.
+#
+# This therefore gives a conservative diagnostic of calendar-time support.
+# =============================================================================
+
+treated_calendar_ready <- treated_T0_demo |>
+  filter(
+    !is.na(
+      treated_month_index
+    ),
+    !is.na(
+      treated_age_key
+    ),
+    !is.na(
+      treated_sex
+    )
+  ) |>
+  tidyr::crossing(
+    age_shift =
+      (-age_caliper_years):age_caliper_years
+  ) |>
+  mutate(
+    allowed_control_age_key =
+      treated_age_key +
+        age_shift
+  )
+
+
+control_calendar_ready <- control_anchor_demo |>
+  filter(
+    !is.na(
+      control_month_index
+    ),
+    !is.na(
+      control_age_key
+    ),
+    !is.na(
+      control_sex
+    )
+  )
+
+
+calendar_candidates <- treated_calendar_ready |>
+  inner_join(
+    control_calendar_ready,
+    by = c(
+      "survey",
+      "treated_sex" =
+        "control_sex",
+      "allowed_control_age_key" =
+        "control_age_key"
+    ),
+    relationship =
+      "many-to-many"
+  ) |>
+  filter(
+    treated_pidp !=
+      control_pidp
+  ) |>
+  mutate(
+    absolute_T0_month_difference =
+      abs(
+        treated_month_index -
+          control_month_index
+      )
+  )
+
+
+# A single control person can have more than one eligible control anchor.
+# For support counts, retain that person's nearest anchor to the treated T0.
+
+calendar_candidate_people <- calendar_candidates |>
+  group_by(
+    treated_event_id,
+    treated_pidp,
+    survey,
+    treated_event_wave,
+    treated_year,
+    treated_month,
+    treated_age,
+    treated_sex,
+    control_pidp
+  ) |>
+  summarise(
+    nearest_absolute_T0_month_difference =
+      min(
+        absolute_T0_month_difference,
+        na.rm =
+          TRUE
+      ),
+    n_candidate_control_anchors =
+      n(),
+    .groups =
+      "drop"
+  )
+
+
+calendar_support_per_treated <- treated_T0_demo |>
+  select(
+    treated_event_id,
+    treated_pidp,
+    survey,
+    treated_event_wave,
+    treated_year,
+    treated_month,
+    treated_month_index,
+    treated_age,
+    treated_sex
+  ) |>
+  left_join(
+    calendar_candidate_people |>
+      group_by(
+        treated_event_id
+      ) |>
+      summarise(
+        n_controls_pm3_months =
+          sum(
+            nearest_absolute_T0_month_difference <= 3
+          ),
+        n_controls_pm6_months =
+          sum(
+            nearest_absolute_T0_month_difference <= 6
+          ),
+        n_controls_pm12_months =
+          sum(
+            nearest_absolute_T0_month_difference <= 12
+          ),
+        nearest_control_month_distance =
+          min(
+            nearest_absolute_T0_month_difference,
+            na.rm =
+              TRUE
+          ),
+        .groups =
+          "drop"
+      ),
+    by =
+      "treated_event_id",
+    relationship =
+      "one-to-one"
+  ) |>
+  mutate(
+    across(
+      c(
+        n_controls_pm3_months,
+        n_controls_pm6_months,
+        n_controls_pm12_months
+      ),
+      ~ coalesce(
+        .x,
+        0L
+      )
+    ),
+    calendar_matching_data_complete =
+      !is.na(
+        treated_month_index
+      ) &
+        !is.na(
+          treated_age
+        ) &
+        !is.na(
+          treated_sex
+        ),
+    nearest_control_month_distance =
+      if_else(
+        is.infinite(
+          nearest_control_month_distance
+        ),
+        NA_real_,
+        nearest_control_month_distance
+      )
+  )
+
+write_csv(
+  calendar_support_per_treated,
+  file.path(
+    output_dir,
+    "calendar_time_control_support_per_treated.csv"
+  )
+)
+
+
+calendar_support_summary <- calendar_support_per_treated |>
+  group_by(
+    survey
+  ) |>
+  summarise(
+    treated_events =
+      n(),
+    treated_with_complete_date_age_sex =
+      sum(
+        calendar_matching_data_complete
+      ),
+    treated_missing_date_age_or_sex =
+      sum(
+        !calendar_matching_data_complete
+      ),
+    zero_controls_pm3_months =
+      sum(
+        calendar_matching_data_complete &
+          n_controls_pm3_months == 0L
+      ),
+    zero_controls_pm6_months =
+      sum(
+        calendar_matching_data_complete &
+          n_controls_pm6_months == 0L
+      ),
+    zero_controls_pm12_months =
+      sum(
+        calendar_matching_data_complete &
+          n_controls_pm12_months == 0L
+      ),
+    median_controls_pm3_months =
+      median(
+        n_controls_pm3_months[
+          calendar_matching_data_complete
+        ],
+        na.rm =
+          TRUE
+      ),
+    median_controls_pm6_months =
+      median(
+        n_controls_pm6_months[
+          calendar_matching_data_complete
+        ],
+        na.rm =
+          TRUE
+      ),
+    median_controls_pm12_months =
+      median(
+        n_controls_pm12_months[
+          calendar_matching_data_complete
+        ],
+        na.rm =
+          TRUE
+      ),
+    p10_controls_pm3_months =
+      q_safe(
+        n_controls_pm3_months[
+          calendar_matching_data_complete
+        ],
+        0.10
+      ),
+    p10_controls_pm6_months =
+      q_safe(
+        n_controls_pm6_months[
+          calendar_matching_data_complete
+        ],
+        0.10
+      ),
+    p10_controls_pm12_months =
+      q_safe(
+        n_controls_pm12_months[
+          calendar_matching_data_complete
+        ],
+        0.10
+      ),
+    .groups =
+      "drop"
+  )
+
+calendar_support_summary <- bind_rows(
+  calendar_support_summary,
+
+  calendar_support_per_treated |>
+    summarise(
+      survey =
+        "BHPS+UKHLS",
+      treated_events =
+        n(),
+      treated_with_complete_date_age_sex =
+        sum(
+          calendar_matching_data_complete
+        ),
+      treated_missing_date_age_or_sex =
+        sum(
+          !calendar_matching_data_complete
+        ),
+      zero_controls_pm3_months =
+        sum(
+          calendar_matching_data_complete &
+            n_controls_pm3_months == 0L
+        ),
+      zero_controls_pm6_months =
+        sum(
+          calendar_matching_data_complete &
+            n_controls_pm6_months == 0L
+        ),
+      zero_controls_pm12_months =
+        sum(
+          calendar_matching_data_complete &
+            n_controls_pm12_months == 0L
+        ),
+      median_controls_pm3_months =
+        median(
+          n_controls_pm3_months[
+            calendar_matching_data_complete
+          ],
+          na.rm =
+            TRUE
+        ),
+      median_controls_pm6_months =
+        median(
+          n_controls_pm6_months[
+            calendar_matching_data_complete
+          ],
+          na.rm =
+            TRUE
+        ),
+      median_controls_pm12_months =
+        median(
+          n_controls_pm12_months[
+            calendar_matching_data_complete
+          ],
+          na.rm =
+            TRUE
+        ),
+      p10_controls_pm3_months =
+        q_safe(
+          n_controls_pm3_months[
+            calendar_matching_data_complete
+          ],
+          0.10
+        ),
+      p10_controls_pm6_months =
+        q_safe(
+          n_controls_pm6_months[
+            calendar_matching_data_complete
+          ],
+          0.10
+        ),
+      p10_controls_pm12_months =
+        q_safe(
+          n_controls_pm12_months[
+            calendar_matching_data_complete
+          ],
+          0.10
+        )
+    )
+)
+
+write_csv(
+  calendar_support_summary,
+  file.path(
+    output_dir,
+    "calendar_time_control_support_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 15. HOW DIFFERENT ARE SAME-WAVE T0 INTERVIEW DATES?
+# =============================================================================
+#
+# This directly quantifies the concern that "same wave" does not necessarily
+# mean "same calendar time", especially in UKHLS.
+# =============================================================================
+
+current_same_wave_pairs <- first_observed_treated |>
+  select(
+    treated_pidp =
+      pidp,
+    survey,
+    event_wave
+  ) |>
+  inner_join(
+    primary_controls |>
+      select(
+        control_pidp =
+          pidp,
+        survey,
+        event_wave
+      ),
+    by = c(
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "many-to-many"
+  ) |>
+  left_join(
+    treated_T0_demo |>
+      select(
+        treated_pidp,
+        survey,
+        treated_event_wave,
+        treated_month_index
+      ),
+    by = c(
+      "treated_pidp",
+      "survey",
+      "event_wave" =
+        "treated_event_wave"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  left_join(
+    control_anchor_demo |>
+      select(
+        control_pidp,
+        survey,
+        control_anchor_wave,
+        control_month_index
+      ),
+    by = c(
+      "control_pidp",
+      "survey",
+      "event_wave" =
+        "control_anchor_wave"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  filter(
+    !is.na(
+      treated_month_index
+    ),
+    !is.na(
+      control_month_index
+    )
+  ) |>
+  mutate(
+    absolute_month_difference =
+      abs(
+        treated_month_index -
+          control_month_index
+      )
+  )
+
+
+same_wave_calendar_distance_summary <- current_same_wave_pairs |>
+  group_by(
+    survey
+  ) |>
+  summarise(
+    treated_control_pairs =
+      n(),
+    median_absolute_month_difference =
+      q_safe(
+        absolute_month_difference,
+        0.50
+      ),
+    p75_absolute_month_difference =
+      q_safe(
+        absolute_month_difference,
+        0.75
+      ),
+    p90_absolute_month_difference =
+      q_safe(
+        absolute_month_difference,
+        0.90
+      ),
+    p95_absolute_month_difference =
+      q_safe(
+        absolute_month_difference,
+        0.95
+      ),
+    pct_within_3_months =
+      100 *
+        mean(
+          absolute_month_difference <= 3
+        ),
+    pct_within_6_months =
+      100 *
+        mean(
+          absolute_month_difference <= 6
+        ),
+    pct_within_12_months =
+      100 *
+        mean(
+          absolute_month_difference <= 12
+        ),
+    pct_over_12_months =
+      100 *
+        mean(
+          absolute_month_difference > 12
+        ),
+    .groups =
+      "drop"
+  )
+
+write_csv(
+  same_wave_calendar_distance_summary,
+  file.path(
+    output_dir,
+    "same_wave_T0_calendar_distance_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 16. OPTIONAL MARITAL / COHABITATION HISTORY FILE DISCOVERY
+# =============================================================================
+
+discover_phistory <- function() {
+
+  explicit_ok <-
+    length(
+      phistory_path
+    ) == 1L &&
+    !is.na(
+      phistory_path
+    ) &&
+    nzchar(
+      phistory_path
+    ) &&
+    file.exists(
+      phistory_path
+    )
+
+  if (explicit_ok) {
+    return(
+      normalizePath(
+        phistory_path,
+        winslash =
+          "/",
+        mustWork =
+          TRUE
+      )
+    )
+  }
+
+  search_roots <- unique(
+    c(
+      common_stata_dir,
+      dirname(
+        common_stata_dir
+      )
+    )
+  )
+
+  hits <- unique(
+    unlist(
+      lapply(
+        search_roots,
+        function(root) {
+
+          if (!dir.exists(
+            root
+          )) {
+            return(
+              character(0)
+            )
+          }
+
+          list.files(
+            root,
+            pattern =
+              "^phistory_long\\.(dta|sav)$",
+            recursive =
+              TRUE,
+            full.names =
+              TRUE,
+            ignore.case =
+              TRUE
+          )
+        }
+      )
+    )
+  )
+
+  if (length(hits) == 0L) {
+    return(
+      NA_character_
+    )
+  }
+
+  hits <- sort(
+    hits
+  )
+
+  if (length(hits) > 1L) {
+    warning(
+      "More than one phistory_long file found. Using the first:\n",
+      hits[1L],
+      "\nAll candidates:\n",
+      paste(
+        hits,
+        collapse =
+          "\n"
+      )
+    )
+  }
+
+  hits[1L]
+}
+
+
+phistory_found_path <- discover_phistory()
+
+phistory_file_status <- tibble(
+  phistory_found =
+    !is.na(
+      phistory_found_path
+    ),
+  phistory_path =
+    phistory_found_path,
+  note =
+    ifelse(
+      !is.na(
+        phistory_found_path
+      ),
+      "phistory_long found; actual first-marriage-date diagnostic will run.",
+      paste0(
+        "phistory_long not found. The calendar interview-time diagnostic is complete, ",
+        "but actual marriage-date completeness cannot be assessed. ",
+        "Download the marital/cohabitation history dataset or set phistory_path manually."
+      )
+    )
+)
+
+write_csv(
+  phistory_file_status,
+  file.path(
+    output_dir,
+    "marriage_history_file_status.csv"
+  )
+)
+
+
+# =============================================================================
+# 17. OPTIONAL ACTUAL FIRST-MARRIAGE DATE DIAGNOSTIC
+# =============================================================================
+
+if (!is.na(
+  phistory_found_path
+)) {
+
+  message(
+    "Reading marital/cohabitation history file: ",
+    phistory_found_path
+  )
+
+  ph <- read_data_file(
+    phistory_found_path
+  )
+
+  pidp_var <- find_variable_flexible(
+    ph,
+    file_prefix =
+      "",
+    basenames =
+      "pidp",
+    required =
+      TRUE
+  )
+
+  status_var <- find_variable_flexible(
+    ph,
+    file_prefix =
+      "",
+    basenames =
+      "status",
+    required =
+      TRUE
+  )
+
+  starty_var <- find_variable_flexible(
+    ph,
+    file_prefix =
+      "",
+    basenames =
+      "starty",
+    required =
+      FALSE
+  )
+
+  startm_var <- find_variable_flexible(
+    ph,
+    file_prefix =
+      "",
+    basenames =
+      "startm",
+    required =
+      FALSE
+  )
+
+  start_if_var <- find_variable_flexible(
+    ph,
+    file_prefix =
+      "",
+    basenames =
+      "start_if",
+    required =
+      FALSE
+  )
+
+  status_num <- suppressWarnings(
+    as.numeric(
+      ph[[
+        status_var
+      ]]
+    )
+  )
+
+  status_label <- if (
+    inherits(
+      ph[[
+        status_var
+      ]],
+      "haven_labelled"
+    )
+  ) {
+    as.character(
+      haven::as_factor(
+        ph[[
+          status_var
+        ]],
+        levels =
+          "labels"
+      )
+    )
+  } else {
+    as.character(
+      ph[[
+        status_var
+      ]]
+    )
+  }
+
+  is_marriage_spell <-
+    (
+      !is.na(
+        status_num
+      ) &
+        status_num == 2
+    ) |
+    (
+      !is.na(
+        status_label
+      ) &
+        stringr::str_detect(
+          stringr::str_to_lower(
+            status_label
+          ),
+          "^married$|marriage"
+        )
+    )
+
+  ph_marriage <- tibble(
+    pidp =
+      ph[[
+        pidp_var
+      ]],
+    is_marriage_spell =
+      is_marriage_spell,
+    start_year =
+      if (
+        is.na(
+          starty_var
+        )
+      ) {
+        NA_integer_
+      } else {
+        clean_year(
+          ph[[
+            starty_var
+          ]]
+        )
+      },
+    start_month =
+      if (
+        is.na(
+          startm_var
+        )
+      ) {
+        NA_integer_
+      } else {
+        clean_month(
+          ph[[
+            startm_var
+          ]]
+        )
+      },
+    start_imputation_flag =
+      if (
+        is.na(
+          start_if_var
+        )
+      ) {
+        NA_real_
+      } else {
+        suppressWarnings(
+          as.numeric(
+            ph[[
+              start_if_var
+            ]]
+          )
+        )
+      }
+  ) |>
+    filter(
+      is_marriage_spell
+    ) |>
+    mutate(
+      marriage_month_index =
+        month_index(
+          start_year,
+          start_month
+        ),
+      sort_month_index =
+        if_else(
+          !is.na(
+            marriage_month_index
+          ),
+          marriage_month_index,
+          if_else(
+            !is.na(
+              start_year
+            ),
+            start_year *
+              12 +
+              6,
+            Inf
+          )
+        )
+    ) |>
+    arrange(
+      pidp,
+      sort_month_index
+    )
+
+
+  first_history_marriage <- ph_marriage |>
+    group_by(
+      pidp
+    ) |>
+    slice(
+      1L
+    ) |>
+    ungroup() |>
+    select(
+      pidp,
+      first_history_marriage_year =
+        start_year,
+      first_history_marriage_month =
+        start_month,
+      first_history_marriage_month_index =
+        marriage_month_index,
+      first_history_marriage_imputation_flag =
+        start_imputation_flag
+    )
+
+
+  treated_Tminus1_T0 <- treated_event_calendar |>
+    filter(
+      event_time %in%
+        c(
+          -1L,
+          0L
+        )
+    ) |>
+    select(
+      pidp,
+      survey,
+      event_wave,
+      event_time,
+      interview_month_index
+    ) |>
+    pivot_wider(
+      names_from =
+        event_time,
+      values_from =
+        interview_month_index,
+      names_prefix =
+        "event_time_"
+    ) |>
+    rename(
+      Tminus1_month_index =
+        `event_time_-1`,
+      T0_month_index =
+        event_time_0
+    )
+
+
+  marriage_history_linkage <- first_observed_treated |>
+    select(
+      pidp,
+      survey,
+      event_wave
+    ) |>
+    distinct() |>
+    left_join(
+      treated_Tminus1_T0,
+      by = c(
+        "pidp",
+        "survey",
+        "event_wave"
+      ),
+      relationship =
+        "one-to-one"
+    ) |>
+    left_join(
+      first_history_marriage,
+      by =
+        "pidp",
+      relationship =
+        "many-to-one"
+    ) |>
+    mutate(
+
+      history_marriage_date_complete =
+        !is.na(
+          first_history_marriage_month_index
+        ),
+
+      history_marriage_year_available =
+        !is.na(
+          first_history_marriage_year
+        ),
+
+      historical_first_marriage_between_Tminus1_and_T0 =
+        history_marriage_date_complete &
+          !is.na(
+            Tminus1_month_index
+          ) &
+          !is.na(
+            T0_month_index
+          ) &
+          first_history_marriage_month_index >=
+            Tminus1_month_index &
+          first_history_marriage_month_index <=
+            T0_month_index,
+
+      months_Tminus1_to_actual_first_marriage =
+        first_history_marriage_month_index -
+          Tminus1_month_index,
+
+      months_actual_first_marriage_to_T0 =
+        T0_month_index -
+          first_history_marriage_month_index,
+
+      historical_first_marriage_before_Tminus1 =
+        history_marriage_date_complete &
+          !is.na(
+            Tminus1_month_index
+          ) &
+          first_history_marriage_month_index <
+            Tminus1_month_index,
+
+      historical_first_marriage_after_T0 =
+        history_marriage_date_complete &
+          !is.na(
+            T0_month_index
+          ) &
+          first_history_marriage_month_index >
+            T0_month_index
+    )
+
+
+  write_csv(
+    marriage_history_linkage,
+    file.path(
+      output_dir,
+      "actual_first_marriage_date_linkage_person_level.csv"
+    )
+  )
+
+
+  marriage_history_summary <- marriage_history_linkage |>
+    group_by(
+      survey
+    ) |>
+    summarise(
+      treated_first_observed_marriages =
+        n(),
+      linked_to_any_historical_marriage_spell =
+        sum(
+          !is.na(
+            first_history_marriage_year
+          )
+        ),
+      pct_linked_to_any_historical_marriage_spell =
+        100 *
+          mean(
+            !is.na(
+              first_history_marriage_year
+            )
+          ),
+      actual_first_marriage_year_available =
+        sum(
+          history_marriage_year_available
+        ),
+      actual_first_marriage_month_year_complete =
+        sum(
+          history_marriage_date_complete
+        ),
+      pct_actual_first_marriage_month_year_complete =
+        100 *
+          mean(
+            history_marriage_date_complete
+          ),
+      n_start_date_flag_0_no_imputation =
+        sum(
+          first_history_marriage_imputation_flag == 0,
+          na.rm =
+            TRUE
+        ),
+      n_start_date_flag_1_month_imputed =
+        sum(
+          first_history_marriage_imputation_flag == 1,
+          na.rm =
+            TRUE
+        ),
+      n_start_date_flag_2_month_and_year_imputed =
+        sum(
+          first_history_marriage_imputation_flag == 2,
+          na.rm =
+            TRUE
+        ),
+      n_historical_first_marriage_between_Tminus1_and_T0 =
+        sum(
+          historical_first_marriage_between_Tminus1_and_T0,
+          na.rm =
+            TRUE
+        ),
+      pct_historical_first_marriage_between_Tminus1_and_T0_among_complete_dates =
+        100 *
+          mean(
+            historical_first_marriage_between_Tminus1_and_T0[
+              history_marriage_date_complete &
+                !is.na(
+                  Tminus1_month_index
+                ) &
+                !is.na(
+                  T0_month_index
+                )
+            ],
+            na.rm =
+              TRUE
+          ),
+      n_historical_first_marriage_before_Tminus1 =
+        sum(
+          historical_first_marriage_before_Tminus1,
+          na.rm =
+            TRUE
+        ),
+      n_historical_first_marriage_after_T0 =
+        sum(
+          historical_first_marriage_after_T0,
+          na.rm =
+            TRUE
+        ),
+      median_months_actual_first_marriage_to_T0 =
+        q_safe(
+          months_actual_first_marriage_to_T0[
+            historical_first_marriage_between_Tminus1_and_T0
+          ],
+          0.50
+        ),
+      p10_months_actual_first_marriage_to_T0 =
+        q_safe(
+          months_actual_first_marriage_to_T0[
+            historical_first_marriage_between_Tminus1_and_T0
+          ],
+          0.10
+        ),
+      p90_months_actual_first_marriage_to_T0 =
+        q_safe(
+          months_actual_first_marriage_to_T0[
+            historical_first_marriage_between_Tminus1_and_T0
+          ],
+          0.90
+        ),
+      .groups =
+        "drop"
+    )
+
+
+  write_csv(
+    marriage_history_summary,
+    file.path(
+      output_dir,
+      "actual_first_marriage_date_completeness_summary.csv"
+    )
+  )
+
+
+  marriage_history_variable_audit <- tibble(
+    file =
+      basename(
+        phistory_found_path
+      ),
+    pidp_var =
+      pidp_var,
+    status_var =
+      status_var,
+    start_year_var =
+      starty_var,
+    start_month_var =
+      startm_var,
+    start_imputation_flag_var =
+      start_if_var,
+    marriage_spells =
+      nrow(
+        ph_marriage
+      ),
+    people_with_marriage_spells =
+      n_distinct(
+        ph_marriage$pidp
+      )
+  )
+
+  write_csv(
+    marriage_history_variable_audit,
+    file.path(
+      output_dir,
+      "marriage_history_variable_audit.csv"
+    )
+  )
+
+  rm(
+    ph
+  )
+
+} else {
+
+  # Create empty-but-readable placeholders so that the expected output list is
+  # stable across runs.
+
+  write_csv(
+    tibble(
+      note =
+        "phistory_long not found; actual first-marriage-date diagnostic not run."
+    ),
+    file.path(
+      output_dir,
+      "actual_first_marriage_date_completeness_summary.csv"
+    )
+  )
+}
+
+
+# =============================================================================
+# 18. T0 INTERVIEW DATE DISTRIBUTION BY SURVEY/WAVE
+# =============================================================================
+#
+# This is useful for seeing directly how much calendar overlap exists across
+# nominal UKHLS waves.
+# =============================================================================
+
+T0_date_distribution <- treated_T0_demo |>
+  count(
+    survey,
+    treated_event_wave,
+    treated_year,
+    treated_month,
+    name =
+      "first_marriages"
+  ) |>
+  arrange(
+    survey,
+    treated_event_wave,
+    treated_year,
+    treated_month
+  )
+
+write_csv(
+  T0_date_distribution,
+  file.path(
+    output_dir,
+    "first_marriage_T0_interview_date_distribution.csv"
+  )
+)
+
+
+wave_calendar_span <- timing_panel |>
+  filter(
+    !is.na(
+      interview_month_index
+    )
+  ) |>
+  group_by(
+    survey,
+    wave_num
+  ) |>
+  summarise(
+    interviewed_people =
+      n(),
+    first_interview_year =
+      min(
+        interview_year
+      ),
+    first_interview_month =
+      interview_month[
+        which.min(
+          interview_month_index
+        )
+      ],
+    last_interview_year =
+      max(
+        interview_year
+      ),
+    last_interview_month =
+      interview_month[
+        which.max(
+          interview_month_index
+        )
+      ],
+    calendar_span_months =
+      max(
+        interview_month_index
+      ) -
+        min(
+          interview_month_index
+        ),
+    distinct_calendar_months =
+      n_distinct(
+        interview_month_index
+      ),
+    .groups =
+      "drop"
+  )
+
+write_csv(
+  wave_calendar_span,
+  file.path(
+    output_dir,
+    "wave_calendar_span.csv"
+  )
+)
+
+
+# =============================================================================
+# 19. HIGH-LEVEL DECISION TABLE
+# =============================================================================
+
+decision_table <- tibble(
+  diagnostic =
+    c(
+      "Interview month/year completeness: BHPS",
+      "Interview month/year completeness: UKHLS",
+      "Consecutive interviews usually 9-15 months apart: BHPS",
+      "Consecutive interviews usually 9-15 months apart: UKHLS",
+      "Nominal T-1 within 9-15 months of T0: BHPS",
+      "Nominal T-1 within 9-15 months of T0: UKHLS",
+      "Calendar-time controls available within +/-3 months",
+      "Calendar-time controls available within +/-6 months",
+      "Actual first-marriage dates available from phistory_long"
+    ),
+  value =
+    c(
+
+      date_variable_audit |>
+        filter(
+          survey == "BHPS"
+        ) |>
+        summarise(
+          x =
+            weighted.mean(
+              pct_complete_month_year,
+              w =
+                n_indresp_rows,
+              na.rm =
+                TRUE
+            )
+        ) |>
+        pull(
+          x
+        ),
+
+      date_variable_audit |>
+        filter(
+          survey == "UKHLS"
+        ) |>
+        summarise(
+          x =
+            weighted.mean(
+              pct_complete_month_year,
+              w =
+                n_indresp_rows,
+              na.rm =
+                TRUE
+            )
+        ) |>
+        pull(
+          x
+        ),
+
+      consecutive_interval_summary |>
+        filter(
+          survey == "BHPS"
+        ) |>
+        pull(
+          pct_9_to_15_months
+        ),
+
+      consecutive_interval_summary |>
+        filter(
+          survey == "UKHLS"
+        ) |>
+        pull(
+          pct_9_to_15_months
+        ),
+
+      treated_event_calendar |>
+        filter(
+          survey == "BHPS",
+          event_time == -1L
+        ) |>
+        summarise(
+          x =
+            100 *
+              mean(
+                months_before_T0 >= 9 &
+                  months_before_T0 <= 15,
+                na.rm =
+                  TRUE
+              )
+        ) |>
+        pull(
+          x
+        ),
+
+      treated_event_calendar |>
+        filter(
+          survey == "UKHLS",
+          event_time == -1L
+        ) |>
+        summarise(
+          x =
+            100 *
+              mean(
+                months_before_T0 >= 9 &
+                  months_before_T0 <= 15,
+                na.rm =
+                  TRUE
+              )
+        ) |>
+        pull(
+          x
+        ),
+
+      calendar_support_per_treated |>
+        filter(
+          calendar_matching_data_complete
+        ) |>
+        summarise(
+          x =
+            100 *
+              mean(
+                n_controls_pm3_months >
+                  0
+              )
+        ) |>
+        pull(
+          x
+        ),
+
+      calendar_support_per_treated |>
+        filter(
+          calendar_matching_data_complete
+        ) |>
+        summarise(
+          x =
+            100 *
+              mean(
+                n_controls_pm6_months >
+                  0
+              )
+        ) |>
+        pull(
+          x
+        ),
+
+      ifelse(
+        !is.na(
+          phistory_found_path
+        ),
+        100,
+        0
+      )
+    ),
+  unit =
+    c(
+      rep(
+        "percent",
+        8
+      ),
+      "file-found indicator (100=yes, 0=no)"
+    )
+)
+
+write_csv(
+  decision_table,
+  file.path(
+    output_dir,
+    "TIMING_DIAGNOSTIC_decision_table.csv"
+  )
+)
+
+
+# =============================================================================
+# 20. FINAL OUTPUT CHECK
+# =============================================================================
+
+expected_outputs <- c(
+  "interview_date_variable_audit.csv",
+  "combined_interview_timing_panel.rds",
+  "consecutive_interview_interval_summary.csv",
+  "consecutive_interview_interval_by_wave_pair.csv",
+  "consecutive_interview_interval_categories.csv",
+  "first_marriers_nominal_vs_calendar_event_time_person_level.csv",
+  "first_marriers_nominal_vs_calendar_event_time_summary.csv",
+  "first_marriers_nominal_vs_calendar_event_time_categories.csv",
+  "first_marriers_Tminus1_actual_interval_categories.csv",
+  "calendar_time_control_support_per_treated.csv",
+  "calendar_time_control_support_summary.csv",
+  "same_wave_T0_calendar_distance_summary.csv",
+  "marriage_history_file_status.csv",
+  "actual_first_marriage_date_completeness_summary.csv",
+  "first_marriage_T0_interview_date_distribution.csv",
+  "wave_calendar_span.csv",
+  "TIMING_DIAGNOSTIC_decision_table.csv"
+)
+
+output_check <- tibble(
+  file =
+    expected_outputs,
+  exists =
+    file.exists(
+      file.path(
+        output_dir,
+        expected_outputs
+      )
+    )
+)
+
+write_csv(
+  output_check,
+  file.path(
+    output_dir,
+    "timing_diagnostic_output_check.csv"
+  )
+)
+
+if (any(
+  !output_check$exists
+)) {
+  stop(
+    "One or more expected outputs were not created. ",
+    "Inspect timing_diagnostic_output_check.csv."
+  )
+}
+
+
+# =============================================================================
+# 21. CONSOLE REPORT
+# =============================================================================
+
+cat(
+  "\n\n============================================================\n"
+)
+
+cat(
+  "FIRST-MARRIAGE CALENDAR-TIME DIAGNOSTIC COMPLETE\n"
+)
+
+cat(
+  "============================================================\n\n"
+)
+
+cat(
+  "INTERVIEW-DATE VARIABLE AUDIT\n\n"
+)
+
+print(
+  date_variable_audit,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nCONSECUTIVE INTERVIEW INTERVAL SUMMARY\n\n"
+)
+
+print(
+  consecutive_interval_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nNOMINAL EVENT TIME VS ACTUAL MONTHS BEFORE T0\n\n"
+)
+
+print(
+  nominal_vs_calendar_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nT-1 ACTUAL INTERVAL CATEGORIES\n\n"
+)
+
+print(
+  Tminus1_specific,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nCALENDAR-TIME CONTROL SUPPORT\n\n"
+)
+
+print(
+  calendar_support_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nSAME-WAVE TREATED/CONTROL CALENDAR DISTANCES\n\n"
+)
+
+print(
+  same_wave_calendar_distance_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nMARRIAGE-HISTORY FILE STATUS\n\n"
+)
+
+print(
+  phistory_file_status,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nHIGH-LEVEL DECISION TABLE\n\n"
+)
+
+print(
+  decision_table,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nOUTPUT DIRECTORY:\n",
+  normalizePath(
+    output_dir,
+    winslash =
+      "/",
+    mustWork =
+      FALSE
+  ),
+  "\n\n"
+)
+
+cat(
+  "Most important files to inspect/upload:\n",
+  "  1. interview_date_variable_audit.csv\n",
+  "  2. consecutive_interview_interval_summary.csv\n",
+  "  3. first_marriers_nominal_vs_calendar_event_time_summary.csv\n",
+  "  4. first_marriers_Tminus1_actual_interval_categories.csv\n",
+  "  5. calendar_time_control_support_summary.csv\n",
+  "  6. same_wave_T0_calendar_distance_summary.csv\n",
+  "  7. wave_calendar_span.csv\n",
+  "  8. TIMING_DIAGNOSTIC_decision_table.csv\n",
+  "  9. actual_first_marriage_date_completeness_summary.csv\n"
+)
+
+cat(
+  "\nInterpretation guide:\n",
+  "  - If actual interview spacing is tightly concentrated around 12 months,\n",
+  "    the wave-based results may remain a useful approximation.\n",
+  "  - If nominal T-k values show substantial calendar-time dispersion,\n",
+  "    the main trajectory should be re-estimated using actual interview time.\n",
+  "  - If +/-3 or +/-6 month calendar risk sets retain excellent support,\n",
+  "    calendar-time rather than same-wave matching is preferable.\n",
+  "  - If historical first-marriage month/year is highly complete and usually\n",
+  "    falls between T-1 and T0, actual marriage date can become the event anchor.\n"
+)
+
+cat(
+  "============================================================\n"
+)

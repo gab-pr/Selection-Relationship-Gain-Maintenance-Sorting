@@ -1,0 +1,484 @@
+################################################################################
+# UKHLS CURRENTLY-UNPARTNERED SELECTION RISK-SET PREPARATION
+# Reproducibility-package dependency for latent stable-trait / WPVS H1 analyses
+################################################################################
+#
+# PURPOSE
+# -------
+# Build the exact-wave clean-unpartnered UKHLS landmark base required by the
+# latent stable-trait / within-person variability score (WPVS) selection
+# workflows. This script contains DATA PREPARATION ONLY. It does not estimate
+# psychological-selection models and does not construct prior-mean/deviation
+# predictors.
+#
+# A clean-unpartnered landmark requires, at the SAME UKHLS interview:
+#   1. harmonized relationship status == "single"; and
+#   2. NCRR1 == 2 (no steady non-resident partner).
+#
+# The saved RDS deliberately retains the historical directory/file name expected
+# by the validated latent-analysis scripts:
+#   psychological_selection_UKHLS_wave3plus_NCRR1_v3_current_unpartnered_primary/
+#   NCRR1_v3_formation_analytic_base.rds
+#
+# Run from the beginning in a fresh R session.
+################################################################################
+
+required_packages <- c("haven", "dplyr", "purrr", "tibble", "readr")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop("Install required package(s): ", paste(missing_packages, collapse = ", "))
+}
+
+suppressPackageStartupMessages({
+  library(haven)
+  library(dplyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+})
+
+# ------------------------------------------------------------------------------
+# 1. PATHS AND OPTIONS
+# ------------------------------------------------------------------------------
+UKHLS_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se/ukhls"
+)
+COMMON_STATA_DIR <- dirname(UKHLS_DIR)
+
+PERSON_WAVE_RDS <- file.path(
+  COMMON_STATA_DIR,
+  "first_marriage_Tminus5_T0_diagnostic",
+  "combined_person_wave_panel.rds"
+)
+
+TIMING_RDS <- file.path(
+  COMMON_STATA_DIR,
+  "first_marriage_calendar_timing_diagnostic",
+  "combined_interview_timing_panel.rds"
+)
+
+OUT_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "psychological_selection_UKHLS_wave3plus_NCRR1_v3_current_unpartnered_primary"
+)
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+FORMATION_BASE_RDS <- file.path(OUT_DIR, "NCRR1_v3_formation_analytic_base.rds")
+UKHLS_WAVES <- 3L:15L
+UKHLS_PREFIX <- letters[UKHLS_WAVES]
+MIN_AGE <- 18L
+MAX_AGE <- 100L
+
+# ------------------------------------------------------------------------------
+# 2. HELPERS
+# ------------------------------------------------------------------------------
+normalize_pidp_key <- function(x) {
+  z <- x
+  if (
+    inherits(z, "haven_labelled") ||
+      inherits(z, "labelled") ||
+      inherits(z, "haven_labelled_spss")
+  ) z <- unclass(z)
+  if (is.factor(z)) z <- as.character(z)
+  if (is.numeric(z) || is.integer(z)) {
+    out <- ifelse(
+      is.na(z), NA_character_,
+      format(z, scientific = FALSE, trim = TRUE, digits = 22)
+    )
+    out <- sub("\\.0+$", "", out)
+    return(out)
+  }
+  out <- trimws(as.character(z))
+  out[out %in% c("", "NA", "NaN")] <- NA_character_
+  sub("\\.0+$", "", out)
+}
+
+as_numeric_clean <- function(x) {
+  z <- x
+  if (
+    inherits(z, "haven_labelled") ||
+      inherits(z, "labelled") ||
+      inherits(z, "haven_labelled_spss")
+  ) z <- unclass(z)
+  if (is.factor(z)) z <- as.character(z)
+  suppressWarnings(as.numeric(z))
+}
+
+stata_month_from_year_month <- function(year, month_num) {
+  y <- suppressWarnings(as.integer(year))
+  m <- suppressWarnings(as.integer(month_num))
+  ifelse(
+    is.na(y) | is.na(m) | m < 1L | m > 12L,
+    NA_integer_,
+    as.integer((y - 1960L) * 12L + (m - 1L))
+  )
+}
+
+pick_existing_name <- function(all_names, candidates, label, file_path) {
+  hit <- candidates[candidates %in% all_names]
+  if (length(hit) == 0L) {
+    stop(
+      "Could not find ", label, " in ", basename(file_path), ". Tried: ",
+      paste(candidates, collapse = ", ")
+    )
+  }
+  hit[[1L]]
+}
+
+write_csv_quiet <- function(x, filename) {
+  readr::write_csv(x, file.path(OUT_DIR, filename), na = "", progress = FALSE)
+}
+
+# ------------------------------------------------------------------------------
+# 3. READ NCRR1 BY EXACT UKHLS WAVE
+# ------------------------------------------------------------------------------
+read_ncrr1_wave <- function(wave_num, prefix) {
+  file_path <- file.path(UKHLS_DIR, paste0(prefix, "_indresp.dta"))
+  if (!file.exists(file_path)) {
+    stop("Missing UKHLS INDRESP file for Wave ", wave_num, ": ", file_path)
+  }
+
+  header <- haven::read_dta(file_path, n_max = 0)
+  nm <- names(header)
+
+  pidp_nm <- pick_existing_name(
+    nm, c("pidp", paste0(prefix, "_pidp")), "pidp", file_path
+  )
+  ncrr1_nm <- pick_existing_name(
+    nm, c(paste0(prefix, "_ncrr1"), "ncrr1"), "NCRR1", file_path
+  )
+  inty_nm <- pick_existing_name(
+    nm, c(paste0(prefix, "_intdaty_dv"), "intdaty_dv"),
+    "interview year", file_path
+  )
+  intm_nm <- pick_existing_name(
+    nm, c(paste0(prefix, "_intdatm_dv"), "intdatm_dv"),
+    "interview month", file_path
+  )
+
+  dat <- haven::read_dta(
+    file_path,
+    col_select = dplyr::all_of(unique(c(pidp_nm, ncrr1_nm, inty_nm, intm_nm)))
+  )
+
+  tibble::tibble(
+    pidp_key = normalize_pidp_key(dat[[pidp_nm]]),
+    wave_num = as.integer(wave_num),
+    wave_prefix = prefix,
+    ncrr_year_raw = suppressWarnings(as.integer(as_numeric_clean(dat[[inty_nm]]))),
+    ncrr_month_raw = suppressWarnings(as.integer(as_numeric_clean(dat[[intm_nm]]))),
+    ncrr1_raw = suppressWarnings(as.integer(as_numeric_clean(dat[[ncrr1_nm]])))
+  ) %>%
+    dplyr::mutate(
+      ncrr_year_raw = dplyr::if_else(
+        !is.na(ncrr_year_raw) & ncrr_year_raw >= 1900L & ncrr_year_raw <= 2100L,
+        ncrr_year_raw,
+        NA_integer_
+      ),
+      ncrr_month_raw = dplyr::if_else(
+        !is.na(ncrr_month_raw) & ncrr_month_raw >= 1L & ncrr_month_raw <= 12L,
+        ncrr_month_raw,
+        NA_integer_
+      ),
+      ncrr1 = dplyr::if_else(ncrr1_raw %in% c(1L, 2L), ncrr1_raw, NA_integer_),
+      ncrr1_label = dplyr::case_when(
+        ncrr1 == 1L ~ "steady non-resident partner",
+        ncrr1 == 2L ~ "no steady non-resident partner",
+        TRUE ~ "missing/inapplicable/other"
+      ),
+      ncrr_month_index_raw = stata_month_from_year_month(
+        ncrr_year_raw, ncrr_month_raw
+      )
+    )
+}
+
+ncrr_raw <- purrr::map2_dfr(UKHLS_WAVES, UKHLS_PREFIX, read_ncrr1_wave) %>%
+  dplyr::filter(!is.na(pidp_key))
+
+if (anyDuplicated(ncrr_raw[c("pidp_key", "wave_num")]) > 0L) {
+  stop("NCRR1 extraction is not unique by pidp x wave.")
+}
+
+ncrr1_wave_audit <- ncrr_raw %>%
+  dplyr::group_by(wave_num, wave_prefix) %>%
+  dplyr::summarise(
+    rows = dplyr::n(),
+    valid_ncrr1 = sum(ncrr1 %in% c(1L, 2L), na.rm = TRUE),
+    yes_nonresident_partner = sum(ncrr1 == 1L, na.rm = TRUE),
+    no_nonresident_partner = sum(ncrr1 == 2L, na.rm = TRUE),
+    invalid_or_missing = sum(is.na(ncrr1)),
+    .groups = "drop"
+  )
+write_csv_quiet(ncrr1_wave_audit, "NCRR1_v3_wave3plus_availability_and_code_audit.csv")
+
+if (any(ncrr1_wave_audit$valid_ncrr1 == 0L)) {
+  stop("At least one Wave 3-15 file has zero valid NCRR1 responses.")
+}
+
+# ------------------------------------------------------------------------------
+# 4. ALIGN NCRR1, PSYCHOLOGY, STATUS, AND INTERVIEW TIMING BY PIDP x WAVE
+# ------------------------------------------------------------------------------
+required_inputs <- c(PERSON_WAVE_RDS, TIMING_RDS)
+missing_inputs <- required_inputs[!file.exists(required_inputs)]
+if (length(missing_inputs) > 0L) {
+  stop("Missing required input file(s):\n", paste(missing_inputs, collapse = "\n"))
+}
+
+combined_raw <- readRDS(PERSON_WAVE_RDS)
+timing_raw <- readRDS(TIMING_RDS)
+
+required_combined <- c(
+  "pidp", "survey", "wave_num", "status", "ghq12", "life_sat", "age", "sex"
+)
+required_timing <- c(
+  "pidp", "survey", "wave_num", "interview_year", "interview_month"
+)
+
+miss_combined <- setdiff(required_combined, names(combined_raw))
+miss_timing <- setdiff(required_timing, names(timing_raw))
+if (length(miss_combined) > 0L) {
+  stop("combined_person_wave_panel.rds missing: ", paste(miss_combined, collapse = ", "))
+}
+if (length(miss_timing) > 0L) {
+  stop("combined_interview_timing_panel.rds missing: ", paste(miss_timing, collapse = ", "))
+}
+
+combined <- combined_raw %>%
+  dplyr::transmute(
+    pidp_key = normalize_pidp_key(pidp),
+    survey = as.character(survey),
+    wave_num = suppressWarnings(as.integer(wave_num)),
+    status = tolower(as.character(status)),
+    ghq12 = suppressWarnings(as.numeric(ghq12)),
+    life_sat = suppressWarnings(as.numeric(life_sat)),
+    age = suppressWarnings(as.numeric(age)),
+    sex = as.character(sex)
+  ) %>%
+  dplyr::filter(
+    survey == "UKHLS",
+    wave_num %in% UKHLS_WAVES,
+    !is.na(pidp_key)
+  )
+
+timing <- timing_raw %>%
+  dplyr::transmute(
+    pidp_key = normalize_pidp_key(pidp),
+    survey = as.character(survey),
+    wave_num = suppressWarnings(as.integer(wave_num)),
+    interview_year = suppressWarnings(as.integer(interview_year)),
+    interview_month = suppressWarnings(as.integer(interview_month))
+  ) %>%
+  dplyr::filter(
+    survey == "UKHLS",
+    wave_num %in% UKHLS_WAVES,
+    !is.na(pidp_key)
+  )
+
+if (anyDuplicated(combined[c("pidp_key", "wave_num")]) > 0L) {
+  stop("Combined UKHLS person-wave panel is not unique by pidp x wave.")
+}
+if (anyDuplicated(timing[c("pidp_key", "wave_num")]) > 0L) {
+  stop("UKHLS timing panel is not unique by pidp x wave.")
+}
+
+wave_panel <- combined %>%
+  dplyr::left_join(
+    timing %>% dplyr::select(-survey),
+    by = c("pidp_key", "wave_num"),
+    relationship = "one-to-one"
+  ) %>%
+  dplyr::left_join(
+    ncrr_raw %>%
+      dplyr::select(
+        pidp_key, wave_num, wave_prefix,
+        ncrr_year_raw, ncrr_month_raw, ncrr_month_index_raw,
+        ncrr1_raw, ncrr1, ncrr1_label
+      ),
+    by = c("pidp_key", "wave_num"),
+    relationship = "one-to-one"
+  ) %>%
+  dplyr::mutate(
+    interview_month_index = stata_month_from_year_month(
+      interview_year, interview_month
+    ),
+    age_c = age - 30,
+    age_c2 = age_c^2,
+    landmark_id = paste(pidp_key, wave_num, sep = "__wave__")
+  ) %>%
+  dplyr::filter(
+    !is.na(interview_month_index),
+    !is.na(age), age >= MIN_AGE, age <= MAX_AGE,
+    !is.na(sex)
+  )
+
+same_wave_alignment_audit <- wave_panel %>%
+  dplyr::summarise(
+    wave_rows = dplyr::n(),
+    unique_people = dplyr::n_distinct(pidp_key),
+    rows_with_valid_ncrr1 = sum(ncrr1 %in% c(1L, 2L), na.rm = TRUE),
+    rows_with_both_interview_months = sum(
+      !is.na(interview_month_index) & !is.na(ncrr_month_index_raw)
+    ),
+    exact_month_matches = sum(
+      !is.na(interview_month_index) & !is.na(ncrr_month_index_raw) &
+        interview_month_index == ncrr_month_index_raw
+    ),
+    nonzero_month_mismatches = sum(
+      !is.na(interview_month_index) & !is.na(ncrr_month_index_raw) &
+        interview_month_index != ncrr_month_index_raw
+    )
+  )
+write_csv_quiet(same_wave_alignment_audit, "NCRR1_v3_same_wave_alignment_audit.csv")
+
+same_wave_month_mismatch_rows <- wave_panel %>%
+  dplyr::filter(
+    !is.na(interview_month_index),
+    !is.na(ncrr_month_index_raw),
+    interview_month_index != ncrr_month_index_raw
+  ) %>%
+  dplyr::select(
+    pidp_key, wave_num, interview_year, interview_month,
+    ncrr_year_raw, ncrr_month_raw,
+    interview_month_index, ncrr_month_index_raw,
+    status, ncrr1_raw, ncrr1, ncrr1_label, ghq12, life_sat, age, sex
+  )
+write_csv_quiet(
+  same_wave_month_mismatch_rows,
+  "NCRR1_v3_same_wave_month_mismatch_rows.csv"
+)
+
+if (nrow(same_wave_month_mismatch_rows) > 0L) {
+  warning(
+    nrow(same_wave_month_mismatch_rows),
+    " same-wave records have discordant interview months and are excluded."
+  )
+}
+
+wave_panel <- wave_panel %>%
+  dplyr::filter(
+    is.na(ncrr_month_index_raw) |
+      interview_month_index == ncrr_month_index_raw
+  )
+
+single_refinement_audit <- wave_panel %>%
+  dplyr::filter(status == "single") %>%
+  dplyr::summarise(
+    exact_wave_single_rows = dplyr::n(),
+    exact_wave_single_people = dplyr::n_distinct(pidp_key),
+    single_with_valid_ncrr1 = sum(ncrr1 %in% c(1L, 2L), na.rm = TRUE),
+    single_ncrr1_yes = sum(ncrr1 == 1L, na.rm = TRUE),
+    single_ncrr1_no = sum(ncrr1 == 2L, na.rm = TRUE),
+    single_ncrr1_missing_or_inapplicable = sum(is.na(ncrr1))
+  )
+write_csv_quiet(
+  single_refinement_audit,
+  "NCRR1_v3_exact_wave_single_refinement_audit.csv"
+)
+
+# ------------------------------------------------------------------------------
+# 5. BUILD AND SAVE THE CLEAN-UNPARTNERED LANDMARK BASE
+# ------------------------------------------------------------------------------
+formation_base <- wave_panel %>%
+  dplyr::filter(
+    status == "single",
+    ncrr1 == 2L
+  ) %>%
+  dplyr::transmute(
+    pidp_key,
+    wave_num,
+    landmark_id,
+    interview_month_index,
+    interview_year,
+    interview_month,
+    age,
+    age_c,
+    age_c2,
+    sex,
+    status,
+    ncrr1,
+    ncrr1_label,
+    life_sat,
+    ghq12
+  ) %>%
+  dplyr::arrange(pidp_key, wave_num)
+
+if (nrow(formation_base) == 0L) {
+  stop("Clean-unpartnered landmark base is empty.")
+}
+if (anyDuplicated(formation_base[c("pidp_key", "wave_num")]) > 0L) {
+  stop("Clean-unpartnered landmark base is not unique by pidp x wave.")
+}
+
+riskset_audit <- tibble::tibble(
+  definition = c(
+    "exact-wave status=single",
+    "single + valid NCRR1",
+    "single + NCRR1=YES (steady non-resident partner)",
+    "PRIMARY clean-unpartnered: single + NCRR1=NO"
+  ),
+  landmarks = c(
+    sum(wave_panel$status == "single", na.rm = TRUE),
+    sum(wave_panel$status == "single" & wave_panel$ncrr1 %in% c(1L, 2L), na.rm = TRUE),
+    sum(wave_panel$status == "single" & wave_panel$ncrr1 == 1L, na.rm = TRUE),
+    nrow(formation_base)
+  ),
+  people = c(
+    dplyr::n_distinct(wave_panel$pidp_key[wave_panel$status == "single"]),
+    dplyr::n_distinct(wave_panel$pidp_key[
+      wave_panel$status == "single" & wave_panel$ncrr1 %in% c(1L, 2L)
+    ]),
+    dplyr::n_distinct(wave_panel$pidp_key[
+      wave_panel$status == "single" & wave_panel$ncrr1 == 1L
+    ]),
+    dplyr::n_distinct(formation_base$pidp_key)
+  )
+)
+write_csv_quiet(riskset_audit, "NCRR1_v3_formation_riskset_audit.csv")
+
+analytic_base_audit <- formation_base %>%
+  dplyr::summarise(
+    landmarks = dplyr::n(),
+    unique_people = dplyr::n_distinct(pidp_key),
+    min_wave = min(wave_num, na.rm = TRUE),
+    max_wave = max(wave_num, na.rm = TRUE),
+    min_interview_year = min(interview_year, na.rm = TRUE),
+    max_interview_year = max(interview_year, na.rm = TRUE),
+    life_satisfaction_observed = sum(is.finite(life_sat)),
+    ghq12_observed = sum(is.finite(ghq12))
+  )
+write_csv_quiet(analytic_base_audit, "NCRR1_v3_analytic_base_audit.csv")
+
+saveRDS(formation_base, FORMATION_BASE_RDS)
+
+output_check <- tibble::tibble(
+  file = c(
+    "NCRR1_v3_wave3plus_availability_and_code_audit.csv",
+    "NCRR1_v3_same_wave_alignment_audit.csv",
+    "NCRR1_v3_same_wave_month_mismatch_rows.csv",
+    "NCRR1_v3_exact_wave_single_refinement_audit.csv",
+    "NCRR1_v3_formation_riskset_audit.csv",
+    "NCRR1_v3_analytic_base_audit.csv",
+    "NCRR1_v3_formation_analytic_base.rds"
+  )
+) %>%
+  dplyr::mutate(exists = file.exists(file.path(OUT_DIR, file)))
+readr::write_csv(
+  output_check,
+  file.path(OUT_DIR, "NCRR1_v3_output_check.csv"),
+  na = "",
+  progress = FALSE
+)
+
+if (any(!output_check$exists)) {
+  stop(
+    "Preparation finished incompletely. Missing: ",
+    paste(output_check$file[!output_check$exists], collapse = ", ")
+  )
+}
+
+cat("\nClean-unpartnered selection base prepared successfully.\n")
+cat("Saved: ", FORMATION_BASE_RDS, "\n", sep = "")
+################################################################################

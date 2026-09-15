@@ -1,0 +1,1836 @@
+################################################################################
+# UKHLS WAVES 3-15
+# INCIDENT STEADY NON-RESIDENTIAL (LAT) RELATIONSHIP FORMATION
+# PSYCHOLOGICAL TRAJECTORIES BEFORE AND ACROSS RELATIONSHIP FORMATION
+#
+# COMPLEMENTARY / EXPLORATORY ANALYSIS FOR THE
+# SELECTION - DIFFERENTIATION - DEVELOPMENT - SORTING FRAMEWORK
+#
+# PURPOSE
+# -------
+# This workflow addresses a temporal gap left by the cohabitation-duration
+# analyses. It asks whether psychological functioning changes BEFORE formation
+# of a steady non-residential relationship and/or ACROSS formation of that
+# relationship.
+#
+# It estimates two distinct quantities:
+#
+#   1. ABSOLUTE WITHIN-PERSON CHANGE among incident LAT formers.
+#      This directly answers whether future relationship formers themselves
+#      improve, remain stable, or deteriorate.
+#
+#   2. MATCHED DIFFERENTIAL CHANGE relative to contemporaneous respondents who
+#      are observed as single and without a steady non-residential partner over
+#      the corresponding risk interval.
+#
+# The workflow deliberately keeps these quantities separate. A favorable
+# treated-control difference can arise from improvement among treated people,
+# deterioration among controls, or both.
+#
+# INFERENTIAL STATUS
+# ------------------
+# These analyses are complementary/exploratory. They were motivated by the
+# pattern observed in the current study and MUST NOT be described as part of
+# the original confirmatory marriage-proximity hypothesis family. They can
+# clarify the mechanism/timing underlying the framework but cannot rescue a
+# nonsignificant confirmatory result.
+#
+# PRIMARY INCIDENT-LAT EVENT DEFINITION
+# -------------------------------------
+# A respondent must have two consecutive VALID NCRR1 observations such that:
+#
+#   prior valid observation:  status == "single" AND NCRR1 == 2
+#                             (no steady non-resident partner)
+#   current valid observation: status == "single" AND NCRR1 == 1
+#                             (steady non-resident partner)
+#
+# At the first positive NCRR1 observation, the reported relationship start
+# month/year (NCRRM/NCRRY4) must:
+#
+#   - be valid;
+#   - occur AFTER the prior NCRR1=2 interview;
+#   - occur ON OR BEFORE the first NCRR1=1 interview;
+#   - be no more than 12 months after the prior unpartnered interview;
+#   - be no more than 12 months before the first positive interview;
+#   - and the two valid NCRR1 interviews must be no more than 18 months apart.
+#
+# These rules identify a clean interval in which an incident steady LAT
+# relationship is reported to have started between an observed unpartnered
+# interview and an observed partnered interview.
+#
+# PRIMARY TEMPORAL LANDMARKS
+# --------------------------
+#   pre25_36          = closest psychological observation 25-36 months before
+#                       the reported LAT relationship start
+#   pre13_24          = closest psychological observation 13-24 months before
+#                       the reported LAT relationship start
+#   last_unpartnered  = the exact prior interview with single + NCRR1=2;
+#                       by design 1-12 months before reported relationship start
+#   first_LAT         = the exact first positive NCRR1 interview;
+#                       by design 0-12 months after reported relationship start
+#
+# KEY CONTRASTS
+# -------------
+# A. PRE-FORMATION CHANGE:
+#      pre25_36 -> last_unpartnered
+#    Tests whether future LAT formers were already improving before the reported
+#    relationship began. A favorable absolute change is consistent with dynamic
+#    psychological selection, but is not causal evidence.
+#
+# B. FORMATION-ASSOCIATED CHANGE:
+#      last_unpartnered -> first_LAT
+#    Tests whether psychological functioning changes as an incident steady LAT
+#    relationship forms. A favorable absolute and relative change is consistent
+#    with an early relationship-formation gain.
+#
+# C. TOTAL EXTENDED CHANGE:
+#      pre25_36 -> first_LAT
+#    Describes the combined longer trajectory.
+#
+# CONTROL DESIGN
+# --------------
+# PRIMARY matched controls are NOT required to remain unpartnered indefinitely.
+# For each treated event they must:
+#
+#   - be single + NCRR1=2 at a comparable baseline interview;
+#   - be observed single + NCRR1=2 again at the treated event's positive wave;
+#   - have no observed steady-partner or co-residential/formal transition
+#     between those two observations;
+#   - have no later reported LAT start date indicating that a relationship
+#     actually began before that control follow-up interview.
+#
+# Matching uses exact baseline UKHLS wave, exact baseline interview year, exact
+# sex, age +/- 1 year, and baseline interview month within +/- 3 months.
+# The control pseudo-event month preserves the treated person's elapsed months
+# from baseline interview to reported relationship start.
+#
+# Controls may form relationships AFTER the matched follow-up observation. This
+# avoids defining the primary comparison group by future never-partnered status.
+#
+# STABLE-UNPARTNERED SENSITIVITY
+# ------------------------------
+# A secondary descriptive sensitivity restricts controls to those with observed
+# unpartnered follow-up through 24 months after the pseudo-event. This is useful
+# substantively but explicitly conditions on future relationship history and is
+# therefore NOT the primary counterfactual.
+#
+# FIRST-LIKE HISTORY SENSITIVITY
+# ------------------------------
+# A second sensitivity restricts BOTH treated respondents and controls to
+# baselines with no prior observed partnership of any type and no known dated
+# PHISTORY co-residential/formal union beginning on/before baseline. Undated
+# PHISTORY spells do not exclude observations because their temporal position is
+# unknown.
+#
+# OUTCOMES
+# --------
+# life_sat : higher = better
+# ghq_wb   : reverse of GHQ-12 distress, ghq_wb = -ghq12; higher = better
+#
+# Thus, positive changes consistently indicate more favorable psychological
+# functioning in this workflow.
+################################################################################
+
+
+# =============================================================================
+# 0. PACKAGES
+# =============================================================================
+
+required_packages <- c(
+  "haven", "dplyr", "tidyr", "purrr", "tibble", "readr",
+  "stringr", "ggplot2", "fixest"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install these package(s) before running the workflow: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(haven)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(fixest)
+
+fixest::setFixest_nthreads(max(1L, parallel::detectCores() - 1L))
+
+
+# =============================================================================
+# 1. PATHS AND USER OPTIONS
+# =============================================================================
+
+ukhls_dir <- "D:/Documenti/psicologia/big data/Understanding Society+BHPS/UKDA-6614-stata/stata/stata14_se/ukhls"
+common_stata_dir <- dirname(ukhls_dir)
+
+diagnostic_dir <- file.path(common_stata_dir, "first_marriage_Tminus5_T0_diagnostic")
+timing_dir <- file.path(common_stata_dir, "first_marriage_calendar_timing_diagnostic")
+phistory_validation_dir <- file.path(common_stata_dir, "first_marriage_phistory_validation")
+
+results_dir <- file.path(
+  common_stata_dir,
+  "incident_LAT_psychological_trajectory_v1"
+)
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+input_paths <- c(
+  combined_wave = file.path(diagnostic_dir, "combined_person_wave_panel.rds"),
+  timing_wave = file.path(timing_dir, "combined_interview_timing_panel.rds"),
+  phistory_long = file.path(phistory_validation_dir, "phistory_long_clean.rds")
+)
+
+missing_inputs <- input_paths[!file.exists(input_paths)]
+if (length(missing_inputs) > 0L) {
+  stop(
+    "Missing required upstream file(s):\n",
+    paste(missing_inputs, collapse = "\n"),
+    "\nRun the finalized person-wave/timing/PHISTORY workflows first."
+  )
+}
+
+UKHLS_WAVES <- 3L:15L
+UKHLS_PREFIX <- letters[UKHLS_WAVES]  # c ... o
+
+MIN_AGE <- 18
+MAX_AGE <- 100
+
+# Clean incident-event timing rules.
+MAX_NEGATIVE_TO_POSITIVE_MONTHS <- 18L
+MAX_NEGATIVE_TO_EVENT_MONTHS <- 12L
+MAX_EVENT_TO_POSITIVE_MONTHS <- 12L
+
+# Matching rules.
+MATCH_AGE_CALIPER <- 1
+MATCH_BASELINE_MONTH_CALIPER <- 3L
+MATCH_FOLLOWUP_INTERVAL_CALIPER <- 3L
+MIN_CONTROLS_PER_SET <- 5L
+
+# Stable-unpartnered sensitivity.
+STABLE_UNPARTNERED_HORIZON_MONTHS <- 24L
+
+# Analysis switches.
+RUN_STABLE_UNPARTNERED_SENSITIVITY <- TRUE
+RUN_FIRSTLIKE_HISTORY_SENSITIVITY <- TRUE
+MAKE_PLOTS <- TRUE
+SAVE_ANALYTIC_RDS <- TRUE
+
+# Pre-event bins. T-1 and T0 are exact observed transition-bracketing interviews
+# and therefore are not selected from these windows.
+PRE_WINDOWS <- tribble(
+  ~period,    ~lower_month, ~upper_month, ~target_month,
+  "pre25_36", -36L,         -25L,         -30.5,
+  "pre13_24", -24L,         -13L,         -18.5
+)
+
+PERIOD_ORDER <- c("pre25_36", "pre13_24", "last_unpartnered", "first_LAT")
+
+KEY_CONTRASTS <- tribble(
+  ~contrast, ~period0, ~period1, ~interpretation,
+  "preformation_25_36_to_last_unpartnered",
+  "pre25_36", "last_unpartnered",
+  "Within-person / differential change before reported LAT formation",
+
+  "formation_last_unpartnered_to_first_LAT",
+  "last_unpartnered", "first_LAT",
+  "Within-person / differential change across incident LAT formation",
+
+  "extended_25_36_to_first_LAT",
+  "pre25_36", "first_LAT",
+  "Extended change from 25-36 months before formation to first LAT observation"
+)
+
+
+# =============================================================================
+# 2. HELPERS
+# =============================================================================
+
+normalize_pidp_key <- function(x) {
+  z <- x
+  if (
+    inherits(z, "haven_labelled") ||
+      inherits(z, "labelled") ||
+      inherits(z, "haven_labelled_spss")
+  ) z <- unclass(z)
+  if (is.factor(z)) z <- as.character(z)
+  if (is.numeric(z) || is.integer(z)) {
+    out <- ifelse(
+      is.na(z), NA_character_,
+      format(z, scientific = FALSE, trim = TRUE, digits = 22)
+    )
+    out <- sub("\\.0+$", "", out)
+    return(out)
+  }
+  out <- trimws(as.character(z))
+  out[out %in% c("", "NA", "NaN")] <- NA_character_
+  sub("\\.0+$", "", out)
+}
+
+as_numeric_clean <- function(x) {
+  z <- x
+  if (
+    inherits(z, "haven_labelled") ||
+      inherits(z, "labelled") ||
+      inherits(z, "haven_labelled_spss")
+  ) z <- unclass(z)
+  if (is.factor(z)) z <- as.character(z)
+  suppressWarnings(as.numeric(z))
+}
+
+stata_month_from_year_month <- function(year, month_num) {
+  y <- suppressWarnings(as.integer(year))
+  m <- suppressWarnings(as.integer(month_num))
+  ifelse(
+    is.na(y) | is.na(m) | m < 1L | m > 12L,
+    NA_integer_,
+    as.integer((y - 1960L) * 12L + (m - 1L))
+  )
+}
+
+stata_month_to_year <- function(m) {
+  ifelse(is.na(m), NA_integer_, as.integer(1960L + floor(m / 12)))
+}
+
+stata_month_to_monthnum <- function(m) {
+  ifelse(is.na(m), NA_integer_, as.integer((m %% 12L) + 1L))
+}
+
+pick_existing_name <- function(all_names, candidates, label, file_path) {
+  hit <- candidates[candidates %in% all_names]
+  if (length(hit) == 0L) {
+    stop(
+      "Could not find ", label, " in ", basename(file_path), ". Tried: ",
+      paste(candidates, collapse = ", ")
+    )
+  }
+  hit[[1L]]
+}
+
+pick_optional_name <- function(all_names, candidates) {
+  hit <- candidates[candidates %in% all_names]
+  if (length(hit) == 0L) NA_character_ else hit[[1L]]
+}
+
+first_future_from_candidate <- function(candidate) {
+  dplyr::lead(rev(cummin(rev(candidate))), default = Inf)
+}
+
+normal_ci <- function(est, se, level = 0.95) {
+  crit <- qnorm(1 - (1 - level) / 2)
+  c(est - crit * se, est + crit * se)
+}
+
+safe_sd <- function(x) {
+  z <- suppressWarnings(as.numeric(x))
+  z <- z[is.finite(z)]
+  if (length(z) < 2L) return(NA_real_)
+  s <- sd(z)
+  if (!is.finite(s) || s <= 0) NA_real_ else s
+}
+
+safe_weighted_mean <- function(x, w) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  weighted.mean(x[ok], w[ok])
+}
+
+write_csv_quiet <- function(x, filename) {
+  readr::write_csv(x, file.path(results_dir, filename))
+}
+
+
+# =============================================================================
+# 3. READ NCRR1 + REPORTED LAT START MONTH/YEAR FROM EACH UKHLS WAVE
+# =============================================================================
+
+read_ncrr_wave <- function(wave_num, prefix) {
+  file_path <- file.path(ukhls_dir, paste0(prefix, "_indresp.dta"))
+  if (!file.exists(file_path)) {
+    stop("Missing UKHLS INDRESP file for Wave ", wave_num, ": ", file_path)
+  }
+
+  header <- haven::read_dta(file_path, n_max = 0)
+  nm <- names(header)
+
+  pidp_nm <- pick_existing_name(
+    nm, c("pidp", paste0(prefix, "_pidp")), "pidp", file_path
+  )
+  ncrr1_nm <- pick_existing_name(
+    nm, c(paste0(prefix, "_ncrr1"), "ncrr1"), "NCRR1", file_path
+  )
+  inty_nm <- pick_existing_name(
+    nm, c(paste0(prefix, "_intdaty_dv"), "intdaty_dv"),
+    "interview year", file_path
+  )
+  intm_nm <- pick_existing_name(
+    nm, c(paste0(prefix, "_intdatm_dv"), "intdatm_dv"),
+    "interview month", file_path
+  )
+
+  ncrrm_nm <- pick_optional_name(
+    nm, c(paste0(prefix, "_ncrrm"), "ncrrm")
+  )
+  ncrry4_nm <- pick_optional_name(
+    nm, c(paste0(prefix, "_ncrry4"), "ncrry4")
+  )
+
+  selected <- unique(na.omit(c(
+    pidp_nm, ncrr1_nm, inty_nm, intm_nm, ncrrm_nm, ncrry4_nm
+  )))
+
+  dat <- haven::read_dta(file_path, col_select = dplyr::all_of(selected))
+
+  get_optional <- function(v) {
+    if (is.na(v) || !v %in% names(dat)) {
+      rep(NA_real_, nrow(dat))
+    } else {
+      as_numeric_clean(dat[[v]])
+    }
+  }
+
+  out <- tibble(
+    pidp_key = normalize_pidp_key(dat[[pidp_nm]]),
+    wave_num = as.integer(wave_num),
+    wave_prefix = prefix,
+    ncrr_year_raw = suppressWarnings(as.integer(as_numeric_clean(dat[[inty_nm]]))),
+    ncrr_month_raw = suppressWarnings(as.integer(as_numeric_clean(dat[[intm_nm]]))),
+    ncrr1_raw = suppressWarnings(as.integer(as_numeric_clean(dat[[ncrr1_nm]]))),
+    ncrrm_raw = suppressWarnings(as.integer(get_optional(ncrrm_nm))),
+    ncrry4_raw = suppressWarnings(as.integer(get_optional(ncrry4_nm)))
+  ) |>
+    mutate(
+      ncrr_year_raw = if_else(
+        !is.na(ncrr_year_raw) & ncrr_year_raw >= 1900L & ncrr_year_raw <= 2100L,
+        ncrr_year_raw, NA_integer_
+      ),
+      ncrr_month_raw = if_else(
+        !is.na(ncrr_month_raw) & ncrr_month_raw >= 1L & ncrr_month_raw <= 12L,
+        ncrr_month_raw, NA_integer_
+      ),
+      ncrr1 = if_else(ncrr1_raw %in% c(1L, 2L), ncrr1_raw, NA_integer_),
+      ncrrm = if_else(
+        !is.na(ncrrm_raw) & ncrrm_raw >= 1L & ncrrm_raw <= 12L,
+        ncrrm_raw, NA_integer_
+      ),
+      ncrry4 = if_else(
+        !is.na(ncrry4_raw) & ncrry4_raw >= 1900L & ncrry4_raw <= 2100L,
+        ncrry4_raw, NA_integer_
+      ),
+      ncrr_month_index_raw = stata_month_from_year_month(ncrr_year_raw, ncrr_month_raw),
+      lat_start_month_index = stata_month_from_year_month(ncrry4, ncrrm)
+    )
+
+  out
+}
+
+ncrr_raw <- map2_dfr(UKHLS_WAVES, UKHLS_PREFIX, read_ncrr_wave) |>
+  filter(!is.na(pidp_key))
+
+if (anyDuplicated(ncrr_raw[c("pidp_key", "wave_num")]) > 0L) {
+  stop("NCRR extraction is not unique by pidp x wave.")
+}
+
+ncrr_availability_audit <- ncrr_raw |>
+  group_by(wave_num, wave_prefix) |>
+  summarise(
+    rows = n(),
+    valid_ncrr1 = sum(ncrr1 %in% c(1L, 2L), na.rm = TRUE),
+    ncrr1_yes = sum(ncrr1 == 1L, na.rm = TRUE),
+    ncrr1_no = sum(ncrr1 == 2L, na.rm = TRUE),
+    positive_with_valid_reported_start = sum(
+      ncrr1 == 1L & !is.na(lat_start_month_index), na.rm = TRUE
+    ),
+    pct_positive_with_valid_reported_start = if_else(
+      ncrr1_yes > 0,
+      100 * positive_with_valid_reported_start / ncrr1_yes,
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+write_csv_quiet(ncrr_availability_audit, "01_NCRR_LAT_start_availability_by_wave.csv")
+
+
+# =============================================================================
+# 4. READ SAME-WAVE PSYCHOLOGY / STATUS / INTERVIEW TIMING
+# =============================================================================
+
+combined_raw <- readRDS(input_paths[["combined_wave"]])
+timing_raw <- readRDS(input_paths[["timing_wave"]])
+
+required_combined <- c(
+  "pidp", "survey", "wave_num", "status", "ghq12", "life_sat", "age", "sex"
+)
+required_timing <- c(
+  "pidp", "survey", "wave_num", "interview_year", "interview_month"
+)
+
+miss_combined <- setdiff(required_combined, names(combined_raw))
+miss_timing <- setdiff(required_timing, names(timing_raw))
+if (length(miss_combined) > 0L) {
+  stop("combined_person_wave_panel.rds missing: ", paste(miss_combined, collapse = ", "))
+}
+if (length(miss_timing) > 0L) {
+  stop("combined_interview_timing_panel.rds missing: ", paste(miss_timing, collapse = ", "))
+}
+
+combined <- combined_raw |>
+  transmute(
+    pidp_key = normalize_pidp_key(pidp),
+    survey = as.character(survey),
+    wave_num = suppressWarnings(as.integer(wave_num)),
+    status = as.character(status),
+    ghq12 = suppressWarnings(as.numeric(ghq12)),
+    life_sat = suppressWarnings(as.numeric(life_sat)),
+    age = suppressWarnings(as.numeric(age)),
+    sex = as.character(sex)
+  ) |>
+  filter(
+    survey == "UKHLS",
+    wave_num %in% UKHLS_WAVES,
+    !is.na(pidp_key)
+  )
+
+timing <- timing_raw |>
+  transmute(
+    pidp_key = normalize_pidp_key(pidp),
+    survey = as.character(survey),
+    wave_num = suppressWarnings(as.integer(wave_num)),
+    interview_year = suppressWarnings(as.integer(interview_year)),
+    interview_month = suppressWarnings(as.integer(interview_month))
+  ) |>
+  filter(
+    survey == "UKHLS",
+    wave_num %in% UKHLS_WAVES,
+    !is.na(pidp_key)
+  )
+
+if (anyDuplicated(combined[c("pidp_key", "wave_num")]) > 0L) {
+  stop("Combined UKHLS person-wave panel is not unique by pidp x wave.")
+}
+if (anyDuplicated(timing[c("pidp_key", "wave_num")]) > 0L) {
+  stop("UKHLS timing panel is not unique by pidp x wave.")
+}
+
+wave_panel <- combined |>
+  left_join(
+    timing |> select(-survey),
+    by = c("pidp_key", "wave_num"),
+    relationship = "one-to-one"
+  ) |>
+  left_join(
+    ncrr_raw |>
+      select(
+        pidp_key, wave_num, wave_prefix,
+        ncrr_year_raw, ncrr_month_raw, ncrr_month_index_raw,
+        ncrr1_raw, ncrr1, ncrrm, ncrry4, lat_start_month_index
+      ),
+    by = c("pidp_key", "wave_num"),
+    relationship = "one-to-one"
+  ) |>
+  mutate(
+    interview_month_index = stata_month_from_year_month(interview_year, interview_month),
+    ghq12 = if_else(ghq12 >= 0 & ghq12 <= 36, ghq12, NA_real_),
+    life_sat = if_else(life_sat >= 1 & life_sat <= 7, life_sat, NA_real_),
+    ghq_wb = -ghq12
+  ) |>
+  filter(
+    !is.na(interview_month_index),
+    !is.na(age), age >= MIN_AGE, age <= MAX_AGE,
+    !is.na(sex)
+  )
+
+# Same-interview timing consistency check, inherited from the existing NCRR1 V3 logic.
+same_wave_timing_audit <- wave_panel |>
+  summarise(
+    rows = n(),
+    rows_with_both_month_sources = sum(
+      !is.na(interview_month_index) & !is.na(ncrr_month_index_raw)
+    ),
+    exact_month_matches = sum(
+      !is.na(interview_month_index) & !is.na(ncrr_month_index_raw) &
+        interview_month_index == ncrr_month_index_raw
+    ),
+    month_mismatches = sum(
+      !is.na(interview_month_index) & !is.na(ncrr_month_index_raw) &
+        interview_month_index != ncrr_month_index_raw
+    )
+  )
+write_csv_quiet(same_wave_timing_audit, "02_same_wave_timing_audit.csv")
+
+# Conservative exclusion only when the two sources disagree about the same interview month.
+wave_panel <- wave_panel |>
+  filter(
+    is.na(ncrr_month_index_raw) |
+      interview_month_index == ncrr_month_index_raw
+  )
+
+
+# =============================================================================
+# 5. PHISTORY FLAGS FOR FIRST-LIKE SENSITIVITY
+# =============================================================================
+
+phistory_raw <- readRDS(input_paths[["phistory_long"]])
+required_phistory <- c("pidp", "status", "starty", "startm")
+missing_phistory <- setdiff(required_phistory, names(phistory_raw))
+if (length(missing_phistory) > 0L) {
+  stop("PHISTORY missing: ", paste(missing_phistory, collapse = ", "))
+}
+
+phistory <- phistory_raw |>
+  mutate(
+    pidp_key = normalize_pidp_key(pidp),
+    status_num = suppressWarnings(as.integer(as_numeric_clean(status))),
+    start_year = suppressWarnings(as.integer(as_numeric_clean(starty))),
+    start_month_num = suppressWarnings(as.integer(as_numeric_clean(startm))),
+    start_year = if_else(
+      !is.na(start_year) & start_year >= 1900L & start_year <= 2100L,
+      start_year, NA_integer_
+    ),
+    start_month_num = if_else(
+      !is.na(start_month_num) & start_month_num >= 1L & start_month_num <= 12L,
+      start_month_num, NA_integer_
+    ),
+    start_month_index = stata_month_from_year_month(start_year, start_month_num)
+  )
+
+phistory_flags <- phistory |>
+  group_by(pidp_key) |>
+  summarise(
+    has_undated_relevant_spell = any(
+      status_num %in% c(2L, 3L, 10L) & is.na(start_month_index), na.rm = TRUE
+    ),
+    first_known_union_month = {
+      z <- start_month_index[
+        status_num %in% c(2L, 3L, 10L) & !is.na(start_month_index)
+      ]
+      if (length(z) == 0L) NA_real_ else min(z)
+    },
+    .groups = "drop"
+  )
+
+
+# =============================================================================
+# 6. PANEL HISTORY AND FUTURE-EVENT FEATURES
+# =============================================================================
+
+person_followup <- wave_panel |>
+  group_by(pidp_key) |>
+  summarise(
+    last_panel_month = max(interview_month_index, na.rm = TRUE),
+    last_valid_ncrr_month = {
+      z <- interview_month_index[ncrr1 %in% c(1L, 2L)]
+      if (length(z) == 0L) NA_real_ else max(z)
+    },
+    .groups = "drop"
+  )
+
+panel_features <- wave_panel |>
+  arrange(pidp_key, interview_month_index, wave_num) |>
+  group_by(pidp_key) |>
+  mutate(
+    prior_observed_household_or_formal = lag(
+      cumsum(coalesce(
+        status %in% c("cohab", "married", "civil_partner", "other"), FALSE
+      )) > 0L,
+      default = FALSE
+    ),
+    prior_observed_lat = lag(
+      cumsum(coalesce(ncrr1 == 1L, FALSE)) > 0L,
+      default = FALSE
+    ),
+
+    .cand_lat_detection = if_else(
+      coalesce(ncrr1 == 1L, FALSE),
+      as.numeric(interview_month_index), Inf
+    ),
+    .cand_lat_reported_start = if_else(
+      coalesce(ncrr1 == 1L, FALSE) & !is.na(lat_start_month_index),
+      as.numeric(lat_start_month_index), Inf
+    ),
+    .cand_coresident = if_else(
+      status %in% c("cohab", "married", "civil_partner"),
+      as.numeric(interview_month_index), Inf
+    ),
+    .cand_non_single = if_else(
+      !is.na(status) & status != "single",
+      as.numeric(interview_month_index), Inf
+    ),
+
+    first_future_lat_detection_month = first_future_from_candidate(.cand_lat_detection),
+    first_future_lat_reported_start_month = first_future_from_candidate(.cand_lat_reported_start),
+    first_future_coresident_month = first_future_from_candidate(.cand_coresident),
+    first_future_non_single_month = first_future_from_candidate(.cand_non_single)
+  ) |>
+  ungroup() |>
+  mutate(
+    across(
+      c(
+        first_future_lat_detection_month,
+        first_future_lat_reported_start_month,
+        first_future_coresident_month,
+        first_future_non_single_month
+      ),
+      ~ if_else(is.infinite(.x), NA_real_, .x)
+    ),
+    first_future_any_partner_detection_month = pmin(
+      first_future_lat_detection_month,
+      first_future_coresident_month,
+      na.rm = TRUE
+    ),
+    first_future_any_partner_detection_month = if_else(
+      is.infinite(first_future_any_partner_detection_month),
+      NA_real_, first_future_any_partner_detection_month
+    )
+  ) |>
+  select(-starts_with(".cand_")) |>
+  left_join(person_followup, by = "pidp_key", relationship = "many-to-one") |>
+  left_join(phistory_flags, by = "pidp_key", relationship = "many-to-one") |>
+  mutate(
+    has_undated_relevant_spell = coalesce(has_undated_relevant_spell, FALSE),
+    known_dated_prior_union =
+      !is.na(first_known_union_month) &
+      first_known_union_month <= interview_month_index,
+    no_prior_observed_any_partnership =
+      !prior_observed_household_or_formal & !prior_observed_lat,
+    no_known_prior_union_and_no_prior_LAT =
+      !prior_observed_household_or_formal &
+      !prior_observed_lat &
+      !known_dated_prior_union
+  )
+
+
+# =============================================================================
+# 7. IDENTIFY CLEAN INCIDENT LAT FORMATIONS
+# =============================================================================
+
+# Restrict sequence calculations to interviews at which NCRR1 has a valid 1/2 response.
+valid_ncrr_sequence <- panel_features |>
+  filter(ncrr1 %in% c(1L, 2L)) |>
+  arrange(pidp_key, interview_month_index, wave_num) |>
+  group_by(pidp_key) |>
+  mutate(
+    prev_valid_ncrr1 = lag(ncrr1),
+    prev_valid_wave = lag(wave_num),
+    prev_valid_month = lag(interview_month_index),
+    prev_valid_year = lag(interview_year),
+    prev_valid_monthnum = lag(interview_month),
+    prev_valid_status = lag(status),
+    prev_valid_age = lag(age),
+    prev_valid_sex = lag(sex),
+    prev_no_prior_observed_any_partnership = lag(no_prior_observed_any_partnership),
+    prev_known_dated_prior_union = lag(known_dated_prior_union),
+    prev_no_known_prior_union_and_no_prior_LAT = lag(no_known_prior_union_and_no_prior_LAT),
+    prev_first_future_any_partner_detection_month =
+      lag(first_future_any_partner_detection_month)
+  ) |>
+  ungroup()
+
+incident_candidates <- valid_ncrr_sequence |>
+  filter(ncrr1 == 1L, prev_valid_ncrr1 == 2L) |>
+  mutate(
+    baseline_to_positive_months = interview_month_index - prev_valid_month,
+    baseline_to_event_months = lat_start_month_index - prev_valid_month,
+    event_to_positive_months = interview_month_index - lat_start_month_index,
+
+    timing_reason = case_when(
+      status != "single" ~ "positive NCRR1 interview not single",
+      prev_valid_status != "single" ~ "prior NCRR1=2 interview not single",
+      is.na(lat_start_month_index) ~ "reported LAT start month/year missing or invalid",
+      is.na(prev_valid_month) ~ "prior valid NCRR1 interview timing missing",
+      baseline_to_positive_months <= 0 ~ "nonpositive prior-to-current interval",
+      baseline_to_positive_months > MAX_NEGATIVE_TO_POSITIVE_MONTHS ~
+        "prior NCRR1=2 to first NCRR1=1 interval > allowed maximum",
+      !is.na(prev_first_future_any_partner_detection_month) &
+        prev_first_future_any_partner_detection_month < interview_month_index ~
+        "another observed partner/co-residential state occurs between bracketing interviews",
+      baseline_to_event_months <= 0 ~
+        "reported LAT start not after prior NCRR1=2 interview",
+      baseline_to_event_months > MAX_NEGATIVE_TO_EVENT_MONTHS ~
+        "reported LAT start > 12 months after prior unpartnered interview",
+      event_to_positive_months < 0 ~
+        "reported LAT start after first positive NCRR1 interview",
+      event_to_positive_months > MAX_EVENT_TO_POSITIVE_MONTHS ~
+        "first positive NCRR1 interview > 12 months after reported LAT start",
+      TRUE ~ "PRIMARY_ELIGIBLE"
+    ),
+    primary_eligible = timing_reason == "PRIMARY_ELIGIBLE"
+  )
+
+incident_timing_audit <- incident_candidates |>
+  count(timing_reason, name = "candidate_transitions") |>
+  arrange(desc(candidate_transitions))
+write_csv_quiet(incident_timing_audit, "03_incident_LAT_timing_audit.csv")
+
+write_csv_quiet(
+  incident_candidates |>
+    select(
+      pidp_key, prev_valid_wave, wave_num,
+      prev_valid_year, prev_valid_monthnum,
+      interview_year, interview_month,
+      lat_start_month_index,
+      baseline_to_positive_months,
+      baseline_to_event_months, event_to_positive_months,
+      status, prev_valid_status,
+      timing_reason, primary_eligible
+    ),
+  "04_incident_LAT_candidate_rows.csv"
+)
+
+# Primary analysis uses the first CLEAN incident LAT formation observed for each respondent.
+primary_treated <- incident_candidates |>
+  filter(primary_eligible) |>
+  arrange(pidp_key, lat_start_month_index, wave_num) |>
+  group_by(pidp_key) |>
+  slice_head(n = 1L) |>
+  ungroup() |>
+  transmute(
+    match_set_id = paste0("LAT_", row_number()),
+    treated_pidp = pidp_key,
+    baseline_wave = prev_valid_wave,
+    positive_wave = wave_num,
+    baseline_month = prev_valid_month,
+    positive_month = interview_month_index,
+    event_month = lat_start_month_index,
+    baseline_year = prev_valid_year,
+    baseline_monthnum = prev_valid_monthnum,
+    treated_age = prev_valid_age,
+    treated_sex = prev_valid_sex,
+    baseline_to_positive_months,
+    event_offset_from_baseline = baseline_to_event_months,
+    event_to_positive_months,
+    baseline_no_prior_observed_any_partnership =
+      coalesce(prev_no_prior_observed_any_partnership, FALSE),
+    baseline_known_dated_prior_union =
+      coalesce(prev_known_dated_prior_union, FALSE),
+    baseline_no_known_prior_union_and_no_prior_LAT =
+      coalesce(prev_no_known_prior_union_and_no_prior_LAT, FALSE)
+  )
+
+if (nrow(primary_treated) == 0L) {
+  stop("No primary clean incident LAT formations were identified.")
+}
+
+primary_treated_audit <- primary_treated |>
+  summarise(
+    treated_events = n(),
+    treated_people = n_distinct(treated_pidp),
+    median_baseline_to_event_months = median(event_offset_from_baseline, na.rm = TRUE),
+    median_event_to_positive_months = median(event_to_positive_months, na.rm = TRUE),
+    median_baseline_to_positive_months = median(baseline_to_positive_months, na.rm = TRUE),
+    firstlike_no_prior_observed_partner = sum(
+      baseline_no_prior_observed_any_partnership, na.rm = TRUE
+    ),
+    firstlike_no_known_prior_union_or_LAT = sum(
+      baseline_no_known_prior_union_and_no_prior_LAT, na.rm = TRUE
+    )
+  )
+write_csv_quiet(primary_treated_audit, "05_primary_treated_event_audit.csv")
+
+
+# =============================================================================
+# 8. BUILD TREATED-SPECIFIC RISK-SET MATCHES
+# =============================================================================
+
+control_baselines_all <- panel_features |>
+  filter(status == "single", ncrr1 == 2L) |>
+  transmute(
+    control_pidp = pidp_key,
+    control_baseline_wave = wave_num,
+    control_baseline_year = interview_year,
+    control_baseline_monthnum = interview_month,
+    control_baseline_month = interview_month_index,
+    control_age = age,
+    control_sex = sex,
+    control_first_future_any_partner_detection_month =
+      first_future_any_partner_detection_month,
+    control_first_future_lat_reported_start_month =
+      first_future_lat_reported_start_month,
+    control_first_future_coresident_month = first_future_coresident_month,
+    control_first_future_non_single_month = first_future_non_single_month,
+    control_last_valid_ncrr_month = last_valid_ncrr_month,
+    control_no_prior_observed_any_partnership = no_prior_observed_any_partnership,
+    control_known_dated_prior_union = known_dated_prior_union,
+    control_no_known_prior_union_and_no_prior_LAT =
+      no_known_prior_union_and_no_prior_LAT
+  )
+
+followup_lookup <- panel_features |>
+  transmute(
+    control_pidp = pidp_key,
+    positive_wave = wave_num,
+    control_followup_month = interview_month_index,
+    control_followup_status = status,
+    control_followup_ncrr1 = ncrr1
+  )
+
+build_control_candidates <- function(
+    treated_events,
+    require_stable_24m = FALSE,
+    require_firstlike_history = FALSE
+) {
+  t <- treated_events
+
+  if (require_firstlike_history) {
+    t <- t |>
+      filter(baseline_no_known_prior_union_and_no_prior_LAT)
+  }
+
+  pool <- control_baselines_all
+  if (require_firstlike_history) {
+    pool <- pool |>
+      filter(control_no_known_prior_union_and_no_prior_LAT)
+  }
+
+  d <- t |>
+    inner_join(
+      pool,
+      by = c(
+        "baseline_wave" = "control_baseline_wave",
+        "baseline_year" = "control_baseline_year",
+        "treated_sex" = "control_sex"
+      ),
+      relationship = "many-to-many"
+    ) |>
+    filter(
+      control_pidp != treated_pidp,
+      abs(control_age - treated_age) <= MATCH_AGE_CALIPER,
+      abs(control_baseline_month - baseline_month) <= MATCH_BASELINE_MONTH_CALIPER
+    ) |>
+    left_join(
+      followup_lookup,
+      by = c("control_pidp", "positive_wave"),
+      relationship = "many-to-one"
+    ) |>
+    mutate(
+      control_followup_interval = control_followup_month - control_baseline_month,
+      control_pseudo_event_month =
+        control_baseline_month + event_offset_from_baseline,
+
+      control_no_observed_partner_through_followup =
+        is.na(control_first_future_any_partner_detection_month) |
+        control_first_future_any_partner_detection_month > control_followup_month,
+
+      # A later positive NCRR1 report can retrospectively date its relationship
+      # start before the matched follow-up. Exclude such controls because they
+      # may not truly have remained unpartnered through the comparison interval.
+      control_no_reported_LAT_start_through_followup =
+        is.na(control_first_future_lat_reported_start_month) |
+        control_first_future_lat_reported_start_month > control_followup_month,
+      control_remains_single_through_followup =
+        is.na(control_first_future_non_single_month) |
+        control_first_future_non_single_month > control_followup_month
+    ) |>
+    filter(
+      !is.na(control_followup_month),
+      control_followup_status == "single",
+      control_followup_ncrr1 == 2L,
+      control_followup_month > control_baseline_month,
+      abs(control_followup_interval - baseline_to_positive_months) <=
+        MATCH_FOLLOWUP_INTERVAL_CALIPER,
+      control_pseudo_event_month > control_baseline_month,
+      control_pseudo_event_month <= control_followup_month,
+      control_no_observed_partner_through_followup,
+      control_no_reported_LAT_start_through_followup,
+      control_remains_single_through_followup
+    )
+
+  if (require_stable_24m) {
+    d <- d |>
+      mutate(
+        stable_target_month =
+          control_pseudo_event_month + STABLE_UNPARTNERED_HORIZON_MONTHS,
+        stable_followup_observed =
+          !is.na(control_last_valid_ncrr_month) &
+          control_last_valid_ncrr_month >= stable_target_month,
+        no_observed_partner_through_stable_horizon =
+          is.na(control_first_future_any_partner_detection_month) |
+          control_first_future_any_partner_detection_month > stable_target_month,
+        no_reported_LAT_start_through_stable_horizon =
+          is.na(control_first_future_lat_reported_start_month) |
+          control_first_future_lat_reported_start_month > stable_target_month,
+        no_coresident_detection_through_stable_horizon =
+          is.na(control_first_future_coresident_month) |
+          control_first_future_coresident_month > stable_target_month,
+        remains_single_through_stable_horizon =
+          is.na(control_first_future_non_single_month) |
+          control_first_future_non_single_month > stable_target_month
+      ) |>
+      filter(
+        stable_followup_observed,
+        no_observed_partner_through_stable_horizon,
+        no_reported_LAT_start_through_stable_horizon,
+        no_coresident_detection_through_stable_horizon,
+        remains_single_through_stable_horizon
+      )
+  }
+
+  d <- d |>
+    distinct(match_set_id, control_pidp, .keep_all = TRUE) |>
+    group_by(match_set_id) |>
+    mutate(n_controls = n()) |>
+    ungroup() |>
+    filter(n_controls >= MIN_CONTROLS_PER_SET)
+
+  d
+}
+
+make_match_index <- function(control_candidates, treated_events, analysis_label) {
+  retained_sets <- control_candidates |>
+    distinct(match_set_id)
+
+  t <- treated_events |>
+    semi_join(retained_sets, by = "match_set_id") |>
+    transmute(
+      analysis_label = analysis_label,
+      match_set_id,
+      unit_pidp = treated_pidp,
+      condition = "treated",
+      event_month,
+      baseline_wave,
+      endpoint_wave = positive_wave,
+      baseline_month,
+      endpoint_month = positive_month
+    )
+
+  c <- control_candidates |>
+    transmute(
+      analysis_label = analysis_label,
+      match_set_id,
+      unit_pidp = control_pidp,
+      condition = "unpartnered control",
+      event_month = control_pseudo_event_month,
+      baseline_wave,
+      endpoint_wave = positive_wave,
+      baseline_month = control_baseline_month,
+      endpoint_month = control_followup_month
+    )
+
+  bind_rows(t, c) |>
+    arrange(match_set_id, desc(condition == "treated"), unit_pidp)
+}
+
+primary_control_candidates <- build_control_candidates(
+  primary_treated,
+  require_stable_24m = FALSE,
+  require_firstlike_history = FALSE
+)
+primary_match_index <- make_match_index(
+  primary_control_candidates,
+  primary_treated,
+  "primary_risk_set_controls"
+)
+
+if (nrow(primary_match_index) == 0L) {
+  stop("Primary matching produced no retained matched sets.")
+}
+
+# Stable-unpartnered sensitivity: future-conditioned descriptive comparison.
+stable_match_index <- tibble()
+if (RUN_STABLE_UNPARTNERED_SENSITIVITY) {
+  stable_control_candidates <- build_control_candidates(
+    primary_treated,
+    require_stable_24m = TRUE,
+    require_firstlike_history = FALSE
+  )
+  stable_match_index <- make_match_index(
+    stable_control_candidates,
+    primary_treated,
+    "stable_unpartnered_24m_sensitivity"
+  )
+}
+
+# First-like history sensitivity: both treated and controls have no prior observed
+# partnership and no known dated co-residential/formal union before baseline.
+firstlike_match_index <- tibble()
+if (RUN_FIRSTLIKE_HISTORY_SENSITIVITY) {
+  firstlike_treated <- primary_treated |>
+    filter(baseline_no_known_prior_union_and_no_prior_LAT)
+
+  firstlike_control_candidates <- build_control_candidates(
+    firstlike_treated,
+    require_stable_24m = FALSE,
+    require_firstlike_history = TRUE
+  )
+  firstlike_match_index <- make_match_index(
+    firstlike_control_candidates,
+    firstlike_treated,
+    "firstlike_history_sensitivity"
+  )
+}
+
+match_summary_one <- function(idx) {
+  if (nrow(idx) == 0L) return(tibble())
+  idx |>
+    group_by(analysis_label) |>
+    summarise(
+      matched_sets = n_distinct(match_set_id),
+      treated_person_sets = sum(condition == "treated"),
+      control_person_sets = sum(condition == "unpartnered control"),
+      unique_treated_people = n_distinct(unit_pidp[condition == "treated"]),
+      unique_control_people = n_distinct(unit_pidp[condition == "unpartnered control"]),
+      median_controls_per_set = median(
+        as.numeric(table(match_set_id)[unique(match_set_id)] - 1L)
+      ),
+      .groups = "drop"
+    )
+}
+
+match_summary <- bind_rows(
+  match_summary_one(primary_match_index),
+  match_summary_one(stable_match_index),
+  match_summary_one(firstlike_match_index)
+)
+write_csv_quiet(match_summary, "06_matching_summary.csv")
+
+
+# =============================================================================
+# 9. CONSTRUCT EVENT-ALIGNED PSYCHOLOGICAL LANDMARKS
+# =============================================================================
+
+panel_for_stack <- panel_features |>
+  select(
+    pidp_key, wave_num, interview_month_index, interview_year, interview_month,
+    status, ncrr1, ghq12, ghq_wb, life_sat, age, sex
+  )
+
+build_event_stack <- function(match_index) {
+  if (nrow(match_index) == 0L) return(tibble())
+
+  joined <- match_index |>
+    inner_join(
+      panel_for_stack,
+      by = c("unit_pidp" = "pidp_key"),
+      relationship = "many-to-many"
+    ) |>
+    mutate(rel_month = interview_month_index - event_month)
+
+  # Select one observation in each distal pre-event window, closest to the
+  # midpoint of that window.
+  distal <- map_dfr(seq_len(nrow(PRE_WINDOWS)), function(i) {
+    w <- PRE_WINDOWS[i, ]
+    joined |>
+      filter(
+        rel_month >= w$lower_month,
+        rel_month <= w$upper_month
+      ) |>
+      mutate(
+        period = w$period,
+        distance_to_target = abs(rel_month - w$target_month)
+      ) |>
+      group_by(analysis_label, match_set_id, unit_pidp, condition) |>
+      arrange(distance_to_target, interview_month_index, .by_group = TRUE) |>
+      slice_head(n = 1L) |>
+      ungroup() |>
+      select(-distance_to_target)
+  })
+
+  # Exact last observed unpartnered interview.
+  last_unpartnered <- joined |>
+    filter(
+      wave_num == baseline_wave,
+      interview_month_index == baseline_month
+    ) |>
+    mutate(period = "last_unpartnered")
+
+  # Exact first observed steady LAT interview for treated respondents and the
+  # corresponding still-unpartnered follow-up wave for controls.
+  first_lat_or_control_followup <- joined |>
+    filter(
+      wave_num == endpoint_wave,
+      interview_month_index == endpoint_month
+    ) |>
+    mutate(period = "first_LAT")
+
+  bind_rows(distal, last_unpartnered, first_lat_or_control_followup) |>
+    mutate(
+      period = factor(period, levels = PERIOD_ORDER, ordered = TRUE)
+    ) |>
+    arrange(analysis_label, match_set_id, unit_pidp, period)
+}
+
+primary_stack <- build_event_stack(primary_match_index)
+stable_stack <- build_event_stack(stable_match_index)
+firstlike_stack <- build_event_stack(firstlike_match_index)
+
+# Treated-only stack is deliberately independent of successful matching.
+treated_only_index <- primary_treated |>
+  transmute(
+    analysis_label = "all_primary_treated_events",
+    match_set_id,
+    unit_pidp = treated_pidp,
+    condition = "treated",
+    event_month,
+    baseline_wave,
+    endpoint_wave = positive_wave,
+    baseline_month,
+    endpoint_month = positive_month
+  )
+treated_stack <- build_event_stack(treated_only_index)
+
+# Audit the observed relationship state at the distal pre-event landmarks.
+treated_distal_state_audit <- treated_stack |>
+  filter(period %in% c("pre25_36", "pre13_24")) |>
+  count(period, status, ncrr1, name = "n") |>
+  group_by(period) |>
+  mutate(percent = 100 * n / sum(n)) |>
+  ungroup()
+write_csv_quiet(
+  treated_distal_state_audit,
+  "07_treated_distal_relationship_state_audit.csv"
+)
+
+# Baseline SDs at the last unpartnered interview. These are used to standardize
+# all effect estimates so that absolute and relative results use one common scale.
+baseline_sds <- bind_rows(
+  treated_stack |>
+    filter(period == "last_unpartnered", !is.na(life_sat)) |>
+    summarise(
+      outcome = "life_sat",
+      baseline_sd = safe_sd(life_sat),
+      n = sum(!is.na(life_sat))
+    ),
+  treated_stack |>
+    filter(period == "last_unpartnered", !is.na(ghq_wb)) |>
+    summarise(
+      outcome = "ghq_wb",
+      baseline_sd = safe_sd(ghq_wb),
+      n = sum(!is.na(ghq_wb))
+    )
+)
+write_csv_quiet(baseline_sds, "08_last_unpartnered_baseline_SDs.csv")
+
+get_baseline_sd <- function(outcome) {
+  x <- baseline_sds$baseline_sd[baseline_sds$outcome == outcome]
+  if (length(x) != 1L || !is.finite(x)) return(NA_real_)
+  x
+}
+
+
+# =============================================================================
+# 10. ABSOLUTE WITHIN-PERSON CHANGE AMONG INCIDENT LAT FORMERS
+# =============================================================================
+
+absolute_paired_change <- function(stack, outcome, contrast_row) {
+  p0 <- contrast_row$period0[[1L]]
+  p1 <- contrast_row$period1[[1L]]
+  contrast_name <- contrast_row$contrast[[1L]]
+
+  d <- stack |>
+    filter(condition == "treated", period %in% c(p0, p1)) |>
+    mutate(y = .data[[outcome]]) |>
+    select(unit_pidp, period, y) |>
+    filter(!is.na(y)) |>
+    distinct(unit_pidp, period, .keep_all = TRUE) |>
+    pivot_wider(names_from = period, values_from = y)
+
+  if (!all(c(p0, p1) %in% names(d))) return(tibble())
+
+  d <- d |>
+    filter(!is.na(.data[[p0]]), !is.na(.data[[p1]])) |>
+    mutate(change = .data[[p1]] - .data[[p0]])
+
+  if (nrow(d) < 2L) return(tibble())
+
+  est <- mean(d$change)
+  se <- sd(d$change) / sqrt(nrow(d))
+  ci <- normal_ci(est, se)
+  sd0 <- get_baseline_sd(outcome)
+
+  tibble(
+    analysis = "absolute_within_person_treated",
+    outcome = outcome,
+    contrast = contrast_name,
+    period0 = p0,
+    period1 = p1,
+    n_people = nrow(d),
+    mean_period0 = mean(d[[p0]]),
+    mean_period1 = mean(d[[p1]]),
+    absolute_change = est,
+    std_error = se,
+    conf_low = ci[1],
+    conf_high = ci[2],
+    p_value = 2 * pnorm(abs(est / se), lower.tail = FALSE),
+    baseline_sd_last_unpartnered = sd0,
+    change_std = est / sd0,
+    conf_low_std = ci[1] / sd0,
+    conf_high_std = ci[2] / sd0
+  )
+}
+
+absolute_results <- map_dfr(c("life_sat", "ghq_wb"), function(outcome) {
+  map_dfr(seq_len(nrow(KEY_CONTRASTS)), function(i) {
+    absolute_paired_change(treated_stack, outcome, KEY_CONTRASTS[i, ])
+  })
+}) |>
+  group_by(contrast) |>
+  mutate(
+    p_holm_across_two_outcomes = p.adjust(p_value, method = "holm")
+  ) |>
+  ungroup()
+
+write_csv_quiet(
+  absolute_results,
+  "09_absolute_within_person_LAT_former_changes.csv"
+)
+
+
+# =============================================================================
+# 11. MATCHED TWO-PERIOD DIFFERENCE-IN-DIFFERENCES
+# =============================================================================
+
+prepare_matched_pair <- function(stack, outcome, p0, p1) {
+  d <- stack |>
+    filter(period %in% c(p0, p1)) |>
+    mutate(y = .data[[outcome]]) |>
+    filter(!is.na(y)) |>
+    select(
+      analysis_label, match_set_id, unit_pidp, condition,
+      period, y
+    ) |>
+    distinct(match_set_id, unit_pidp, period, .keep_all = TRUE)
+
+  eligible_units <- d |>
+    count(
+      analysis_label, match_set_id, unit_pidp, condition,
+      name = "n_periods"
+    ) |>
+    filter(n_periods == 2L)
+
+  set_eligibility <- eligible_units |>
+    group_by(analysis_label, match_set_id) |>
+    summarise(
+      treated_complete = any(condition == "treated"),
+      n_complete_controls = sum(condition == "unpartnered control"),
+      .groups = "drop"
+    ) |>
+    filter(treated_complete, n_complete_controls >= 1L)
+
+  d <- d |>
+    semi_join(
+      eligible_units,
+      by = c("analysis_label", "match_set_id", "unit_pidp", "condition")
+    ) |>
+    semi_join(
+      set_eligibility,
+      by = c("analysis_label", "match_set_id")
+    )
+
+  unit_weights <- d |>
+    distinct(analysis_label, match_set_id, unit_pidp, condition) |>
+    group_by(analysis_label, match_set_id) |>
+    mutate(
+      n_controls = sum(condition == "unpartnered control"),
+      analysis_weight = if_else(
+        condition == "treated", 1, 1 / n_controls
+      )
+    ) |>
+    ungroup() |>
+    select(
+      analysis_label, match_set_id, unit_pidp, condition,
+      n_controls, analysis_weight
+    )
+
+  d |>
+    left_join(
+      unit_weights,
+      by = c("analysis_label", "match_set_id", "unit_pidp", "condition"),
+      relationship = "many-to-one"
+    ) |>
+    mutate(
+      post = as.integer(as.character(period) == p1),
+      treated = as.integer(condition == "treated"),
+      treated_post = treated * post,
+      match_person_id = paste(match_set_id, unit_pidp, sep = "__pid__"),
+      match_time_id = paste(match_set_id, as.character(period), sep = "__period__")
+    )
+}
+
+fit_matched_did <- function(stack, outcome, contrast_row) {
+  p0 <- contrast_row$period0[[1L]]
+  p1 <- contrast_row$period1[[1L]]
+  contrast_name <- contrast_row$contrast[[1L]]
+
+  d <- prepare_matched_pair(stack, outcome, p0, p1)
+  if (nrow(d) == 0L) return(tibble())
+
+  if (length(unique(d$treated_post)) < 2L) return(tibble())
+
+  mod <- fixest::feols(
+    y ~ treated_post | match_person_id + match_time_id,
+    data = d,
+    weights = ~ analysis_weight,
+    vcov = ~ unit_pidp,
+    notes = TRUE
+  )
+
+  b <- coef(mod)
+  V <- vcov(mod)
+  if (!"treated_post" %in% names(b)) return(tibble())
+
+  est <- unname(b[["treated_post"]])
+  se <- sqrt(V["treated_post", "treated_post"])
+  ci <- normal_ci(est, se)
+  sd0 <- get_baseline_sd(outcome)
+
+  # Direct decomposition into weighted within-group change using exactly the
+  # paired person-sets entering the model.
+  deltas <- d |>
+    select(
+      analysis_label, match_set_id, unit_pidp, condition,
+      period, y, analysis_weight
+    ) |>
+    distinct() |>
+    pivot_wider(names_from = period, values_from = y) |>
+    mutate(delta = .data[[p1]] - .data[[p0]])
+
+  group_change <- deltas |>
+    group_by(condition) |>
+    summarise(
+      weighted_change = safe_weighted_mean(delta, analysis_weight),
+      n_person_sets = n(),
+      sum_weight = sum(analysis_weight),
+      .groups = "drop"
+    )
+
+  treated_change <- group_change$weighted_change[
+    group_change$condition == "treated"
+  ]
+  control_change <- group_change$weighted_change[
+    group_change$condition == "unpartnered control"
+  ]
+
+  tibble(
+    analysis_label = unique(d$analysis_label)[1],
+    outcome = outcome,
+    contrast = contrast_name,
+    period0 = p0,
+    period1 = p1,
+    matched_sets = n_distinct(d$match_set_id),
+    unique_treated_people = n_distinct(d$unit_pidp[d$condition == "treated"]),
+    unique_control_people = n_distinct(d$unit_pidp[d$condition == "unpartnered control"]),
+    treated_weighted_change = treated_change,
+    control_weighted_change = control_change,
+    did_estimate = est,
+    std_error = se,
+    conf_low = ci[1],
+    conf_high = ci[2],
+    p_value = 2 * pnorm(abs(est / se), lower.tail = FALSE),
+    baseline_sd_last_unpartnered = sd0,
+    did_std = est / sd0,
+    conf_low_std = ci[1] / sd0,
+    conf_high_std = ci[2] / sd0
+  )
+}
+
+run_matched_bundle <- function(stack) {
+  if (nrow(stack) == 0L) return(tibble())
+  map_dfr(c("life_sat", "ghq_wb"), function(outcome) {
+    map_dfr(seq_len(nrow(KEY_CONTRASTS)), function(i) {
+      fit_matched_did(stack, outcome, KEY_CONTRASTS[i, ])
+    })
+  }) |>
+    group_by(analysis_label, contrast) |>
+    mutate(
+      p_holm_across_two_outcomes = p.adjust(p_value, method = "holm")
+    ) |>
+    ungroup()
+}
+
+primary_did_results <- run_matched_bundle(primary_stack)
+stable_did_results <- run_matched_bundle(stable_stack)
+firstlike_did_results <- run_matched_bundle(firstlike_stack)
+
+all_did_results <- bind_rows(
+  primary_did_results,
+  stable_did_results,
+  firstlike_did_results
+)
+
+write_csv_quiet(
+  all_did_results,
+  "10_matched_LAT_formation_DID_results.csv"
+)
+
+
+# =============================================================================
+# 12. DESCRIPTIVE ABSOLUTE TRAJECTORIES AMONG TREATED RESPONDENTS
+# =============================================================================
+
+absolute_trajectory_descriptives <- bind_rows(
+  treated_stack |>
+    filter(!is.na(life_sat)) |>
+    group_by(period) |>
+    summarise(
+      outcome = "life_sat",
+      n = n(),
+      mean = mean(life_sat),
+      sd = sd(life_sat),
+      se = sd / sqrt(n),
+      .groups = "drop"
+    ),
+  treated_stack |>
+    filter(!is.na(ghq_wb)) |>
+    group_by(period) |>
+    summarise(
+      outcome = "ghq_wb",
+      n = n(),
+      mean = mean(ghq_wb),
+      sd = sd(ghq_wb),
+      se = sd / sqrt(n),
+      .groups = "drop"
+    )
+) |>
+  mutate(
+    period = factor(period, levels = PERIOD_ORDER, ordered = TRUE),
+    conf_low = mean - 1.96 * se,
+    conf_high = mean + 1.96 * se
+  )
+
+write_csv_quiet(
+  absolute_trajectory_descriptives,
+  "11_treated_absolute_trajectory_descriptives.csv"
+)
+
+
+# =============================================================================
+# 13. OPTIONAL GRAYSCALE PLOTS
+# =============================================================================
+
+if (MAKE_PLOTS) {
+  # Baseline-standardized treated-only trajectory. Positive = better functioning.
+  plot_rows <- treated_stack |>
+    select(unit_pidp, period, life_sat, ghq_wb) |>
+    pivot_longer(
+      cols = c(life_sat, ghq_wb),
+      names_to = "outcome",
+      values_to = "value"
+    ) |>
+    filter(!is.na(value)) |>
+    left_join(baseline_sds, by = "outcome", relationship = "many-to-one") |>
+    group_by(outcome) |>
+    mutate(
+      baseline_mean = mean(
+        value[period == "last_unpartnered"], na.rm = TRUE
+      )
+    ) |>
+    ungroup() |>
+    mutate(z_from_last_unpartnered_scale = (value - baseline_mean) / baseline_sd) |>
+    group_by(outcome, period) |>
+    summarise(
+      n = n(),
+      mean_z = mean(z_from_last_unpartnered_scale),
+      se_z = sd(z_from_last_unpartnered_scale) / sqrt(n),
+      .groups = "drop"
+    ) |>
+    mutate(
+      period = factor(period, levels = PERIOD_ORDER, ordered = TRUE),
+      conf_low = mean_z - 1.96 * se_z,
+      conf_high = mean_z + 1.96 * se_z,
+      outcome_label = case_when(
+        outcome == "life_sat" ~ "Life satisfaction",
+        outcome == "ghq_wb" ~ "GHQ psychological functioning",
+        TRUE ~ outcome
+      )
+    )
+
+  p1 <- ggplot(
+    plot_rows,
+    aes(x = period, y = mean_z, group = outcome_label, linetype = outcome_label)
+  ) +
+    geom_hline(yintercept = 0, linewidth = 0.4) +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 2.2) +
+    geom_errorbar(
+      aes(ymin = conf_low, ymax = conf_high),
+      width = 0.08, linewidth = 0.45
+    ) +
+    facet_wrap(~ outcome_label, scales = "free_y") +
+    scale_x_discrete(
+      labels = c(
+        pre25_36 = "25-36m\npre",
+        pre13_24 = "13-24m\npre",
+        last_unpartnered = "Last\nunpartnered",
+        first_LAT = "First LAT\nobservation"
+      )
+    ) +
+    labs(
+      x = NULL,
+      y = "Mean in SD units of the last-unpartnered scale",
+      title = "Psychological trajectories around incident steady LAT formation",
+      subtitle = "Treated respondents only; positive values indicate better functioning"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position = "none",
+      panel.grid.minor = element_blank()
+    )
+
+  ggsave(
+    file.path(results_dir, "12_treated_absolute_trajectories_grayscale.png"),
+    p1, width = 9, height = 5.5, dpi = 300
+  )
+
+  if (nrow(primary_did_results) > 0L) {
+    p2dat <- primary_did_results |>
+      mutate(
+        outcome_label = case_when(
+          outcome == "life_sat" ~ "Life satisfaction",
+          outcome == "ghq_wb" ~ "GHQ psychological functioning",
+          TRUE ~ outcome
+        ),
+        contrast_label = case_when(
+          contrast == "preformation_25_36_to_last_unpartnered" ~ "Pre-formation",
+          contrast == "formation_last_unpartnered_to_first_LAT" ~ "Across formation",
+          contrast == "extended_25_36_to_first_LAT" ~ "Extended",
+          TRUE ~ contrast
+        )
+      )
+
+    p2 <- ggplot(
+      p2dat,
+      aes(x = did_std, y = contrast_label, shape = outcome_label)
+    ) +
+      geom_vline(xintercept = 0, linewidth = 0.4) +
+      geom_errorbarh(
+        aes(xmin = conf_low_std, xmax = conf_high_std),
+        height = 0.15, linewidth = 0.5,
+        position = position_dodge(width = 0.35)
+      ) +
+      geom_point(
+        size = 2.3,
+        position = position_dodge(width = 0.35)
+      ) +
+      labs(
+        x = "Matched differential change (SD)",
+        y = NULL,
+        shape = NULL,
+        title = "Matched differential psychological change around LAT formation",
+        subtitle = "Positive values indicate more favorable change among incident LAT formers"
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(panel.grid.minor = element_blank())
+
+    ggsave(
+      file.path(results_dir, "13_primary_matched_DID_grayscale.png"),
+      p2, width = 9, height = 5.5, dpi = 300
+    )
+  }
+}
+
+
+# =============================================================================
+# 14. ANALYTIC SAMPLE / AVAILABILITY AUDITS
+# =============================================================================
+
+period_availability <- treated_stack |>
+  group_by(period) |>
+  summarise(
+    treated_rows = n(),
+    treated_people = n_distinct(unit_pidp),
+    life_sat_observed = sum(!is.na(life_sat)),
+    ghq_observed = sum(!is.na(ghq_wb)),
+    .groups = "drop"
+  )
+write_csv_quiet(period_availability, "14_treated_period_availability.csv")
+
+matched_period_availability <- bind_rows(
+  primary_stack,
+  stable_stack,
+  firstlike_stack
+) |>
+  group_by(analysis_label, condition, period) |>
+  summarise(
+    rows = n(),
+    people = n_distinct(unit_pidp),
+    matched_sets = n_distinct(match_set_id),
+    life_sat_observed = sum(!is.na(life_sat)),
+    ghq_observed = sum(!is.na(ghq_wb)),
+    .groups = "drop"
+  )
+write_csv_quiet(matched_period_availability, "15_matched_period_availability.csv")
+
+# Matching balance on baseline age and timing, descriptive only.
+primary_match_balance <- primary_control_candidates |>
+  summarise(
+    matched_sets = n_distinct(match_set_id),
+    control_rows = n(),
+    mean_abs_age_difference = mean(abs(control_age - treated_age), na.rm = TRUE),
+    max_abs_age_difference = max(abs(control_age - treated_age), na.rm = TRUE),
+    mean_abs_baseline_month_difference = mean(
+      abs(control_baseline_month - baseline_month), na.rm = TRUE
+    ),
+    max_abs_baseline_month_difference = max(
+      abs(control_baseline_month - baseline_month), na.rm = TRUE
+    ),
+    mean_abs_followup_interval_difference = mean(
+      abs(control_followup_interval - baseline_to_positive_months), na.rm = TRUE
+    ),
+    max_abs_followup_interval_difference = max(
+      abs(control_followup_interval - baseline_to_positive_months), na.rm = TRUE
+    )
+  )
+write_csv_quiet(primary_match_balance, "16_primary_match_balance_audit.csv")
+
+
+# =============================================================================
+# 15. OPTIONAL SAVE OF ANALYTIC OBJECTS
+# =============================================================================
+
+if (SAVE_ANALYTIC_RDS) {
+  saveRDS(primary_treated, file.path(results_dir, "primary_incident_LAT_events.rds"))
+  saveRDS(primary_match_index, file.path(results_dir, "primary_LAT_match_index.rds"))
+  saveRDS(primary_stack, file.path(results_dir, "primary_LAT_event_stack.rds"))
+  saveRDS(treated_stack, file.path(results_dir, "treated_only_LAT_event_stack.rds"))
+  if (nrow(stable_stack) > 0L) {
+    saveRDS(stable_stack, file.path(results_dir, "stable_unpartnered_LAT_event_stack.rds"))
+  }
+  if (nrow(firstlike_stack) > 0L) {
+    saveRDS(firstlike_stack, file.path(results_dir, "firstlike_LAT_event_stack.rds"))
+  }
+}
+
+
+# =============================================================================
+# 16. INTERPRETATION GUIDE
+# =============================================================================
+
+interpretation_guide <- tribble(
+  ~result_pattern, ~interpretation,
+
+  "Absolute treated LS/GHQ improves from pre25_36 to last_unpartnered",
+  paste(
+    "Psychological improvement precedes the reported LAT relationship start.",
+    "This is compatible with dynamic psychological selection or an emerging",
+    "relationship not yet classified as steady, but is not causal evidence."
+  ),
+
+  "Absolute treated LS/GHQ improves from last_unpartnered to first_LAT",
+  paste(
+    "Psychological functioning improves across observed formation of the steady",
+    "non-residential relationship. This supports an early relationship-formation",
+    "gain more directly than marriage-centered event time does."
+  ),
+
+  "Treated absolute change approximately zero but controls deteriorate",
+  paste(
+    "The favorable matched difference is primarily differential maintenance,",
+    "not absolute psychological improvement among future relationship formers."
+  ),
+
+  "Treated improves and controls deteriorate",
+  paste(
+    "The favorable relative trajectory combines an absolute gain among future",
+    "relationship formers with deterioration among controls."
+  ),
+
+  "No favorable absolute or matched formation change",
+  paste(
+    "The hypothesis that the earlier life-satisfaction gain is localized around",
+    "steady LAT formation receives little support. The gain may occur at another",
+    "relationship stage, reflect selection, or depend on unobserved timing."
+  ),
+
+  "Stable-unpartnered sensitivity stronger than primary risk-set comparison",
+  paste(
+    "Interpret cautiously: the stable-control analysis conditions on future",
+    "continued unpartneredness and is descriptive rather than the preferred",
+    "counterfactual."
+  )
+)
+write_csv_quiet(interpretation_guide, "17_interpretation_guide.csv")
+
+
+# =============================================================================
+# 17. README / SESSION INFORMATION / OUTPUT CHECK
+# =============================================================================
+
+readme_lines <- c(
+  "UKHLS INCIDENT LAT PSYCHOLOGICAL TRAJECTORY WORKFLOW V1",
+  "",
+  "Inferential status: COMPLEMENTARY / EXPLORATORY.",
+  "",
+  "Primary event:",
+  "  observed single + NCRR1=2 -> reported LAT start -> observed single + NCRR1=1,",
+  "  with the reported start month between the two valid NCRR1 interviews.",
+  "",
+  "Primary key contrasts:",
+  "  1. pre25_36 -> last_unpartnered: pre-formation change",
+  "  2. last_unpartnered -> first_LAT: formation-associated change",
+  "  3. pre25_36 -> first_LAT: extended change",
+  "",
+  "Primary controls:",
+  "  contemporaneous single + NCRR1=2 respondents who are also observed",
+  "  single + NCRR1=2 at the corresponding follow-up wave; they may partner later.",
+  "",
+  "Sensitivities:",
+  "  - controls stable-unpartnered through 24 months after pseudo-event (future-conditioned)",
+  "  - no prior observed partnership / no known dated prior PHISTORY union",
+  "",
+  "Outcome direction:",
+  "  life_sat higher = better",
+  "  ghq_wb = -ghq12, higher = better",
+  "",
+  "For interpretation, inspect absolute within-person changes BEFORE the matched",
+  "DID estimates. A favorable DID alone does not prove absolute improvement."
+)
+writeLines(readme_lines, file.path(results_dir, "00_READ_ME_FIRST.txt"))
+
+capture.output(sessionInfo(), file = file.path(results_dir, "99_sessionInfo.txt"))
+
+expected_outputs <- c(
+  "00_READ_ME_FIRST.txt",
+  "01_NCRR_LAT_start_availability_by_wave.csv",
+  "02_same_wave_timing_audit.csv",
+  "03_incident_LAT_timing_audit.csv",
+  "04_incident_LAT_candidate_rows.csv",
+  "05_primary_treated_event_audit.csv",
+  "06_matching_summary.csv",
+  "07_treated_distal_relationship_state_audit.csv",
+  "08_last_unpartnered_baseline_SDs.csv",
+  "09_absolute_within_person_LAT_former_changes.csv",
+  "10_matched_LAT_formation_DID_results.csv",
+  "11_treated_absolute_trajectory_descriptives.csv",
+  "14_treated_period_availability.csv",
+  "15_matched_period_availability.csv",
+  "16_primary_match_balance_audit.csv",
+  "17_interpretation_guide.csv",
+  "99_sessionInfo.txt"
+)
+
+if (MAKE_PLOTS) {
+  expected_outputs <- c(
+    expected_outputs,
+    "12_treated_absolute_trajectories_grayscale.png"
+  )
+  if (nrow(primary_did_results) > 0L) {
+    expected_outputs <- c(expected_outputs, "13_primary_matched_DID_grayscale.png")
+  }
+}
+
+output_check <- tibble(
+  file = expected_outputs,
+  exists = file.exists(file.path(results_dir, expected_outputs))
+)
+write_csv_quiet(output_check, "98_output_check.csv")
+
+if (any(!output_check$exists)) {
+  warning(
+    "Workflow completed but some expected outputs are missing: ",
+    paste(output_check$file[!output_check$exists], collapse = ", ")
+  )
+}
+
+cat("\n============================================================\n")
+cat("INCIDENT LAT PSYCHOLOGICAL TRAJECTORY WORKFLOW V1 COMPLETE\n")
+cat("Results directory:\n", results_dir, "\n")
+cat("============================================================\n\n")
+################################################################################

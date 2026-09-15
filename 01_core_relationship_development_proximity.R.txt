@@ -1,0 +1,6202 @@
+# =============================================================================
+# UKHLS REVISED FORMAL ANALYSIS WORKFLOW - VERSION 4.2
+# Selection, relationship development, marriage proximity, and breakup proximity
+# =============================================================================
+#
+# Identification and inferential sequence:
+# A. Pre-relationship psychological differentiation/selection
+# B. Distal 25-60m pre-proximity diagnostic
+# C. Relationship development + lagged coupled-change analyses
+#    + non-binary C-to-D distal diagnostic
+# D_M. Marriage-proximity ATT risk-set analyses of RECENT CHANGE
+# D_B. Breakup-proximity ATT risk-set analyses of RECENT CHANGE
+# E. Sequential explanatory attenuation on identical common samples
+#    + inverse-probability-of-history-availability weighting (IPHAW)
+# F. Lagged NCRR12 expectation triangulation in LAT relationships
+# G. Multiple-relationship within-person robustness
+#
+# CONFIRMATORY FAMILY:
+#   D_M, 1-12 months before marriage, D1b estimator, GHQ and life satisfaction.
+#   Two-sided p-values are Holm-adjusted across these two co-primary outcomes.
+#
+# SECONDARY MULTIPLICITY FAMILIES:
+#   Marriage timing: D1b at 13-24m and 25-60m x GHQ/LS (Holm across 4).
+#   Breakup timing: D1b at 1-12m, 13-24m, 25-60m x GHQ/LS (Holm across 6).
+#
+# D1b is the fixed confirmatory estimator because its estimand is the observed
+# history-complete eligible population and it does not require modeling the
+# missing-history process. D1c is a MANDATORY missing-history sensitivity that
+# reweights the same observed-history cases toward the eligible risk-set
+# population in which the survey/interview schedule provided STRUCTURAL
+# OPPORTUNITY for the required prior psychological history to be observed.
+# D1c cannot create/rescue confirmatory support, but a stable and materially
+# discordant D1c result QUALIFIES a supported D1b result as sensitive to
+# selective psychological-history availability.
+#
+# D0/D1a/D2/D3 and A/B/C/E/F/G are explanatory, diagnostic, robustness, or
+# triangulation analyses rather than additional confirmatory tests.
+#
+# No analysis is interpreted as a causal "anticipation effect" or as a
+# causal mediation/decomposition. E is descriptive explanatory attenuation.
+#
+# VERSION 4.2 CORRECTIONS:
+#   - C1/C2 omit the 0-11m outcome interaction explicitly, removing exact
+#     collinearity with relationship-spell fixed effects.
+#   - C5a uses the identified 12-23m marriage interaction; C5b and all joint
+#     tests use a direct covariance-matrix Wald chi-square implementation.
+#   - F excludes NCRR12=6 (prefer not to disclose), adds 1-5 categorical
+#     omnibus tests and an ordinal likelihood trend, and activates reciprocal
+#     numeric models using verified coding.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. CONFIGURATION
+# -----------------------------------------------------------------------------
+
+UKHLS_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se/ukhls"
+)
+
+PHISTORY_FILE <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "Marital and Cohabitation Histories/stata/phistory_long.dta"
+)
+
+OUT_DIR <- file.path(
+  getwd(),
+  "UKHLS_REVISED_selection_development_proximity_v4_2"
+)
+
+VALID_WAVES <- letters[1:15]
+
+MARRIAGE_DATE_FLAGS_PRIMARY <- 0L
+MARRIAGE_DATE_FLAGS_SENSITIVITY <- c(0L, 1L)
+
+# Breakup timing uses the cohabitation end date. Primary analyses require
+# an exact observed end month/year (end_if == 0); end_if 0/1 is sensitivity.
+BREAKUP_DATE_FLAGS_PRIMARY <- 0L
+BREAKUP_DATE_FLAGS_SENSITIVITY <- c(0L, 1L)
+
+EXCLUDE_SAME_MONTH_MARRIAGE <- TRUE
+
+PRIMARY_DURATION_MIN <- 0L
+PRIMARY_DURATION_MAX <- 179L
+
+# Approximately annual psychological change.
+PRIOR_PSYCH_MIN_GAP_MONTHS <- 6L
+PRIOR_PSYCH_MAX_GAP_MONTHS <- 18L
+
+# RDAS is less frequent.
+PRIOR_RDAS_MIN_GAP_MONTHS <- 6L
+PRIOR_RDAS_MAX_GAP_MONTHS <- 30L
+
+# Previous observed change used in lagged models.
+PRIOR_CHANGE_MAX_GAP_MONTHS <- 36L
+
+PRE_REL_MIN_GAP_MONTHS <- 12L
+PRE_REL_MAX_GAP_MONTHS <- 60L
+PRE_REL_SENS_MIN_GAP_MONTHS <- 24L
+
+RISKSET_DURATION_BIN_MONTHS <- 6L
+RISKSET_AGE_BIN_YEARS <- 2L
+CONTROL_HORIZON_MONTHS <- 60L
+
+# IPHAW component-weight configuration. Each availability-stage weight is
+# stabilized within treated/control groups and initially trimmed at 1/99.
+IPHAW_TRIM_LOWER <- 0.01
+IPHAW_TRIM_UPPER <- 0.99
+IPHAW_PROB_EPS <- 0.01
+
+# The PRODUCT of ATT and sequential history weights is re-trimmed after
+# multiplication. This is crucial: component-wise trimming does not bound the
+# tail of a product of weights. Primary IPHAW sensitivities use 1/99 final
+# trimming; 2.5/97.5 is an additional tighter-trimming sensitivity.
+FINAL_WEIGHT_TRIM_LOWER <- 0.01
+FINAL_WEIGHT_TRIM_UPPER <- 0.99
+FINAL_WEIGHT_TIGHT_LOWER <- 0.025
+FINAL_WEIGHT_TIGHT_UPPER <- 0.975
+
+# Prespecified weight-stability rule.
+# D1b remains the confirmatory estimator. D1c is a mandatory sensitivity.
+# If overall OR either treatment-arm ESS/N < 0.50, D1c is considered too
+# unstable to adjudicate robustness to selective history availability.
+# ESS/N < 0.25 is flagged as severely unstable.
+ESS_ACCEPTABLE_RATIO <- 0.50
+ESS_SEVERE_RATIO <- 0.25
+
+# Confirmatory inference.
+CONFIRMATORY_ALPHA <- 0.05
+CONFIRMATORY_ADJUSTMENT <- "holm"
+SECONDARY_ADJUSTMENT <- "holm"
+
+# Structural-opportunity / IPHAW stability settings.
+# This is a diagnostic sparsity flag, not an automatic exclusion threshold.
+# D1c remains adjudicated primarily by the prespecified ESS rule above.
+IPHAW_MIN_SELECTED_PER_ARM_DIAGNOSTIC <- 30L
+
+# Mandatory D1b-vs-D1c disagreement analysis.
+# Respondents are resampled as clusters. Within each bootstrap replicate,
+# H1 opportunity-target ATT weights AND the H1 availability model are
+# re-estimated. The final analysis uses a BCa interval when the delete-one-
+# respondent cluster jackknife is numerically reliable; percentile is the
+# prespecified fallback.
+RUN_CONFIRMATORY_IPHAW_BOOTSTRAP <- TRUE
+RUN_CONFIRMATORY_IPHAW_BCA <- TRUE
+CONFIRMATORY_IPHAW_BOOT_REPS <- 1999L
+CONFIRMATORY_IPHAW_BOOT_SEED <- 20260831L
+CONFIRMATORY_IPHAW_BOOT_CI <- 0.95
+CONFIRMATORY_IPHAW_BOOT_MIN_SUCCESS <- 0.80
+CONFIRMATORY_IPHAW_JACKKNIFE_MIN_SUCCESS <- 0.80
+
+# Reconstruct histories after removing ambiguous active-cohabitation source
+# rows and fit ATT-only strict-history sensitivities. These do not alter D1b.
+RUN_STRICT_UNAMBIGUOUS_HISTORY_SENSITIVITY <- TRUE
+
+# NCRR12 coding was verified from UKHLS value labels before v4.2:
+#   1 = very likely, 2 = likely, 3 = not sure, 4 = unlikely,
+#   5 = very unlikely, 6 = prefer not to disclose.
+# Category 6 is non-substantive and is excluded from F. For numeric trend /
+# reciprocal models, higher score means greater perceived likelihood of marriage.
+NCRR12_SUBSTANTIVE_VALUES <- 1:5
+NCRR12_SCORE_MAP <- c("1" = 5, "2" = 4, "3" = 3, "4" = 2, "5" = 1)
+
+REBUILD_MASTER_DATA <- TRUE
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "data"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "models"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "tables"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "diagnostics"), recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------------------------------------------------------
+# 1. PACKAGES
+# -----------------------------------------------------------------------------
+
+required_packages <- c(
+  "haven", "dplyr", "tidyr", "purrr", "stringr",
+  "readr", "tibble", "fixest", "splines", "brglm2"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop("Please install: ", paste(missing_packages, collapse = ", "))
+}
+
+library(haven)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(readr)
+library(tibble)
+library(fixest)
+library(splines)
+library(brglm2)
+
+options(dplyr.summarise.inform = FALSE)
+fixest::setFixest_nthreads(0)
+
+# -----------------------------------------------------------------------------
+# 2. HELPERS
+# -----------------------------------------------------------------------------
+
+num_clean <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x[x < 0] <- NA_real_
+  x
+}
+
+ym_index <- function(year, month) {
+  year <- num_clean(year)
+  month <- num_clean(month)
+  out <- rep(NA_real_, length(year))
+  ok <- !is.na(year) & !is.na(month) &
+    month >= 1 & month <= 12 & year >= 1900 & year <= 2100
+  out[ok] <- year[ok] * 12 + month[ok] - 1
+  out
+}
+
+wave_number <- function(w) match(tolower(w), letters)
+
+wave_from_indresp_file <- function(path) {
+  str_match(tolower(basename(path)), "^([a-o])_indresp\\.dta$")[, 2]
+}
+
+find_wave_var <- function(nms, wave, candidates) {
+  possible <- unique(c(paste0(wave, "_", candidates), candidates))
+  hit <- possible[possible %in% nms]
+  if (length(hit) == 0L) NA_character_ else hit[1]
+}
+
+safe_read_names <- function(path) {
+  tryCatch(names(haven::read_dta(path, n_max = 0)),
+           error = function(e) character(0))
+}
+
+zsafe <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(NA_real_, length(x)))
+  (x - mean(x, na.rm = TRUE)) / s
+}
+
+last_nonmissing_lag <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  out <- rep(NA_real_, length(x))
+  last <- NA_real_
+  for (i in seq_along(x)) {
+    out[i] <- last
+    if (!is.na(x[i])) last <- x[i]
+  }
+  out
+}
+
+last_nonmissing_time_lag <- function(x, time) {
+  x <- suppressWarnings(as.numeric(x))
+  time <- suppressWarnings(as.numeric(time))
+  out <- rep(NA_real_, length(x))
+  last_time <- NA_real_
+  for (i in seq_along(x)) {
+    out[i] <- last_time
+    if (!is.na(x[i]) && !is.na(time[i])) last_time <- time[i]
+  }
+  out
+}
+
+last_nonmissing_change_lag <- function(change, time) {
+  change <- suppressWarnings(as.numeric(change))
+  time <- suppressWarnings(as.numeric(time))
+  out_change <- rep(NA_real_, length(change))
+  out_time <- rep(NA_real_, length(change))
+  last_change <- NA_real_
+  last_time <- NA_real_
+  for (i in seq_along(change)) {
+    out_change[i] <- last_change
+    out_time[i] <- last_time
+    if (!is.na(change[i]) && !is.na(time[i])) {
+      last_change <- change[i]
+      last_time <- time[i]
+    }
+  }
+  list(change = out_change, time = out_time)
+}
+
+spell_id <- function(pidp, spellno) {
+  paste(format(pidp, scientific = FALSE, trim = TRUE), spellno, sep = "_")
+}
+
+write_csv_quiet <- function(x, filename, subdir = "tables") {
+  path <- file.path(OUT_DIR, subdir, filename)
+  readr::write_csv(x, path, na = "", progress = FALSE)
+  invisible(path)
+}
+
+write_txt <- function(x, filename, subdir = "tables") {
+  path <- file.path(OUT_DIR, subdir, filename)
+  writeLines(as.character(x), path)
+  invisible(path)
+}
+
+save_fixest_model <- function(model, name) {
+  saveRDS(model, file.path(OUT_DIR, "models", paste0(name, ".rds")))
+  cf <- coef(model)
+  se_ <- se(model)
+  p_ <- pvalue(model)
+  ci_ <- confint(model)
+  out <- tibble(
+    term = names(cf),
+    estimate = as.numeric(cf),
+    std_error = as.numeric(se_),
+    conf_low = as.numeric(ci_[, 1]),
+    conf_high = as.numeric(ci_[, 2]),
+    p_value = as.numeric(p_)
+  )
+  write_csv_quiet(out, paste0(name, "_coefficients.csv"))
+  write_txt(capture.output(summary(model)), paste0(name, "_summary.txt"))
+  invisible(model)
+}
+
+safe_feols <- function(formula, data, name, ...) {
+  model <- tryCatch(
+    fixest::feols(formula, data = data, ...),
+    error = function(e) e
+  )
+  if (inherits(model, "error")) {
+    write_txt(paste0("MODEL FAILED\n\n", conditionMessage(model)),
+              paste0(name, "_ERROR.txt"))
+    return(NULL)
+  }
+  save_fixest_model(model, name)
+}
+
+safe_feglm <- function(formula, data, name, family = "binomial", ...) {
+  model <- tryCatch(
+    fixest::feglm(formula, data = data, family = family, ...),
+    error = function(e) e
+  )
+  if (inherits(model, "error")) {
+    write_txt(paste0("MODEL FAILED\n\n", conditionMessage(model)),
+              paste0(name, "_ERROR.txt"))
+    return(NULL)
+  }
+  save_fixest_model(model, name)
+}
+
+weighted_mean <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  sum(x[ok] * w[ok]) / sum(w[ok])
+}
+
+weighted_var <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w) & w > 0
+  if (sum(ok) < 2L) return(NA_real_)
+  m <- weighted_mean(x[ok], w[ok])
+  sum(w[ok] * (x[ok] - m)^2) / sum(w[ok])
+}
+
+smd_two_group <- function(x, treated, w = NULL) {
+  if (is.null(w)) w <- rep(1, length(x))
+  mt <- weighted_mean(x[treated == 1], w[treated == 1])
+  mc <- weighted_mean(x[treated == 0], w[treated == 0])
+  vt <- weighted_var(x[treated == 1], w[treated == 1])
+  vc <- weighted_var(x[treated == 0], w[treated == 0])
+  denom <- sqrt((vt + vc) / 2)
+  if (is.na(denom) || denom == 0) return(NA_real_)
+  (mt - mc) / denom
+}
+
+
+effective_sample_size <- function(w) {
+  w <- w[is.finite(w) & !is.na(w) & w > 0]
+  if (length(w) == 0L) return(NA_real_)
+  (sum(w)^2) / sum(w^2)
+}
+
+# Re-trim a FINAL combined weight separately within treated/control status.
+# This is applied after ATT x history-weight multiplication.
+trim_weight_by_treatment <- function(
+  w,
+  treated,
+  lower = FINAL_WEIGHT_TRIM_LOWER,
+  upper = FINAL_WEIGHT_TRIM_UPPER
+) {
+  out <- rep(NA_real_, length(w))
+
+  groups <- sort(unique(treated[!is.na(treated)]))
+
+  for (g in groups) {
+    idx <- treated == g & is.finite(w) & !is.na(w) & w > 0
+
+    if (!any(idx)) next
+
+    vals <- w[idx]
+
+    if (length(vals) > 1L) {
+      q <- stats::quantile(
+        vals,
+        probs = c(lower, upper),
+        na.rm = TRUE,
+        names = FALSE
+      )
+      out[idx] <- pmin(pmax(vals, q[1]), q[2])
+    } else {
+      out[idx] <- vals
+    }
+  }
+
+  out
+}
+
+make_final_weight_variants <- function(att_weight, history_weight, treated) {
+  raw <- att_weight * history_weight
+
+  list(
+    raw = raw,
+    trim_1_99 = trim_weight_by_treatment(
+      raw, treated,
+      FINAL_WEIGHT_TRIM_LOWER,
+      FINAL_WEIGHT_TRIM_UPPER
+    ),
+    trim_2p5_97p5 = trim_weight_by_treatment(
+      raw, treated,
+      FINAL_WEIGHT_TIGHT_LOWER,
+      FINAL_WEIGHT_TIGHT_UPPER
+    )
+  )
+}
+
+weight_stability_diagnostics <- function(data, weight_var, stage) {
+  w <- data[[weight_var]]
+
+  one_row <- function(idx, group_label) {
+    idx <- idx & is.finite(w) & !is.na(w) & w > 0
+    n <- sum(idx)
+    ess <- if (n == 0L) NA_real_ else effective_sample_size(w[idx])
+    ratio <- if (n == 0L || is.na(ess)) NA_real_ else ess / n
+
+    tibble(
+      stage = stage,
+      group = group_label,
+      n_nominal = n,
+      ess = ess,
+      ess_ratio = ratio,
+      mean_weight = if (n == 0L) NA_real_ else mean(w[idx]),
+      p99_weight = if (n == 0L) NA_real_ else
+        as.numeric(stats::quantile(w[idx], .99, na.rm = TRUE)),
+      max_weight = if (n == 0L) NA_real_ else max(w[idx])
+    )
+  }
+
+  diag <- bind_rows(
+    one_row(rep(TRUE, nrow(data)), "overall"),
+    one_row(data$treated == 1, "treated"),
+    one_row(data$treated == 0, "control")
+  )
+
+  valid_ratios <- diag$ess_ratio[!is.na(diag$ess_ratio)]
+
+  stage_status <- case_when(
+    length(valid_ratios) == 0L ~ "ESS unavailable",
+    any(valid_ratios < ESS_SEVERE_RATIO) ~
+      "severely unstable: report only; do not use as robustness evidence",
+    any(valid_ratios < ESS_ACCEPTABLE_RATIO) ~
+      "caution: report only; do not use as affirmative robustness evidence",
+    TRUE ~ "acceptable ESS for robustness interpretation"
+  )
+
+  diag %>%
+    mutate(
+      stage_status = stage_status,
+      acceptable_for_robustness =
+        stage_status == "acceptable ESS for robustness interpretation"
+    )
+}
+
+smd_to_target <- function(target_x, selected_x, selected_w) {
+  target_x <- suppressWarnings(as.numeric(target_x))
+  selected_x <- suppressWarnings(as.numeric(selected_x))
+  target_sd <- stats::sd(target_x, na.rm = TRUE)
+  if (is.na(target_sd) || target_sd == 0) return(NA_real_)
+  (weighted_mean(selected_x, selected_w) -
+     mean(target_x, na.rm = TRUE)) / target_sd
+}
+
+extract_term_stats <- function(model, term = "treated") {
+  if (is.null(model)) {
+    return(tibble(
+      term = term,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value = NA_real_,
+      nobs = NA_integer_
+    ))
+  }
+
+  cf <- coef(model)
+  if (!term %in% names(cf)) {
+    return(tibble(
+      term = term,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value = NA_real_,
+      nobs = as.integer(stats::nobs(model))
+    ))
+  }
+
+  ci <- tryCatch(
+    confint(model),
+    error = function(e) NULL
+  )
+
+  if (is.null(ci) || is.null(rownames(ci)) || !term %in% rownames(ci)) {
+    ci_low <- NA_real_
+    ci_high <- NA_real_
+  } else {
+    ci_low <- as.numeric(ci[term, 1])
+    ci_high <- as.numeric(ci[term, 2])
+  }
+
+  tibble(
+    term = term,
+    estimate = unname(cf[term]),
+    std_error = unname(se(model)[term]),
+    conf_low = ci_low,
+    conf_high = ci_high,
+    p_value = unname(pvalue(model)[term]),
+    nobs = as.integer(stats::nobs(model))
+  )
+}
+
+attenuation_row <- function(
+  base_model,
+  adjusted_model,
+  arm,
+  horizon,
+  outcome,
+  stage,
+  common_sample
+) {
+  b <- extract_term_stats(base_model, "treated")
+  a <- extract_term_stats(adjusted_model, "treated")
+
+  interpretable <-
+    !is.na(b$estimate) &
+    !is.na(a$estimate) &
+    abs(b$estimate) > 1e-8 &
+    sign(b$estimate) == sign(a$estimate)
+
+  attenuation_pct <- if (interpretable) {
+    100 * (1 - a$estimate / b$estimate)
+  } else {
+    NA_real_
+  }
+
+  tibble(
+    arm = arm,
+    horizon = horizon,
+    outcome = outcome,
+    stage = stage,
+    common_sample = common_sample,
+    base_estimate = b$estimate,
+    adjusted_estimate = a$estimate,
+    attenuation_pct = attenuation_pct,
+    base_n = b$nobs,
+    adjusted_n = a$nobs,
+    interpretation_flag = if_else(
+      interpretable,
+      "descriptive attenuation estimable",
+      "do not interpret percentage: zero/near-zero or sign change"
+    )
+  )
+}
+
+model_comparison_row <- function(
+  model_a,
+  model_b,
+  arm,
+  horizon,
+  outcome,
+  comparison
+) {
+  a <- extract_term_stats(model_a, "treated")
+  b <- extract_term_stats(model_b, "treated")
+  tibble(
+    arm = arm,
+    horizon = horizon,
+    outcome = outcome,
+    comparison = comparison,
+    estimate_a = a$estimate,
+    estimate_b = b$estimate,
+    absolute_difference = b$estimate - a$estimate,
+    n_a = a$nobs,
+    n_b = b$nobs
+  )
+}
+
+safe_wald_row <- function(model, keep, test_name, outcome, arm = "marriage") {
+  # Direct cluster-robust Wald chi-square test using the covariance matrix
+  # stored with the fitted fixest model. This avoids version-dependent return
+  # structures from fixest::wald() that previously produced blank statistics.
+  empty_row <- function(status, matched_terms = NA_character_, n_terms = 0L,
+                        vcov_rank = NA_integer_) {
+    tibble(
+      test = test_name,
+      arm = arm,
+      outcome = outcome,
+      stat = NA_real_,
+      p_value = NA_real_,
+      df1 = NA_real_,
+      df2 = NA_real_,
+      statistic_type = "Wald chi-square",
+      n_terms = as.integer(n_terms),
+      vcov_rank = as.integer(vcov_rank),
+      matched_terms = matched_terms,
+      status = status
+    )
+  }
+
+  if (is.null(model)) {
+    return(empty_row("model_missing"))
+  }
+
+  b_all <- tryCatch(stats::coef(model), error = function(e) NULL)
+  V_all <- tryCatch(stats::vcov(model), error = function(e) NULL)
+
+  if (is.null(b_all) || is.null(V_all)) {
+    return(empty_row("coef_or_vcov_unavailable"))
+  }
+
+  nm <- names(b_all)
+  idx <- grep(keep, nm, perl = TRUE)
+
+  if (length(idx) == 0L) {
+    return(empty_row("no_matching_coefficients"))
+  }
+
+  terms <- nm[idx]
+  b <- as.numeric(b_all[terms])
+  V <- as.matrix(V_all[terms, terms, drop = FALSE])
+
+  if (any(!is.finite(b)) || any(!is.finite(V))) {
+    return(empty_row(
+      "nonfinite_coef_or_vcov",
+      matched_terms = paste(terms, collapse = " | "),
+      n_terms = length(terms)
+    ))
+  }
+
+  ee <- tryCatch(eigen(V, symmetric = TRUE), error = function(e) NULL)
+  if (is.null(ee)) {
+    return(empty_row(
+      "vcov_eigendecomposition_failed",
+      matched_terms = paste(terms, collapse = " | "),
+      n_terms = length(terms)
+    ))
+  }
+
+  max_eig <- max(abs(ee$values), na.rm = TRUE)
+  tol <- max(1, nrow(V)) * max(max_eig, 1) * .Machine$double.eps * 100
+  keep_eig <- which(ee$values > tol)
+  rank_v <- length(keep_eig)
+
+  if (rank_v == 0L) {
+    return(empty_row(
+      "vcov_rank_zero",
+      matched_terms = paste(terms, collapse = " | "),
+      n_terms = length(terms),
+      vcov_rank = 0L
+    ))
+  }
+
+  Q <- ee$vectors[, keep_eig, drop = FALSE]
+  V_inv <- Q %*% diag(1 / ee$values[keep_eig], nrow = rank_v) %*% t(Q)
+  W <- as.numeric(t(b) %*% V_inv %*% b)
+  p <- stats::pchisq(W, df = rank_v, lower.tail = FALSE)
+
+  tibble(
+    test = test_name,
+    arm = arm,
+    outcome = outcome,
+    stat = W,
+    p_value = p,
+    df1 = as.numeric(rank_v),
+    df2 = NA_real_,
+    statistic_type = "Wald chi-square",
+    n_terms = as.integer(length(terms)),
+    vcov_rank = as.integer(rank_v),
+    matched_terms = paste(terms, collapse = " | "),
+    status = if_else(rank_v == length(terms), "estimated", "estimated_reduced_rank")
+  )
+}
+
+# Structural-opportunity helpers ------------------------------------------------
+
+exists_prior_module_in_window <- function(
+  times,
+  module,
+  j,
+  min_gap,
+  max_gap
+) {
+  if (j <= 1L) return(FALSE)
+  idx <- seq_len(j - 1L)
+  gaps <- times[j] - times[idx]
+  any(
+    module[idx] &
+      !is.na(gaps) &
+      gaps >= min_gap &
+      gaps <= max_gap,
+    na.rm = TRUE
+  )
+}
+
+compute_change_opportunity <- function(
+  times,
+  module,
+  min_gap,
+  max_gap
+) {
+  n <- length(times)
+  out <- rep(FALSE, n)
+  if (n <= 1L) return(out)
+
+  for (k in 2:n) {
+    if (!isTRUE(module[k])) next
+    idx <- seq_len(k - 1L)
+    gaps <- times[k] - times[idx]
+    out[k] <- any(
+      module[idx] &
+        !is.na(gaps) &
+        gaps >= min_gap &
+        gaps <= max_gap,
+      na.rm = TRUE
+    )
+  }
+
+  out
+}
+
+exists_prior_change_opp <- function(
+  times,
+  change_opp,
+  j,
+  max_gap
+) {
+  if (j <= 1L) return(FALSE)
+  idx <- seq_len(j - 1L)
+  gaps <- times[j] - times[idx]
+  any(
+    change_opp[idx] &
+      !is.na(gaps) &
+      gaps > 0 &
+      gaps <= max_gap,
+    na.rm = TRUE
+  )
+}
+
+source_row_ambiguous <- function(
+  source_time,
+  times,
+  ambiguous
+) {
+  if (is.na(source_time)) return(NA)
+  hit <- which(!is.na(times) & times == source_time)
+  if (length(hit) == 0L) return(NA)
+  any(ambiguous[hit], na.rm = TRUE)
+}
+
+# Bias-reduced availability model ---------------------------------------------
+# All candidate specifications use brglm2. There is no ordinary-GLM fallback.
+# Formula reduction is only a numerical fallback if the richer bias-reduced
+# specification cannot be fitted (e.g., a one-level factor after restriction).
+
+fit_bias_reduced_availability <- function(dat) {
+
+  formulas <- list(
+    full = .H ~
+      treated +
+      factor(sex) +
+      wave_n +
+      age +
+      cohab_duration_months +
+      prior_outcome +
+      log1p(n_prior_interviews) +
+      log1p(n_prior_outcome_obs) +
+      log1p(panel_tenure_months),
+
+    reduced = .H ~
+      treated +
+      wave_n +
+      age +
+      cohab_duration_months +
+      prior_outcome +
+      log1p(n_prior_interviews) +
+      log1p(panel_tenure_months),
+
+    minimal = .H ~
+      treated +
+      age +
+      cohab_duration_months +
+      prior_outcome
+  )
+
+  for (nm in names(formulas)) {
+    fit <- tryCatch(
+      suppressWarnings(
+        stats::glm(
+          formulas[[nm]],
+          data = dat,
+          family = stats::binomial("logit"),
+          method = brglm2::brglmFit,
+          type = "AS_mean",
+          control = stats::glm.control(maxit = 100)
+        )
+      ),
+      error = function(e) NULL
+    )
+
+    if (!is.null(fit)) {
+      p <- tryCatch(
+        stats::predict(fit, type = "response"),
+        error = function(e) rep(NA_real_, nrow(dat))
+      )
+
+      if (
+        length(p) == nrow(dat) &&
+          any(is.finite(p), na.rm = TRUE)
+      ) {
+        return(list(
+          model = fit,
+          formula_tier = nm
+        ))
+      }
+    }
+  }
+
+  list(
+    model = NULL,
+    formula_tier = "failed"
+  )
+}
+
+estimate_ipha_stage <- function(
+  data,
+  availability_var,
+  opportunity_var,
+  stage_name,
+  enforce_availability_subset = TRUE
+) {
+
+  source <- data %>%
+    mutate(
+      .H = as.integer(.data[[availability_var]]),
+      .S = as.integer(.data[[opportunity_var]])
+    )
+
+  n_mismatch <- sum(
+    source$.H == 1 & source$.S != 1,
+    na.rm = TRUE
+  )
+
+  if (isTRUE(enforce_availability_subset) && n_mismatch > 0L) {
+    stop(
+      "Structural-opportunity mismatch at ",
+      stage_name,
+      ": ",
+      n_mismatch,
+      " available histories occur outside opportunity support."
+    )
+  }
+
+  support_rates <- source %>%
+    group_by(treated) %>%
+    summarise(
+      n_source = n(),
+      n_opportunity = sum(.S == 1, na.rm = TRUE),
+      n_available_in_opportunity = sum(.H == 1 & .S == 1, na.rm = TRUE),
+      availability_given_opportunity = if_else(
+        n_opportunity > 0,
+        n_available_in_opportunity / n_opportunity,
+        NA_real_
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      stage = stage_name,
+      support_is_structural_subset = enforce_availability_subset,
+      n_available_outside_support = n_mismatch,
+      sparse_selected_arm =
+        n_available_in_opportunity < IPHAW_MIN_SELECTED_PER_ARM_DIAGNOSTIC,
+      stage_sparse_support = any(sparse_selected_arm)
+    )
+
+  write_csv_quiet(
+    support_rates,
+    paste0(stage_name, "_STRUCTURAL_SUPPORT.csv"),
+    subdir = "diagnostics"
+  )
+
+  dat <- source %>%
+    filter(
+      .S == 1,
+      !is.na(landmark_id),
+      !is.na(.H),
+      !is.na(treated),
+      !is.na(wave_n),
+      !is.na(sex),
+      !is.na(age),
+      !is.na(cohab_duration_months),
+      !is.na(prior_outcome),
+      !is.na(n_prior_interviews),
+      !is.na(n_prior_outcome_obs),
+      !is.na(panel_tenure_months)
+    )
+
+  empty_weights <- function(ids = character(0)) {
+    tibble(
+      landmark_id = ids,
+      .H = NA_integer_,
+      .S = NA_integer_,
+      p_hat = NA_real_,
+      ipha_weight_raw = NA_real_,
+      ipha_weight_trim = NA_real_
+    )
+  }
+
+  if (nrow(dat) == 0L) {
+    return(list(
+      weights = empty_weights(),
+      model = NULL,
+      formula_tier = "no_support",
+      support_diagnostics = support_rates
+    ))
+  }
+
+  if (length(unique(dat$.H)) == 1L) {
+    p_hat <- rep(mean(dat$.H), nrow(dat))
+    ipha_raw <- ifelse(dat$.H == 1, 1, NA_real_)
+    ipha_trim <- ipha_raw
+    fit <- NULL
+    formula_tier <- "constant_availability"
+  } else {
+
+    fitted <- fit_bias_reduced_availability(dat)
+    fit <- fitted$model
+    formula_tier <- fitted$formula_tier
+
+    if (is.null(fit)) {
+      write_txt(
+        paste0(
+          "BIAS-REDUCED IPHAW MODEL FAILED\n",
+          "No brglm2 specification produced usable predictions."
+        ),
+        paste0(stage_name, "_IPHAW_ERROR.txt"),
+        subdir = "diagnostics"
+      )
+
+      return(list(
+        weights = tibble(
+          landmark_id = dat$landmark_id,
+          .H = dat$.H,
+          .S = dat$.S,
+          p_hat = NA_real_,
+          ipha_weight_raw = NA_real_,
+          ipha_weight_trim = NA_real_
+        ),
+        model = NULL,
+        formula_tier = "failed",
+        support_diagnostics = support_rates
+      ))
+    }
+
+    saveRDS(
+      fit,
+      file.path(
+        OUT_DIR,
+        "models",
+        paste0(stage_name, "_IPHAW_brglm2.rds")
+      )
+    )
+
+    write_txt(
+      c(
+        paste0("Formula tier: ", formula_tier),
+        "Estimator: brglm2 mean bias-reduced logistic regression (AS_mean)",
+        "Target: structural-opportunity support only",
+        "",
+        capture.output(summary(fit))
+      ),
+      paste0(stage_name, "_IPHAW_brglm2_summary.txt"),
+      subdir = "diagnostics"
+    )
+
+    p_hat <- suppressWarnings(
+      stats::predict(fit, type = "response")
+    )
+
+    # Numerical safeguard only. Structural zero probabilities have already
+    # been removed by the opportunity restriction.
+    p_hat <- pmin(
+      pmax(p_hat, IPHAW_PROB_EPS),
+      1 - IPHAW_PROB_EPS
+    )
+
+    numerator <- ave(
+      dat$.H,
+      dat$treated,
+      FUN = function(z) mean(z == 1)
+    )
+
+    ipha_raw <- ifelse(
+      dat$.H == 1,
+      numerator / p_hat,
+      NA_real_
+    )
+
+    ipha_trim <- trim_weight_by_treatment(
+      ipha_raw,
+      dat$treated,
+      IPHAW_TRIM_LOWER,
+      IPHAW_TRIM_UPPER
+    )
+  }
+
+  diag_dat <- dat %>%
+    mutate(
+      p_hat = p_hat,
+      ipha_weight_raw = ipha_raw,
+      ipha_weight_trim = ipha_trim
+    )
+
+  propensity_summary <- diag_dat %>%
+    group_by(treated, .H) %>%
+    summarise(
+      n = n(),
+      p_hat_mean = mean(p_hat, na.rm = TRUE),
+      p_hat_min = if (all(is.na(p_hat))) NA_real_ else min(p_hat, na.rm = TRUE),
+      p_hat_p05 = if (all(is.na(p_hat))) NA_real_ else quantile(p_hat, 0.05, na.rm = TRUE),
+      p_hat_median = if (all(is.na(p_hat))) NA_real_ else median(p_hat, na.rm = TRUE),
+      p_hat_p95 = if (all(is.na(p_hat))) NA_real_ else quantile(p_hat, 0.95, na.rm = TRUE),
+      p_hat_max = if (all(is.na(p_hat))) NA_real_ else max(p_hat, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      stage = stage_name,
+      formula_tier = formula_tier
+    )
+
+  write_csv_quiet(
+    propensity_summary,
+    paste0(stage_name, "_propensity_summary.csv"),
+    subdir = "diagnostics"
+  )
+
+  wdat <- diag_dat %>%
+    filter(
+      .H == 1,
+      is.finite(ipha_weight_raw),
+      ipha_weight_raw > 0
+    )
+
+  weight_summary <- wdat %>%
+    group_by(treated) %>%
+    summarise(
+      n = n(),
+      raw_mean = mean(ipha_weight_raw, na.rm = TRUE),
+      raw_p99 = if (n() > 0) quantile(ipha_weight_raw, 0.99, na.rm = TRUE) else NA_real_,
+      raw_max = if (n() > 0) max(ipha_weight_raw, na.rm = TRUE) else NA_real_,
+      trim_mean = mean(ipha_weight_trim, na.rm = TRUE),
+      trim_p99 = if (n() > 0) quantile(ipha_weight_trim, 0.99, na.rm = TRUE) else NA_real_,
+      trim_max = if (n() > 0) max(ipha_weight_trim, na.rm = TRUE) else NA_real_,
+      ess_raw = effective_sample_size(ipha_weight_raw),
+      ess_trim = effective_sample_size(ipha_weight_trim),
+      .groups = "drop"
+    )
+
+  write_csv_quiet(
+    weight_summary,
+    paste0(stage_name, "_weight_summary.csv"),
+    subdir = "diagnostics"
+  )
+
+  target_vars <- c(
+    "age",
+    "cohab_duration_months",
+    "prior_outcome",
+    "n_prior_interviews",
+    "n_prior_outcome_obs",
+    "panel_tenure_months"
+  )
+
+  target_balance <- map_dfr(target_vars, function(v) {
+    tibble(
+      variable = v,
+      smd_selected_unweighted_vs_opportunity_target = smd_to_target(
+        dat[[v]],
+        wdat[[v]],
+        rep(1, nrow(wdat))
+      ),
+      smd_selected_IPHAW_vs_opportunity_target = smd_to_target(
+        dat[[v]],
+        wdat[[v]],
+        wdat$ipha_weight_trim
+      )
+    )
+  })
+
+  write_csv_quiet(
+    target_balance,
+    paste0(stage_name, "_target_balance.csv"),
+    subdir = "diagnostics"
+  )
+
+  list(
+    weights = diag_dat %>%
+      select(
+        landmark_id,
+        .H,
+        .S,
+        p_hat,
+        ipha_weight_raw,
+        ipha_weight_trim
+      ),
+    model = fit,
+    formula_tier = formula_tier,
+    support_diagnostics = support_rates
+  )
+}
+
+# -----------------------------------------------------------------------------
+# 2B. PRESPECIFIED INFERENCE / MULTIPLICITY PLAN
+# -----------------------------------------------------------------------------
+
+inference_plan <- tribble(
+  ~family, ~models, ~role, ~multiplicity, ~decision_rule,
+
+  "Confirmatory co-primary family",
+  "D_M D1b, marriage 1-12m: GHQ and life satisfaction",
+  "Confirmatory",
+  "Holm across exactly 2 two-sided tests; familywise alpha=.05",
+  paste(
+    "D1b is fixed in advance as the confirmatory estimator because it targets",
+    "the observed history-complete eligible population without modeling the",
+    "missing-history process. A co-primary outcome is supported only if its",
+    "Holm-adjusted p < .05 and the estimate is in the preregistered favorable",
+    "direction (GHQ negative; life satisfaction positive). If only one outcome",
+    "is supported, conclusions are outcome-specific."
+  ),
+
+  "Mandatory missing-history sensitivity for confirmatory contrasts",
+  "D_M D1c, marriage 1-12m: GHQ and life satisfaction",
+  "Mandatory robustness qualifier; NOT a confirmatory rescue test",
+  "No additional alpha-controlled family; D1c cannot create confirmatory support",
+  paste(
+    "D1c uses the same outcome/covariate specification as D1b but adds",
+    "structural-opportunity-target ATT x psychological-history IPHAW. If D1b is",
+    "supported and D1c has acceptable ESS but reverses sign OR the prespecified",
+    "respondent-cluster BCa 95% CI for beta_D1c - beta_D1b excludes zero",
+    "(percentile CI fallback if BCa is unreliable), the confirmatory conclusion",
+    "must be labeled sensitive to selective history availability and",
+    "generalization beyond the history-complete population is uncertain.",
+    "If D1c ESS is inadequate, robustness to selective history availability",
+    "is not considered reliably assessed. A favorable D1c cannot rescue a",
+    "nonsignificant D1b confirmatory result."
+  ),
+
+  "Secondary marriage-timing family",
+  "D_M D1b: 13-24m and 25-60m x GHQ/LS",
+  "Secondary",
+  "Holm across 4 tests",
+  "Used to characterize temporal localization/gradient; not confirmatory.",
+
+  "Secondary breakup-timing family",
+  "D_B D1b: 1-12m, 13-24m, 25-60m x GHQ/LS",
+  "Secondary",
+  "Holm across 6 tests",
+  "Used to characterize dissolution-proximity patterns; not confirmatory.",
+
+  "Other explanatory/diagnostic/robustness analyses",
+  "D0/D1a/D2/D3/other IPHAW, A, B, C, E, F, G",
+  "Non-confirmatory",
+  "No shared alpha-controlled family used to rescue the central claim",
+  paste(
+    "Interpret estimates, confidence intervals, attenuation patterns,",
+    "weight diagnostics, temporal ordering, and consistency with the",
+    "prespecified confirmatory result."
+  )
+)
+
+write_csv_quiet(
+  inference_plan,
+  "00_INFERENCE_AND_MULTIPLICITY_PLAN.csv"
+)
+
+# -----------------------------------------------------------------------------
+# 3. DISCOVER/READ UKHLS WAVES
+# -----------------------------------------------------------------------------
+
+if (!dir.exists(UKHLS_DIR)) stop("UKHLS_DIR does not exist: ", UKHLS_DIR)
+
+all_dta <- list.files(
+  UKHLS_DIR, pattern = "\\.dta$", recursive = TRUE,
+  full.names = TRUE, ignore.case = TRUE
+)
+
+wave_files <- all_dta[
+  grepl("^[a-o]_indresp\\.dta$", tolower(basename(all_dta)))
+]
+
+wave_index <- tibble(
+  file = wave_files,
+  wave = map_chr(wave_files, wave_from_indresp_file)
+) %>%
+  filter(wave %in% VALID_WAVES) %>%
+  mutate(wave_n = wave_number(wave)) %>%
+  arrange(wave_n)
+
+if (nrow(wave_index) == 0L) stop("No a_indresp.dta ... o_indresp.dta files found.")
+
+# Structural module schedule used to define whether a history COULD have been
+# observed, independently of whether the respondent actually answered the item.
+has_wave_var_core <- function(path, stem) {
+  nms <- safe_read_names(path)
+  any(
+    grepl(
+      paste0("(^|_)", stem, "$"),
+      nms,
+      ignore.case = TRUE
+    )
+  )
+}
+
+module_schedule_core <- wave_index %>%
+  transmute(
+    wave,
+    wave_n,
+    ghq_module = purrr::map_lgl(file, has_wave_var_core, stem = "scghq1_dv"),
+    ls_module = purrr::map_lgl(file, has_wave_var_core, stem = "sclfsato"),
+    rdas_sat_module = purrr::map_lgl(file, has_wave_var_core, stem = "scdassat_dv"),
+    rdas_coh_module = purrr::map_lgl(file, has_wave_var_core, stem = "scdascoh_dv")
+  )
+
+write_csv_quiet(
+  module_schedule_core,
+  "00_MODULE_SCHEDULE_BY_WAVE.csv",
+  subdir = "diagnostics"
+)
+
+variable_specs <- list(
+  pidp = c("pidp"),
+  interview_year = c("intdaty_dv", "istrtdaty"),
+  interview_month = c("intdatm_dv", "istrtdatm"),
+  age = c("age_dv"),
+  sex = c("sex"),
+  mastat_dv = c("mastat_dv"),
+  ghq = c("scghq1_dv"),
+  life_satisfaction = c("sclfsato"),
+  rdas_satisfaction = c("scdassat_dv"),
+  rdas_cohesion = c("scdascoh_dv"),
+  ncrr1 = c("ncrr1"),
+  ncrr11 = c("ncrr11"),
+  ncrr12 = c("ncrr12"),
+  ncrrm = c("ncrrm"),
+  ncrry4 = c("ncrry4")
+)
+
+read_one_wave <- function(path, wave) {
+  nms <- safe_read_names(path)
+  resolved <- map_chr(variable_specs, ~ find_wave_var(nms, wave, .x))
+  names(resolved) <- names(variable_specs)
+  selected <- unique(na.omit(unname(resolved)))
+  dat <- haven::read_dta(path, col_select = dplyr::any_of(selected))
+
+  get_standard <- function(concept) {
+    v <- resolved[[concept]]
+    if (is.na(v) || !v %in% names(dat)) {
+      rep(NA_real_, nrow(dat))
+    } else {
+      suppressWarnings(as.numeric(dat[[v]]))
+    }
+  }
+
+  tibble(
+    wave = wave,
+    wave_n = wave_number(wave),
+    pidp = get_standard("pidp"),
+    interview_year = num_clean(get_standard("interview_year")),
+    interview_month = num_clean(get_standard("interview_month")),
+    age = num_clean(get_standard("age")),
+    sex = num_clean(get_standard("sex")),
+    mastat_dv = num_clean(get_standard("mastat_dv")),
+    ghq = num_clean(get_standard("ghq")),
+    life_satisfaction = num_clean(get_standard("life_satisfaction")),
+    rdas_satisfaction = num_clean(get_standard("rdas_satisfaction")),
+    rdas_cohesion = num_clean(get_standard("rdas_cohesion")),
+    ncrr1 = num_clean(get_standard("ncrr1")),
+    ncrr11 = num_clean(get_standard("ncrr11")),
+    ncrr12 = num_clean(get_standard("ncrr12")),
+    ncrrm = num_clean(get_standard("ncrrm")),
+    ncrry4 = num_clean(get_standard("ncrry4"))
+  ) %>%
+    mutate(
+      interview_ym = ym_index(interview_year, interview_month),
+      lat_relationship_start_ym = ym_index(ncrry4, ncrrm),
+      ghq = if_else(ghq >= 0 & ghq <= 36, ghq, NA_real_),
+      life_satisfaction = if_else(
+        life_satisfaction >= 1 & life_satisfaction <= 7,
+        life_satisfaction, NA_real_
+      ),
+      rdas_satisfaction = if_else(rdas_satisfaction >= 0, rdas_satisfaction, NA_real_),
+      rdas_cohesion = if_else(rdas_cohesion >= 0, rdas_cohesion, NA_real_)
+    )
+}
+
+panel_rds <- file.path(OUT_DIR, "data", "01_panel_person_wave.rds")
+
+if (REBUILD_MASTER_DATA || !file.exists(panel_rds)) {
+  cat("Reading UKHLS waves...\n")
+  panel <- map2_dfr(wave_index$file, wave_index$wave, read_one_wave) %>%
+    filter(!is.na(pidp), !is.na(interview_ym)) %>%
+    arrange(pidp, interview_ym, wave_n) %>%
+    group_by(pidp) %>%
+    mutate(
+      panel_entry_ym = min(interview_ym, na.rm = TRUE),
+      panel_tenure_months = interview_ym - panel_entry_ym,
+      n_prior_interviews = row_number() - 1L,
+      n_prior_ghq_obs = lag(cumsum(!is.na(ghq)), default = 0L),
+      n_prior_ls_obs = lag(cumsum(!is.na(life_satisfaction)), default = 0L),
+
+      prior_ghq = last_nonmissing_lag(ghq),
+      prior_ghq_ym = last_nonmissing_time_lag(ghq, interview_ym),
+      prior_ls = last_nonmissing_lag(life_satisfaction),
+      prior_ls_ym = last_nonmissing_time_lag(life_satisfaction, interview_ym),
+      prior_ghq_gap = interview_ym - prior_ghq_ym,
+      prior_ls_gap = interview_ym - prior_ls_ym,
+      recent_prior_ghq =
+        !is.na(prior_ghq) &
+        prior_ghq_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+        prior_ghq_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+      recent_prior_ls =
+        !is.na(prior_ls) &
+        prior_ls_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+        prior_ls_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+      ghq_change = if_else(recent_prior_ghq, ghq - prior_ghq, NA_real_),
+      ls_change = if_else(recent_prior_ls, life_satisfaction - prior_ls, NA_real_)
+    ) %>%
+    ungroup()
+  saveRDS(panel, panel_rds)
+} else {
+  panel <- readRDS(panel_rds)
+}
+
+# NCRR12 labels.
+ncrr12_label_rows <- list()
+for (i in seq_len(nrow(wave_index))) {
+  w <- wave_index$wave[i]
+  f <- wave_index$file[i]
+  nms <- safe_read_names(f)
+  v <- find_wave_var(nms, w, variable_specs$ncrr12)
+  if (!is.na(v)) {
+    temp <- haven::read_dta(f, col_select = dplyr::all_of(v))
+    labs <- attr(temp[[v]], "labels")
+    if (!is.null(labs)) {
+      ncrr12_label_rows[[length(ncrr12_label_rows) + 1L]] <-
+        tibble(wave = w, value = as.numeric(labs), label = names(labs))
+    }
+  }
+}
+if (length(ncrr12_label_rows) > 0L) {
+  write_csv_quiet(
+    bind_rows(ncrr12_label_rows) %>% distinct(),
+    "00_NCRR12_value_labels_VERIFY_DIRECTION.csv",
+    subdir = "diagnostics"
+  )
+}
+
+# -----------------------------------------------------------------------------
+# 4. PARTNERSHIP HISTORY
+# -----------------------------------------------------------------------------
+
+if (!file.exists(PHISTORY_FILE)) stop("PHISTORY_FILE does not exist: ", PHISTORY_FILE)
+
+ph_names <- names(haven::read_dta(PHISTORY_FILE, n_max = 0))
+
+required_ph <- c(
+  "pidp", "spellno", "status", "partner",
+  "starty", "startm", "endy", "endm",
+  "start_if", "end_if", "ongoing", "cohend"
+)
+
+missing_ph <- setdiff(required_ph, ph_names)
+if (length(missing_ph) > 0L) {
+  stop("phistory_long is missing: ", paste(missing_ph, collapse = ", "))
+}
+
+ph_raw <- haven::read_dta(
+  PHISTORY_FILE,
+  col_select = dplyr::all_of(required_ph)
+)
+
+cohend_label <- as.character(
+  haven::as_factor(ph_raw$cohend, levels = "labels")
+)
+
+ph <- tibble(
+  pidp = num_clean(ph_raw$pidp),
+  spellno = num_clean(ph_raw$spellno),
+  status = num_clean(ph_raw$status),
+  partner = num_clean(ph_raw$partner),
+  starty = num_clean(ph_raw$starty),
+  startm = num_clean(ph_raw$startm),
+  endy = num_clean(ph_raw$endy),
+  endm = num_clean(ph_raw$endm),
+  start_if = num_clean(ph_raw$start_if),
+  end_if = num_clean(ph_raw$end_if),
+  ongoing = num_clean(ph_raw$ongoing),
+  cohend = num_clean(ph_raw$cohend),
+  cohend_label = cohend_label
+) %>%
+  mutate(
+    start_ym = ym_index(starty, startm),
+    end_ym = ym_index(endy, endm),
+    valid_partner = !is.na(partner) & partner > 0
+  ) %>%
+  filter(!is.na(pidp)) %>%
+  arrange(pidp, start_ym, spellno) %>%
+  group_by(pidp) %>%
+  mutate(
+    next_spellno = lead(spellno),
+    next_status = lead(status),
+    next_partner = lead(partner),
+    next_start_ym = lead(start_ym),
+    next_start_if = lead(start_if),
+    same_partner_next =
+      valid_partner & !is.na(next_partner) & next_partner > 0 &
+      partner == next_partner
+  ) %>%
+  ungroup()
+
+saveRDS(ph, file.path(OUT_DIR, "data", "02_phistory_clean.rds"))
+
+cohab_spells <- ph %>%
+  filter(status == 10, !is.na(start_ym), !is.na(end_ym)) %>%
+  mutate(
+    relationship_spell_id = spell_id(pidp, spellno),
+    marriage_link_ok =
+      next_status == 2 &
+      (same_partner_next | !valid_partner | is.na(next_partner) | next_partner <= 0),
+    marriage_start_ym = if_else(marriage_link_ok, next_start_ym, NA_real_),
+    marriage_start_if = if_else(marriage_link_ok, next_start_if, NA_real_),
+    spell_outcome = case_when(
+      ongoing == 0 & cohend == 1 ~ "breakup",
+      ongoing == 0 & cohend == 2 ~ "marriage",
+      ongoing == 1 ~ "ongoing",
+      TRUE ~ "other"
+    )
+  ) %>%
+  transmute(
+    pidp,
+    cohab_spellno = spellno,
+    relationship_spell_id,
+    cohab_partner = partner,
+    valid_partner,
+    cohab_start_ym = start_ym,
+    cohab_end_ym = end_ym,
+    cohab_start_if = start_if,
+    cohab_end_if = end_if,
+    cohab_ongoing = ongoing,
+    cohend,
+    cohend_label,
+    spell_outcome,
+    marriage_start_ym,
+    marriage_start_if
+  )
+
+# -----------------------------------------------------------------------------
+# 5. LINK INTERVIEWS TO ACTIVE COHABITATION SPELLS
+# -----------------------------------------------------------------------------
+
+active_candidates <- panel %>%
+  inner_join(cohab_spells, by = "pidp", relationship = "many-to-many") %>%
+  filter(interview_ym >= cohab_start_ym, interview_ym <= cohab_end_ym)
+
+active_count <- active_candidates %>%
+  count(pidp, wave, interview_ym, name = "n_active_cohab_candidates")
+
+cohab_panel <- active_candidates %>%
+  left_join(active_count, by = c("pidp", "wave", "interview_ym")) %>%
+  mutate(ambiguous_active_cohab = n_active_cohab_candidates > 1) %>%
+  group_by(pidp, wave, interview_ym) %>%
+  arrange(desc(cohab_start_ym), cohab_spellno, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    cohab_duration_months = interview_ym - cohab_start_ym,
+    months_remaining_in_cohab = cohab_end_ym - interview_ym,
+    months_to_marriage = marriage_start_ym - interview_ym,
+    exact_marriage_date = marriage_start_if %in% MARRIAGE_DATE_FLAGS_PRIMARY,
+    usable_marriage_date_sens =
+      marriage_start_if %in% MARRIAGE_DATE_FLAGS_SENSITIVITY,
+    landmark_id = paste(
+      format(pidp, scientific = FALSE, trim = TRUE),
+      relationship_spell_id,
+      wave,
+      interview_ym,
+      sep = "_"
+    ),
+
+    exact_breakup_date =
+      cohab_ongoing == 0 &
+      cohend == 1 &
+      cohab_end_if %in% BREAKUP_DATE_FLAGS_PRIMARY,
+
+    usable_breakup_date_sens =
+      cohab_ongoing == 0 &
+      cohend == 1 &
+      cohab_end_if %in% BREAKUP_DATE_FLAGS_SENSITIVITY,
+
+    months_to_breakup = if_else(
+      cohab_ongoing == 0 & cohend == 1,
+      months_remaining_in_cohab,
+      NA_real_
+    ),
+
+    # Retained as an audit variable and explicitly used in sample-flow output.
+    validated_breakup_24m =
+      usable_breakup_date_sens &
+      months_to_breakup >= 1 &
+      months_to_breakup <= 24,
+
+    # Operational comparison group for BOTH marriage and breakup arms:
+    # the respondent is observed to remain in the same cohabiting spell for
+    # at least another 60 months. Thus neither marriage nor breakup occurs
+    # during the reference horizon.
+    continued_cohab_60m =
+      months_remaining_in_cohab >= CONTROL_HORIZON_MONTHS &
+      (cohab_ongoing == 1 | cohab_end_if %in% c(0, 1)),
+
+    marriage_horizon_state = case_when(
+      exact_marriage_date &
+        !is.na(months_to_marriage) &
+        months_to_marriage >= ifelse(EXCLUDE_SAME_MONTH_MARRIAGE, 1, 0) &
+        months_to_marriage <= 12 ~ "marriage_1_12m",
+      exact_marriage_date &
+        !is.na(months_to_marriage) &
+        months_to_marriage >= 13 &
+        months_to_marriage <= 24 ~ "marriage_13_24m",
+      exact_marriage_date &
+        !is.na(months_to_marriage) &
+        months_to_marriage >= 25 &
+        months_to_marriage <= 60 ~ "marriage_25_60m",
+      continued_cohab_60m ~ "continued_cohab_60m",
+      TRUE ~ NA_character_
+    ),
+
+    breakup_horizon_state = case_when(
+      exact_breakup_date &
+        !is.na(months_to_breakup) &
+        months_to_breakup >= 1 &
+        months_to_breakup <= 12 ~ "breakup_1_12m",
+      exact_breakup_date &
+        !is.na(months_to_breakup) &
+        months_to_breakup >= 13 &
+        months_to_breakup <= 24 ~ "breakup_13_24m",
+      exact_breakup_date &
+        !is.na(months_to_breakup) &
+        months_to_breakup >= 25 &
+        months_to_breakup <= 60 ~ "breakup_25_60m",
+      continued_cohab_60m ~ "continued_cohab_60m",
+      TRUE ~ NA_character_
+    )
+  )
+
+# -----------------------------------------------------------------------------
+# 6. WITHIN-RELATIONSHIP LAGS/CHANGES
+# -----------------------------------------------------------------------------
+
+cohab_panel <- cohab_panel %>%
+  arrange(relationship_spell_id, interview_ym, wave_n) %>%
+  group_by(relationship_spell_id) %>%
+  mutate(
+    prior_spell_ghq = last_nonmissing_lag(ghq),
+    prior_spell_ghq_ym = last_nonmissing_time_lag(ghq, interview_ym),
+    prior_spell_ls = last_nonmissing_lag(life_satisfaction),
+    prior_spell_ls_ym = last_nonmissing_time_lag(life_satisfaction, interview_ym),
+    prior_rdas_satisfaction = last_nonmissing_lag(rdas_satisfaction),
+    prior_rdas_satisfaction_ym =
+      last_nonmissing_time_lag(rdas_satisfaction, interview_ym),
+    prior_rdas_cohesion = last_nonmissing_lag(rdas_cohesion),
+    prior_rdas_cohesion_ym =
+      last_nonmissing_time_lag(rdas_cohesion, interview_ym),
+
+    spell_ghq_gap = interview_ym - prior_spell_ghq_ym,
+    spell_ls_gap = interview_ym - prior_spell_ls_ym,
+    prior_rdas_sat_gap = interview_ym - prior_rdas_satisfaction_ym,
+    prior_rdas_coh_gap = interview_ym - prior_rdas_cohesion_ym,
+
+    recent_prior_spell_ghq =
+      !is.na(prior_spell_ghq) &
+      spell_ghq_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+      spell_ghq_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+
+    recent_prior_spell_ls =
+      !is.na(prior_spell_ls) &
+      spell_ls_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+      spell_ls_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+
+    recent_prior_rdas_sat =
+      !is.na(prior_rdas_satisfaction) &
+      prior_rdas_sat_gap >= PRIOR_RDAS_MIN_GAP_MONTHS &
+      prior_rdas_sat_gap <= PRIOR_RDAS_MAX_GAP_MONTHS,
+
+    recent_prior_rdas_coh =
+      !is.na(prior_rdas_cohesion) &
+      prior_rdas_coh_gap >= PRIOR_RDAS_MIN_GAP_MONTHS &
+      prior_rdas_coh_gap <= PRIOR_RDAS_MAX_GAP_MONTHS,
+
+    recent_prior_both_rdas = recent_prior_rdas_sat & recent_prior_rdas_coh,
+
+    spell_ghq_change =
+      if_else(recent_prior_spell_ghq, ghq - prior_spell_ghq, NA_real_),
+
+    spell_ls_change =
+      if_else(recent_prior_spell_ls,
+              life_satisfaction - prior_spell_ls, NA_real_),
+
+    rdas_satisfaction_change =
+      if_else(
+        recent_prior_rdas_sat & !is.na(rdas_satisfaction),
+        rdas_satisfaction - prior_rdas_satisfaction,
+        NA_real_
+      ),
+
+    rdas_cohesion_change =
+      if_else(
+        recent_prior_rdas_coh & !is.na(rdas_cohesion),
+        rdas_cohesion - prior_rdas_cohesion,
+        NA_real_
+      )
+  ) %>%
+  ungroup()
+
+# Previous observed changes.
+cohab_panel <- cohab_panel %>%
+  arrange(relationship_spell_id, interview_ym) %>%
+  group_by(relationship_spell_id) %>%
+  group_modify(~ {
+    ghq_hist <- last_nonmissing_change_lag(.x$spell_ghq_change, .x$interview_ym)
+    ls_hist <- last_nonmissing_change_lag(.x$spell_ls_change, .x$interview_ym)
+    sat_hist <- last_nonmissing_change_lag(.x$rdas_satisfaction_change, .x$interview_ym)
+    coh_hist <- last_nonmissing_change_lag(.x$rdas_cohesion_change, .x$interview_ym)
+
+    .x %>%
+      mutate(
+        prior_ghq_change = ghq_hist$change,
+        prior_ghq_change_ym = ghq_hist$time,
+        prior_ls_change = ls_hist$change,
+        prior_ls_change_ym = ls_hist$time,
+        prior_rdas_sat_change = sat_hist$change,
+        prior_rdas_sat_change_ym = sat_hist$time,
+        prior_rdas_coh_change = coh_hist$change,
+        prior_rdas_coh_change_ym = coh_hist$time
+      )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    prior_ghq_change_gap = interview_ym - prior_ghq_change_ym,
+    prior_ls_change_gap = interview_ym - prior_ls_change_ym,
+    prior_rdas_sat_change_gap = interview_ym - prior_rdas_sat_change_ym,
+    prior_rdas_coh_change_gap = interview_ym - prior_rdas_coh_change_ym,
+
+    usable_prior_ghq_change =
+      !is.na(prior_ghq_change) &
+      prior_ghq_change_gap > 0 &
+      prior_ghq_change_gap <= PRIOR_CHANGE_MAX_GAP_MONTHS,
+
+    usable_prior_ls_change =
+      !is.na(prior_ls_change) &
+      prior_ls_change_gap > 0 &
+      prior_ls_change_gap <= PRIOR_CHANGE_MAX_GAP_MONTHS,
+
+    usable_prior_rdas_change =
+      !is.na(prior_rdas_sat_change) &
+      !is.na(prior_rdas_coh_change) &
+      prior_rdas_sat_change_gap > 0 &
+      prior_rdas_sat_change_gap <= PRIOR_CHANGE_MAX_GAP_MONTHS &
+      prior_rdas_coh_change_gap > 0 &
+      prior_rdas_coh_change_gap <= PRIOR_CHANGE_MAX_GAP_MONTHS
+  )
+
+# -----------------------------------------------------------------------------
+# 6B. STRUCTURAL OPPORTUNITY FOR H1/H2/H3
+# -----------------------------------------------------------------------------
+# Validated against the dedicated v2 audit: observed H1/H2/H3 histories must be
+# subsets of these opportunity populations. Opportunity is based on EXISTENCE
+# of any admissible scheduled prior measurement/pair on the full cohab_panel;
+# it does not depend on whether the respondent answered the item.
+
+cohab_panel <- cohab_panel %>%
+  left_join(
+    module_schedule_core,
+    by = c("wave", "wave_n")
+  ) %>%
+  mutate(
+    ghq_module = coalesce(ghq_module, FALSE),
+    ls_module = coalesce(ls_module, FALSE),
+    rdas_sat_module = coalesce(rdas_sat_module, FALSE),
+    rdas_coh_module = coalesce(rdas_coh_module, FALSE)
+  ) %>%
+  arrange(
+    relationship_spell_id,
+    interview_ym,
+    wave_n
+  ) %>%
+  group_by(relationship_spell_id) %>%
+  group_modify(~ {
+
+    d <- .x
+    tt <- d$interview_ym
+    n <- nrow(d)
+
+    ghq_change_opp <- compute_change_opportunity(
+      tt,
+      d$ghq_module,
+      PRIOR_PSYCH_MIN_GAP_MONTHS,
+      PRIOR_PSYCH_MAX_GAP_MONTHS
+    )
+
+    ls_change_opp <- compute_change_opportunity(
+      tt,
+      d$ls_module,
+      PRIOR_PSYCH_MIN_GAP_MONTHS,
+      PRIOR_PSYCH_MAX_GAP_MONTHS
+    )
+
+    sat_change_opp <- compute_change_opportunity(
+      tt,
+      d$rdas_sat_module,
+      PRIOR_RDAS_MIN_GAP_MONTHS,
+      PRIOR_RDAS_MAX_GAP_MONTHS
+    )
+
+    coh_change_opp <- compute_change_opportunity(
+      tt,
+      d$rdas_coh_module,
+      PRIOR_RDAS_MIN_GAP_MONTHS,
+      PRIOR_RDAS_MAX_GAP_MONTHS
+    )
+
+    H1_ghq <- rep(FALSE, n)
+    H1_ls <- rep(FALSE, n)
+    H2 <- rep(FALSE, n)
+    H3 <- rep(FALSE, n)
+
+    for (j in seq_len(n)) {
+
+      H1_ghq[j] <- exists_prior_change_opp(
+        tt,
+        ghq_change_opp,
+        j,
+        PRIOR_CHANGE_MAX_GAP_MONTHS
+      )
+
+      H1_ls[j] <- exists_prior_change_opp(
+        tt,
+        ls_change_opp,
+        j,
+        PRIOR_CHANGE_MAX_GAP_MONTHS
+      )
+
+      sat_level_opp <- exists_prior_module_in_window(
+        tt,
+        d$rdas_sat_module,
+        j,
+        PRIOR_RDAS_MIN_GAP_MONTHS,
+        PRIOR_RDAS_MAX_GAP_MONTHS
+      )
+
+      coh_level_opp <- exists_prior_module_in_window(
+        tt,
+        d$rdas_coh_module,
+        j,
+        PRIOR_RDAS_MIN_GAP_MONTHS,
+        PRIOR_RDAS_MAX_GAP_MONTHS
+      )
+
+      H2[j] <- sat_level_opp & coh_level_opp
+
+      H3[j] <-
+        exists_prior_change_opp(
+          tt,
+          sat_change_opp,
+          j,
+          PRIOR_CHANGE_MAX_GAP_MONTHS
+        ) &
+        exists_prior_change_opp(
+          tt,
+          coh_change_opp,
+          j,
+          PRIOR_CHANGE_MAX_GAP_MONTHS
+        )
+    }
+
+    amb <- d$ambiguous_active_cohab
+
+    d %>%
+      mutate(
+        H1_ghq_opportunity = H1_ghq,
+        H1_ls_opportunity = H1_ls,
+        H2_opportunity = H2,
+        H3_opportunity = H3,
+
+        H1_ghq_source_ambiguous = purrr::map_lgl(
+          prior_ghq_change_ym,
+          ~ isTRUE(source_row_ambiguous(.x, tt, amb))
+        ),
+        H1_ls_source_ambiguous = purrr::map_lgl(
+          prior_ls_change_ym,
+          ~ isTRUE(source_row_ambiguous(.x, tt, amb))
+        ),
+        H2_sat_source_ambiguous = purrr::map_lgl(
+          prior_rdas_satisfaction_ym,
+          ~ isTRUE(source_row_ambiguous(.x, tt, amb))
+        ),
+        H2_coh_source_ambiguous = purrr::map_lgl(
+          prior_rdas_cohesion_ym,
+          ~ isTRUE(source_row_ambiguous(.x, tt, amb))
+        ),
+        H3_sat_source_ambiguous = purrr::map_lgl(
+          prior_rdas_sat_change_ym,
+          ~ isTRUE(source_row_ambiguous(.x, tt, amb))
+        ),
+        H3_coh_source_ambiguous = purrr::map_lgl(
+          prior_rdas_coh_change_ym,
+          ~ isTRUE(source_row_ambiguous(.x, tt, amb))
+        )
+      )
+  }) %>%
+  ungroup()
+
+# -----------------------------------------------------------------------------
+# 6C. STRICT UNAMBIGUOUS-SOURCE HISTORY RECONSTRUCTION
+# -----------------------------------------------------------------------------
+# This is sensitivity-only. Current D landmarks are already required to be
+# unambiguous in primary_support; here we additionally prevent any earlier
+# ambiguous active-cohabitation row from supplying the current change, prior
+# level, prior psychological change, prior RDAS level, or prior RDAS change.
+
+strict_history_panel <- cohab_panel %>%
+  filter(!ambiguous_active_cohab) %>%
+  select(
+    landmark_id,
+    relationship_spell_id,
+    interview_ym,
+    wave_n,
+    ghq,
+    life_satisfaction,
+    rdas_satisfaction,
+    rdas_cohesion
+  ) %>%
+  arrange(
+    relationship_spell_id,
+    interview_ym,
+    wave_n
+  ) %>%
+  group_by(relationship_spell_id) %>%
+  mutate(
+    strict_prior_spell_ghq = last_nonmissing_lag(ghq),
+    strict_prior_spell_ghq_ym = last_nonmissing_time_lag(ghq, interview_ym),
+    strict_prior_spell_ls = last_nonmissing_lag(life_satisfaction),
+    strict_prior_spell_ls_ym = last_nonmissing_time_lag(life_satisfaction, interview_ym),
+    strict_prior_rdas_satisfaction = last_nonmissing_lag(rdas_satisfaction),
+    strict_prior_rdas_satisfaction_ym =
+      last_nonmissing_time_lag(rdas_satisfaction, interview_ym),
+    strict_prior_rdas_cohesion = last_nonmissing_lag(rdas_cohesion),
+    strict_prior_rdas_cohesion_ym =
+      last_nonmissing_time_lag(rdas_cohesion, interview_ym),
+
+    strict_spell_ghq_gap = interview_ym - strict_prior_spell_ghq_ym,
+    strict_spell_ls_gap = interview_ym - strict_prior_spell_ls_ym,
+    strict_prior_rdas_sat_gap = interview_ym - strict_prior_rdas_satisfaction_ym,
+    strict_prior_rdas_coh_gap = interview_ym - strict_prior_rdas_cohesion_ym,
+
+    strict_recent_prior_spell_ghq =
+      !is.na(strict_prior_spell_ghq) &
+      strict_spell_ghq_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+      strict_spell_ghq_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+
+    strict_recent_prior_spell_ls =
+      !is.na(strict_prior_spell_ls) &
+      strict_spell_ls_gap >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+      strict_spell_ls_gap <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+
+    strict_recent_prior_rdas_sat =
+      !is.na(strict_prior_rdas_satisfaction) &
+      strict_prior_rdas_sat_gap >= PRIOR_RDAS_MIN_GAP_MONTHS &
+      strict_prior_rdas_sat_gap <= PRIOR_RDAS_MAX_GAP_MONTHS,
+
+    strict_recent_prior_rdas_coh =
+      !is.na(strict_prior_rdas_cohesion) &
+      strict_prior_rdas_coh_gap >= PRIOR_RDAS_MIN_GAP_MONTHS &
+      strict_prior_rdas_coh_gap <= PRIOR_RDAS_MAX_GAP_MONTHS,
+
+    strict_recent_prior_both_rdas =
+      strict_recent_prior_rdas_sat & strict_recent_prior_rdas_coh,
+
+    strict_spell_ghq_change = if_else(
+      strict_recent_prior_spell_ghq,
+      ghq - strict_prior_spell_ghq,
+      NA_real_
+    ),
+
+    strict_spell_ls_change = if_else(
+      strict_recent_prior_spell_ls,
+      life_satisfaction - strict_prior_spell_ls,
+      NA_real_
+    ),
+
+    strict_rdas_satisfaction_change = if_else(
+      strict_recent_prior_rdas_sat & !is.na(rdas_satisfaction),
+      rdas_satisfaction - strict_prior_rdas_satisfaction,
+      NA_real_
+    ),
+
+    strict_rdas_cohesion_change = if_else(
+      strict_recent_prior_rdas_coh & !is.na(rdas_cohesion),
+      rdas_cohesion - strict_prior_rdas_cohesion,
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  arrange(
+    relationship_spell_id,
+    interview_ym
+  ) %>%
+  group_by(relationship_spell_id) %>%
+  group_modify(~ {
+
+    ghq_hist <- last_nonmissing_change_lag(
+      .x$strict_spell_ghq_change,
+      .x$interview_ym
+    )
+
+    ls_hist <- last_nonmissing_change_lag(
+      .x$strict_spell_ls_change,
+      .x$interview_ym
+    )
+
+    sat_hist <- last_nonmissing_change_lag(
+      .x$strict_rdas_satisfaction_change,
+      .x$interview_ym
+    )
+
+    coh_hist <- last_nonmissing_change_lag(
+      .x$strict_rdas_cohesion_change,
+      .x$interview_ym
+    )
+
+    .x %>%
+      mutate(
+        strict_prior_ghq_change = ghq_hist$change,
+        strict_prior_ghq_change_ym = ghq_hist$time,
+        strict_prior_ls_change = ls_hist$change,
+        strict_prior_ls_change_ym = ls_hist$time,
+        strict_prior_rdas_sat_change = sat_hist$change,
+        strict_prior_rdas_sat_change_ym = sat_hist$time,
+        strict_prior_rdas_coh_change = coh_hist$change,
+        strict_prior_rdas_coh_change_ym = coh_hist$time
+      )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    strict_prior_ghq_change_gap = interview_ym - strict_prior_ghq_change_ym,
+    strict_prior_ls_change_gap = interview_ym - strict_prior_ls_change_ym,
+    strict_prior_rdas_sat_change_gap = interview_ym - strict_prior_rdas_sat_change_ym,
+    strict_prior_rdas_coh_change_gap = interview_ym - strict_prior_rdas_coh_change_ym,
+
+    strict_usable_prior_ghq_change =
+      !is.na(strict_prior_ghq_change) &
+      strict_prior_ghq_change_gap > 0 &
+      strict_prior_ghq_change_gap <= PRIOR_CHANGE_MAX_GAP_MONTHS,
+
+    strict_usable_prior_ls_change =
+      !is.na(strict_prior_ls_change) &
+      strict_prior_ls_change_gap > 0 &
+      strict_prior_ls_change_gap <= PRIOR_CHANGE_MAX_GAP_MONTHS,
+
+    strict_usable_prior_rdas_change =
+      !is.na(strict_prior_rdas_sat_change) &
+      !is.na(strict_prior_rdas_coh_change) &
+      strict_prior_rdas_sat_change_gap > 0 &
+      strict_prior_rdas_sat_change_gap <= PRIOR_CHANGE_MAX_GAP_MONTHS &
+      strict_prior_rdas_coh_change_gap > 0 &
+      strict_prior_rdas_coh_change_gap <= PRIOR_CHANGE_MAX_GAP_MONTHS
+  ) %>%
+  select(
+    landmark_id,
+    starts_with("strict_")
+  )
+
+cohab_panel <- cohab_panel %>%
+  left_join(
+    strict_history_panel,
+    by = "landmark_id"
+  )
+
+saveRDS(
+  cohab_panel,
+  file.path(OUT_DIR, "data", "03_cohabitation_person_spell_wave.rds")
+)
+
+primary_support <- cohab_panel %>%
+  filter(
+    !ambiguous_active_cohab,
+    cohab_duration_months >= PRIMARY_DURATION_MIN,
+    cohab_duration_months <= PRIMARY_DURATION_MAX
+  )
+
+sample_flow <- tibble(
+  stage = c(
+    "UKHLS person-wave interviews",
+    "Interview-months linked to cohabitation spell",
+    "Unambiguous cohabitation interview-months",
+    "Primary duration support 0-179m",
+    "Exact-date marriage 1-12m",
+    "Exact-date marriage 13-24m",
+    "Exact-date marriage 25-60m",
+    "Exact-date breakup 1-12m",
+    "Exact-date breakup 13-24m",
+    "Exact-date breakup 25-60m",
+    "Validated breakup <=24m allowing end_if 0/1",
+    "Observed continued cohabitation >=60m",
+    "GHQ recent-change marriage-horizon pool",
+    "LS recent-change marriage-horizon pool",
+    "GHQ recent-change breakup-horizon pool",
+    "LS recent-change breakup-horizon pool"
+  ),
+  n_rows = c(
+    nrow(panel),
+    nrow(cohab_panel),
+    sum(!cohab_panel$ambiguous_active_cohab, na.rm = TRUE),
+    nrow(primary_support),
+    sum(primary_support$marriage_horizon_state == "marriage_1_12m", na.rm = TRUE),
+    sum(primary_support$marriage_horizon_state == "marriage_13_24m", na.rm = TRUE),
+    sum(primary_support$marriage_horizon_state == "marriage_25_60m", na.rm = TRUE),
+    sum(primary_support$breakup_horizon_state == "breakup_1_12m", na.rm = TRUE),
+    sum(primary_support$breakup_horizon_state == "breakup_13_24m", na.rm = TRUE),
+    sum(primary_support$breakup_horizon_state == "breakup_25_60m", na.rm = TRUE),
+    sum(primary_support$validated_breakup_24m, na.rm = TRUE),
+    sum(primary_support$continued_cohab_60m, na.rm = TRUE),
+    sum(!is.na(primary_support$spell_ghq_change) &
+          !is.na(primary_support$marriage_horizon_state), na.rm = TRUE),
+    sum(!is.na(primary_support$spell_ls_change) &
+          !is.na(primary_support$marriage_horizon_state), na.rm = TRUE),
+    sum(!is.na(primary_support$spell_ghq_change) &
+          !is.na(primary_support$breakup_horizon_state), na.rm = TRUE),
+    sum(!is.na(primary_support$spell_ls_change) &
+          !is.na(primary_support$breakup_horizon_state), na.rm = TRUE)
+  )
+)
+
+write_csv_quiet(sample_flow, "01_sample_flow.csv")
+
+
+# -----------------------------------------------------------------------------
+# 7. ANALYSIS A: PRE-RELATIONSHIP PSYCHOLOGICAL DIFFERENTIATION
+# -----------------------------------------------------------------------------
+
+all_union_spells <- ph %>%
+  filter(status %in% c(2, 3, 10), !is.na(start_ym), !is.na(end_ym)) %>%
+  transmute(
+    pidp,
+    union_spellno = spellno,
+    union_status = status,
+    union_partner = partner,
+    union_start_ym = start_ym,
+    union_end_ym = end_ym,
+    union_start_if = start_if,
+    union_end_if = end_if,
+    union_ongoing = ongoing,
+    union_cohend = cohend
+  )
+
+active_union_interviews <- panel %>%
+  select(pidp, wave, interview_ym) %>%
+  inner_join(all_union_spells, by = "pidp", relationship = "many-to-many") %>%
+  filter(interview_ym >= union_start_ym, interview_ym <= union_end_ym) %>%
+  distinct(pidp, wave, interview_ym) %>%
+  mutate(active_union = TRUE)
+
+strict_unpartnered <- panel %>%
+  left_join(
+    active_union_interviews,
+    by = c("pidp", "wave", "interview_ym")
+  ) %>%
+  mutate(
+    active_union = coalesce(active_union, FALSE),
+    strict_no_partner = !active_union & ncrr1 == 2
+  ) %>%
+  filter(strict_no_partner)
+
+next_union_candidates <- strict_unpartnered %>%
+  inner_join(all_union_spells, by = "pidp", relationship = "many-to-many") %>%
+  filter(union_start_ym > interview_ym) %>%
+  mutate(months_to_next_union = union_start_ym - interview_ym) %>%
+  group_by(pidp, wave, interview_ym) %>%
+  arrange(months_to_next_union, union_spellno, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup()
+
+focal_cohab_outcomes <- cohab_spells %>%
+  transmute(
+    pidp,
+    union_spellno = cohab_spellno,
+    focal_cohab_outcome = spell_outcome,
+    focal_cohab_duration = cohab_end_ym - cohab_start_ym
+  )
+
+pre_rel_candidates <- next_union_candidates %>%
+  left_join(focal_cohab_outcomes, by = c("pidp", "union_spellno")) %>%
+  mutate(
+    focal_union_outcome = case_when(
+      union_status == 2 ~ "marriage",
+      union_status == 10 & focal_cohab_outcome == "marriage" ~ "marriage",
+      union_status == 10 & focal_cohab_outcome == "breakup" ~ "breakup",
+      union_status == 10 &
+        focal_cohab_outcome == "ongoing" &
+        !is.na(focal_cohab_duration) &
+        focal_cohab_duration >= 24 ~ "stable_cohab",
+      TRUE ~ "other"
+    ),
+    focal_union_id = paste(pidp, union_spellno, sep = "_")
+  )
+
+make_pre_rel_sample <- function(min_gap) {
+  pre_rel_candidates %>%
+    filter(
+      months_to_next_union >= min_gap,
+      months_to_next_union <= PRE_REL_MAX_GAP_MONTHS,
+      focal_union_outcome %in% c("marriage", "breakup", "stable_cohab")
+    ) %>%
+    group_by(focal_union_id) %>%
+    arrange(months_to_next_union, .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(
+      ghq_z = zsafe(ghq),
+      ls_z = zsafe(life_satisfaction),
+      ghq_change_z = zsafe(ghq_change),
+      ls_change_z = zsafe(ls_change)
+    )
+}
+
+pre_rel_primary <- make_pre_rel_sample(PRE_REL_MIN_GAP_MONTHS)
+pre_rel_sensitivity <- make_pre_rel_sample(PRE_REL_SENS_MIN_GAP_MONTHS)
+
+write_csv_quiet(
+  pre_rel_primary %>% count(focal_union_outcome, name = "n"),
+  "A00_pre_relationship_sample_counts.csv"
+)
+
+# Marriage versus breakup: primary selection contrast.
+A_marriage_breakup <- pre_rel_primary %>%
+  filter(focal_union_outcome %in% c("marriage", "breakup")) %>%
+  mutate(marriage_vs_breakup = as.integer(focal_union_outcome == "marriage"))
+
+A1_GHQ_LEVEL <- safe_feglm(
+  marriage_vs_breakup ~ ghq_z + age + i(sex) | wave,
+  data = A_marriage_breakup,
+  name = "A1_pre_relationship_GHQ_level_marriage_vs_breakup",
+  family = "binomial",
+  vcov = ~pidp
+)
+
+A1_LS_LEVEL <- safe_feglm(
+  marriage_vs_breakup ~ ls_z + age + i(sex) | wave,
+  data = A_marriage_breakup,
+  name = "A1_pre_relationship_LS_level_marriage_vs_breakup",
+  family = "binomial",
+  vcov = ~pidp
+)
+
+A2_GHQ_CHANGE <- safe_feglm(
+  marriage_vs_breakup ~ ghq_z + ghq_change_z + age + i(sex) | wave,
+  data = A_marriage_breakup %>% filter(recent_prior_ghq),
+  name = "A2_pre_relationship_GHQ_change_marriage_vs_breakup",
+  family = "binomial",
+  vcov = ~pidp
+)
+
+A2_LS_CHANGE <- safe_feglm(
+  marriage_vs_breakup ~ ls_z + ls_change_z + age + i(sex) | wave,
+  data = A_marriage_breakup %>% filter(recent_prior_ls),
+  name = "A2_pre_relationship_LS_change_marriage_vs_breakup",
+  family = "binomial",
+  vcov = ~pidp
+)
+
+# Marriage versus demonstrably stable cohabitation: complementary contrast.
+A_marriage_stable <- pre_rel_primary %>%
+  filter(focal_union_outcome %in% c("marriage", "stable_cohab")) %>%
+  mutate(marriage_vs_stable = as.integer(focal_union_outcome == "marriage"))
+
+A3_GHQ <- safe_feglm(
+  marriage_vs_stable ~ ghq_z + age + i(sex) | wave,
+  data = A_marriage_stable,
+  name = "A3_pre_relationship_GHQ_marriage_vs_stable",
+  family = "binomial",
+  vcov = ~pidp
+)
+
+A3_LS <- safe_feglm(
+  marriage_vs_stable ~ ls_z + age + i(sex) | wave,
+  data = A_marriage_stable,
+  name = "A3_pre_relationship_LS_marriage_vs_stable",
+  family = "binomial",
+  vcov = ~pidp
+)
+
+# 24-60m sensitivity.
+A_sens_mb <- pre_rel_sensitivity %>%
+  filter(focal_union_outcome %in% c("marriage", "breakup")) %>%
+  mutate(marriage_vs_breakup = as.integer(focal_union_outcome == "marriage"))
+
+A_SENS_GHQ <- safe_feglm(
+  marriage_vs_breakup ~ ghq_z + age + i(sex) | wave,
+  data = A_sens_mb,
+  name = "A_SENS_pre_relationship_24_60m_GHQ",
+  family = "binomial",
+  vcov = ~pidp
+)
+
+A_SENS_LS <- safe_feglm(
+  marriage_vs_breakup ~ ls_z + age + i(sex) | wave,
+  data = A_sens_mb,
+  name = "A_SENS_pre_relationship_24_60m_LS",
+  family = "binomial",
+  vcov = ~pidp
+)
+
+# -----------------------------------------------------------------------------
+# 8. RISK-SET CONSTRUCTION HELPER
+# -----------------------------------------------------------------------------
+
+add_riskset_id <- function(dat) {
+  dat %>%
+    mutate(
+      duration_stratum = floor(
+        cohab_duration_months / RISKSET_DURATION_BIN_MONTHS
+      ),
+      age_stratum = floor(age / RISKSET_AGE_BIN_YEARS),
+      riskset_stratum = interaction(
+        wave, sex, duration_stratum, age_stratum, drop = TRUE
+      )
+    )
+}
+
+make_att_riskset <- function(dat, treated_var = "treated") {
+  dat <- dat %>%
+    filter(
+      !is.na(riskset_stratum),
+      !is.na(.data[[treated_var]])
+    )
+
+  counts <- dat %>%
+    group_by(riskset_stratum) %>%
+    summarise(
+      n_treated = sum(.data[[treated_var]] == 1, na.rm = TRUE),
+      n_control = sum(.data[[treated_var]] == 0, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(n_treated > 0, n_control > 0)
+
+  dat %>%
+    inner_join(counts, by = "riskset_stratum") %>%
+    mutate(
+      att_weight = if_else(
+        .data[[treated_var]] == 1,
+        1,
+        n_treated / n_control
+      )
+    )
+}
+
+# -----------------------------------------------------------------------------
+# 9. ANALYSIS B: DISTAL 25-60m PRE-PROXIMITY DIAGNOSTIC
+# -----------------------------------------------------------------------------
+#
+# B is deliberately NOT called an independent state-selection analysis.
+# It only tests whether levels are already different well before the 1-24m
+# window that D treats as proximal.
+
+distal_level_pool <- primary_support %>%
+  filter(
+    marriage_horizon_state %in% c("marriage_25_60m", "continued_cohab_60m")
+  ) %>%
+  mutate(
+    distal_treated = as.integer(marriage_horizon_state == "marriage_25_60m"),
+    ghq_z = zsafe(ghq),
+    ls_z = zsafe(life_satisfaction)
+  ) %>%
+  add_riskset_id()
+
+B_distal_matched <- make_att_riskset(
+  distal_level_pool,
+  treated_var = "distal_treated"
+)
+
+write_csv_quiet(
+  B_distal_matched %>% count(marriage_horizon_state, name = "n"),
+  "B00_distal_matched_counts.csv"
+)
+
+B1_GHQ_DISTAL <- safe_feols(
+  ghq_z ~ distal_treated | riskset_stratum,
+  data = B_distal_matched,
+  name = "B1_GHQ_distal_25_60m_ATT_riskset",
+  weights = ~att_weight,
+  vcov = ~pidp
+)
+
+B1_LS_DISTAL <- safe_feols(
+  ls_z ~ distal_treated | riskset_stratum,
+  data = B_distal_matched,
+  name = "B1_LS_distal_25_60m_ATT_riskset",
+  weights = ~att_weight,
+  vcov = ~pidp
+)
+
+# -----------------------------------------------------------------------------
+# 10. ANALYSIS C: RELATIONSHIP DEVELOPMENT
+# -----------------------------------------------------------------------------
+
+development <- primary_support %>%
+  filter(spell_outcome %in% c("marriage", "breakup", "ongoing")) %>%
+  mutate(
+    duration_bin = cut(
+      cohab_duration_months,
+      breaks = c(-Inf, 11, 23, 35, 59, 83, 119, 179),
+      labels = c(
+        "0-11", "12-23", "24-35", "36-59",
+        "60-83", "84-119", "120-179"
+      )
+    ),
+    duration_bin = relevel(factor(duration_bin), ref = "0-11"),
+    spell_outcome = relevel(factor(spell_outcome), ref = "ongoing"),
+    ghq_z = zsafe(ghq),
+    ls_z = zsafe(life_satisfaction),
+    rdas_satisfaction_z = zsafe(rdas_satisfaction),
+    rdas_cohesion_z = zsafe(rdas_cohesion)
+  )
+
+# Main effects of spell_outcome are not requested because spell outcome is
+# constant within relationship and is absorbed by relationship-spell FE.
+#
+# V4.2 IDENTIFICATION FIX:
+# ------------------------
+# V4.1 included all duration-bin x spell-outcome interactions, including the
+# 0-11m interaction. Within a marriage (or breakup) spell, the complete set of
+# duration-bin interactions sums to a spell-level constant, which is absorbed
+# by relationship_spell_id FE. This generated exact collinearity and enormous
+# standard errors. V4.2 explicitly omits the 0-11m outcome interaction and uses
+# named dummy interactions for all later duration bins.
+
+C_TRAJ_NONREF_BINS <- c(
+  "12-23", "24-35", "36-59", "60-83", "84-119", "120-179"
+)
+
+make_bin_stub <- function(x) gsub("-", "_", x, fixed = TRUE)
+
+for (bin in C_TRAJ_NONREF_BINS) {
+  stub <- make_bin_stub(bin)
+  development[[paste0("dur_", stub)]] <- as.integer(development$duration_bin == bin)
+  development[[paste0("marriage_x_", stub)]] <-
+    as.integer(development$spell_outcome == "marriage") *
+    development[[paste0("dur_", stub)]]
+  development[[paste0("breakup_x_", stub)]] <-
+    as.integer(development$spell_outcome == "breakup") *
+    development[[paste0("dur_", stub)]]
+}
+
+C_DUR_TERMS <- paste0("dur_", make_bin_stub(C_TRAJ_NONREF_BINS))
+C_MARRIAGE_TERMS <- paste0("marriage_x_", make_bin_stub(C_TRAJ_NONREF_BINS))
+C_BREAKUP_TERMS <- paste0("breakup_x_", make_bin_stub(C_TRAJ_NONREF_BINS))
+C_TRAJ_RHS <- paste(
+  c(C_DUR_TERMS, C_MARRIAGE_TERMS, C_BREAKUP_TERMS),
+  collapse = " + "
+)
+
+make_C_trajectory_formula <- function(outcome) {
+  stats::as.formula(
+    paste0(
+      outcome,
+      " ~ ", C_TRAJ_RHS,
+      " | relationship_spell_id + wave"
+    )
+  )
+}
+
+C1_GHQ_TRAJECTORY <- safe_feols(
+  make_C_trajectory_formula("ghq_z"),
+  data = development,
+  name = "C1_GHQ_relationship_age_trajectory",
+  vcov = ~pidp
+)
+
+C1_LS_TRAJECTORY <- safe_feols(
+  make_C_trajectory_formula("ls_z"),
+  data = development,
+  name = "C1_LS_relationship_age_trajectory",
+  vcov = ~pidp
+)
+
+C2_RDAS_SAT_TRAJECTORY <- safe_feols(
+  make_C_trajectory_formula("rdas_satisfaction_z"),
+  data = development,
+  name = "C2_RDAS_satisfaction_relationship_age_trajectory",
+  vcov = ~pidp
+)
+
+C2_RDAS_COH_TRAJECTORY <- safe_feols(
+  make_C_trajectory_formula("rdas_cohesion_z"),
+  data = development,
+  name = "C2_RDAS_cohesion_relationship_age_trajectory",
+  vcov = ~pidp
+)
+
+# Numerical identification audit for the corrected C1/C2 models.
+trajectory_identification_row <- function(model, name) {
+  if (is.null(model)) {
+    return(tibble(
+      model = name,
+      n_coefficients = NA_integer_,
+      n_outcome_interactions = NA_integer_,
+      max_abs_interaction_estimate = NA_real_,
+      max_interaction_se = NA_real_,
+      all_interaction_se_finite = FALSE,
+      status = "model_missing"
+    ))
+  }
+  cf <- stats::coef(model)
+  ss <- fixest::se(model)
+  idx <- grepl("^(marriage_x_|breakup_x_)", names(cf))
+  tibble(
+    model = name,
+    n_coefficients = length(cf),
+    n_outcome_interactions = sum(idx),
+    max_abs_interaction_estimate = if_else(any(idx), max(abs(cf[idx]), na.rm = TRUE), NA_real_),
+    max_interaction_se = if_else(any(idx), max(ss[idx], na.rm = TRUE), NA_real_),
+    all_interaction_se_finite = if_else(any(idx), all(is.finite(ss[idx])), FALSE),
+    status = if_else(any(idx) && all(is.finite(ss[idx])), "identified_numeric", "inspect")
+  )
+}
+
+C_TRAJECTORY_IDENTIFICATION_AUDIT <- bind_rows(
+  trajectory_identification_row(C1_GHQ_TRAJECTORY, "C1_GHQ"),
+  trajectory_identification_row(C1_LS_TRAJECTORY, "C1_LS"),
+  trajectory_identification_row(C2_RDAS_SAT_TRAJECTORY, "C2_RDAS_satisfaction"),
+  trajectory_identification_row(C2_RDAS_COH_TRAJECTORY, "C2_RDAS_cohesion")
+)
+
+write_csv_quiet(
+  C_TRAJECTORY_IDENTIFICATION_AUDIT,
+  "C00_trajectory_identification_audit.csv",
+  subdir = "diagnostics"
+)
+# C3: prior RDAS change -> later psychological change.
+C3_data_ghq <- development %>%
+  filter(
+    !is.na(spell_ghq_change),
+    usable_prior_rdas_change,
+    !is.na(prior_spell_ghq)
+  ) %>%
+  mutate(
+    ghq_change_z = zsafe(spell_ghq_change),
+    prior_ghq_level_z = zsafe(prior_spell_ghq),
+    prior_rdas_sat_change_z = zsafe(prior_rdas_sat_change),
+    prior_rdas_coh_change_z = zsafe(prior_rdas_coh_change)
+  )
+
+C3_GHQ_LAGGED_RDAS <- safe_feols(
+  ghq_change_z ~
+    prior_rdas_sat_change_z +
+    prior_rdas_coh_change_z +
+    prior_ghq_level_z +
+    ns(cohab_duration_months, df = 4) |
+    relationship_spell_id + wave,
+  data = C3_data_ghq,
+  name = "C3_GHQ_change_from_PRIOR_RDAS_change",
+  vcov = ~pidp
+)
+
+C3_data_ls <- development %>%
+  filter(
+    !is.na(spell_ls_change),
+    usable_prior_rdas_change,
+    !is.na(prior_spell_ls)
+  ) %>%
+  mutate(
+    ls_change_z = zsafe(spell_ls_change),
+    prior_ls_level_z = zsafe(prior_spell_ls),
+    prior_rdas_sat_change_z = zsafe(prior_rdas_sat_change),
+    prior_rdas_coh_change_z = zsafe(prior_rdas_coh_change)
+  )
+
+C3_LS_LAGGED_RDAS <- safe_feols(
+  ls_change_z ~
+    prior_rdas_sat_change_z +
+    prior_rdas_coh_change_z +
+    prior_ls_level_z +
+    ns(cohab_duration_months, df = 4) |
+    relationship_spell_id + wave,
+  data = C3_data_ls,
+  name = "C3_LS_change_from_PRIOR_RDAS_change",
+  vcov = ~pidp
+)
+
+# C4: reverse temporal ordering, prior psychological change -> later RDAS change.
+run_C4 <- function(
+  outcome_change,
+  prior_psych_change,
+  prior_psych_ok,
+  prior_rdas_level,
+  model_name
+) {
+  dat <- development %>%
+    mutate(
+      outcome_change_tmp = .data[[outcome_change]],
+      prior_psych_change_tmp = .data[[prior_psych_change]],
+      prior_psych_ok_tmp = .data[[prior_psych_ok]],
+      prior_rdas_level_tmp = .data[[prior_rdas_level]]
+    ) %>%
+    filter(
+      !is.na(outcome_change_tmp),
+      prior_psych_ok_tmp,
+      !is.na(prior_rdas_level_tmp)
+    ) %>%
+    mutate(
+      outcome_change_z = zsafe(outcome_change_tmp),
+      prior_psych_change_z = zsafe(prior_psych_change_tmp),
+      prior_rdas_level_z = zsafe(prior_rdas_level_tmp)
+    )
+
+  safe_feols(
+    outcome_change_z ~
+      prior_psych_change_z +
+      prior_rdas_level_z +
+      ns(cohab_duration_months, df = 4) |
+      relationship_spell_id + wave,
+    data = dat,
+    name = model_name,
+    vcov = ~pidp
+  )
+}
+
+C4_RDAS_SAT_FROM_GHQ <- run_C4(
+  "rdas_satisfaction_change",
+  "prior_ghq_change",
+  "usable_prior_ghq_change",
+  "prior_rdas_satisfaction",
+  "C4_RDAS_satisfaction_change_from_PRIOR_GHQ_change"
+)
+
+C4_RDAS_COH_FROM_GHQ <- run_C4(
+  "rdas_cohesion_change",
+  "prior_ghq_change",
+  "usable_prior_ghq_change",
+  "prior_rdas_cohesion",
+  "C4_RDAS_cohesion_change_from_PRIOR_GHQ_change"
+)
+
+C4_RDAS_SAT_FROM_LS <- run_C4(
+  "rdas_satisfaction_change",
+  "prior_ls_change",
+  "usable_prior_ls_change",
+  "prior_rdas_satisfaction",
+  "C4_RDAS_satisfaction_change_from_PRIOR_LS_change"
+)
+
+C4_RDAS_COH_FROM_LS <- run_C4(
+  "rdas_cohesion_change",
+  "prior_ls_change",
+  "usable_prior_ls_change",
+  "prior_rdas_cohesion",
+  "C4_RDAS_cohesion_change_from_PRIOR_LS_change"
+)
+
+
+# -----------------------------------------------------------------------------
+# 10B. FORMAL C-TO-D PRE-PROXIMITY DIAGNOSTICS
+# -----------------------------------------------------------------------------
+#
+# Two related diagnostics are exported.
+#
+# C5a: early relationship-age diagnostic from the corrected C1 models.
+#      The 0-11m marriage interaction is explicitly omitted. Therefore
+#      marriage_x_12_23 asks whether change from 0-11m to 12-23m differs for
+#      spells that eventually marry versus ongoing spells.
+#
+# C5b: preferred pre-proximity diagnostic. It restricts observations to
+#      exact marriages still 25-60 months away versus continued cohabitation
+#      observed for >=60 months and tests whether relationship-age slopes
+#      already differ before the 1-24m proximal marriage window.
+#
+# These are NOT conventional DID parallel-trends tests. They diagnose whether
+# D_M should be interpreted as onset of a localized proximity pattern versus
+# continuation/acceleration of earlier divergence.
+
+C5a_early_tests <- bind_rows(
+  safe_wald_row(
+    C1_GHQ_TRAJECTORY,
+    keep = "^marriage_x_12_23$",
+    test_name = "C5a early 0-11 to 12-23 marriage-trajectory difference",
+    outcome = "GHQ"
+  ),
+  safe_wald_row(
+    C1_LS_TRAJECTORY,
+    keep = "^marriage_x_12_23$",
+    test_name = "C5a early 0-11 to 12-23 marriage-trajectory difference",
+    outcome = "Life satisfaction"
+  )
+)
+
+write_csv_quiet(
+  C5a_early_tests,
+  "C5a_early_relationship_age_joint_tests.csv",
+  subdir = "diagnostics"
+)
+
+C5_preprox <- primary_support %>%
+  filter(
+    marriage_horizon_state %in% c(
+      "marriage_25_60m",
+      "continued_cohab_60m"
+    )
+  ) %>%
+  mutate(
+    preprox_treated = as.integer(
+      marriage_horizon_state == "marriage_25_60m"
+    ),
+    ghq_z_preprox = zsafe(ghq),
+    ls_z_preprox = zsafe(life_satisfaction)
+  )
+
+C5_GHQ_PREPROX <- safe_feols(
+  ghq_z_preprox ~
+    ns(cohab_duration_months, df = 3) +
+    ns(cohab_duration_months, df = 3):preprox_treated |
+    relationship_spell_id + wave,
+  data = C5_preprox,
+  name = "C5_GHQ_preprox_25_60m_trajectory_diagnostic",
+  vcov = ~pidp
+)
+
+C5_LS_PREPROX <- safe_feols(
+  ls_z_preprox ~
+    ns(cohab_duration_months, df = 3) +
+    ns(cohab_duration_months, df = 3):preprox_treated |
+    relationship_spell_id + wave,
+  data = C5_preprox,
+  name = "C5_LS_preprox_25_60m_trajectory_diagnostic",
+  vcov = ~pidp
+)
+
+C5b_preprox_tests <- bind_rows(
+  safe_wald_row(
+    C5_GHQ_PREPROX,
+    keep = "preprox_treated",
+    test_name = "C5b joint pre-proximity trajectory interaction",
+    outcome = "GHQ"
+  ),
+  safe_wald_row(
+    C5_LS_PREPROX,
+    keep = "preprox_treated",
+    test_name = "C5b joint pre-proximity trajectory interaction",
+    outcome = "Life satisfaction"
+  )
+)
+
+write_csv_quiet(
+  C5b_preprox_tests,
+  "C5b_preprox_25_60m_joint_tests.csv",
+  subdir = "diagnostics"
+)
+
+# -----------------------------------------------------------------------------
+# 11. ANALYSES D_M AND D_B: PROXIMITY RISK-SET ANALYSES
+# -----------------------------------------------------------------------------
+#
+# D_M: exact marriage proximity
+#   1-12m, 13-24m, 25-60m versus continued cohabitation >=60m
+#
+# D_B: exact validated-breakup proximity
+#   1-12m, 13-24m, 25-60m versus continued cohabitation >=60m
+#
+# Outcome: RECENT within-relationship psychological change.
+#
+# Risk sets: wave x sex x 6-month duration x 2-year age.
+# Treated observations receive weight 1. Controls receive n_treated/n_control
+# within risk set, yielding an ATT-oriented coarsened risk-set comparison.
+#
+# MISSING PRIOR CHANGE
+# --------------------
+# There is NO mean-fill + missing-indicator method in this version.
+# Each contrast is estimated as:
+#
+# D0  Broad sample: prior outcome level only.
+# D1a History-complete baseline: same formula, restricted to observed prior
+#     psychological change.
+# D1b Same D1a sample + observed prior psychological change.
+# D1c D1b + IPHAW sensitivity for selective psychological-history availability.
+# D2a RDAS-level-complete common-sample baseline.
+# D2b Same D2a sample + prior RDAS satisfaction/cohesion levels.
+# D2c D2b + sequential IPHAW sensitivity.
+# D3a RDAS-change-complete common-sample baseline.
+# D3b Same D3a sample + prior RDAS satisfaction/cohesion changes.
+# D3c D3b + sequential IPHAW sensitivity.
+#
+# E below quantifies DESCRIPTIVE attenuation only between nested models fitted
+# on identical common samples. These are not causal mediated proportions.
+
+D_marriage_pool <- primary_support %>%
+  filter(
+    marriage_horizon_state %in% c(
+      "marriage_1_12m",
+      "marriage_13_24m",
+      "marriage_25_60m",
+      "continued_cohab_60m"
+    )
+  ) %>%
+  add_riskset_id()
+
+D_breakup_pool <- primary_support %>%
+  filter(
+    breakup_horizon_state %in% c(
+      "breakup_1_12m",
+      "breakup_13_24m",
+      "breakup_25_60m",
+      "continued_cohab_60m"
+    )
+  ) %>%
+  add_riskset_id()
+
+prepare_proximity_pair <- function(
+  data,
+  state_var,
+  treated_state,
+  outcome = c("ghq", "ls")
+) {
+  outcome <- match.arg(outcome)
+
+  dat <- data %>%
+    filter(
+      .data[[state_var]] %in% c(
+        treated_state,
+        "continued_cohab_60m"
+      )
+    ) %>%
+    mutate(
+      treated = as.integer(.data[[state_var]] == treated_state)
+    )
+
+  if (outcome == "ghq") {
+    dat <- dat %>%
+      filter(
+        !is.na(spell_ghq_change),
+        !is.na(prior_spell_ghq)
+      ) %>%
+      mutate(
+        outcome_change = spell_ghq_change,
+        prior_outcome = prior_spell_ghq,
+        prior_outcome_change = prior_ghq_change,
+        n_prior_outcome_obs = n_prior_ghq_obs,
+        psych_history_available =
+          usable_prior_ghq_change & !is.na(prior_ghq_change),
+        H1_opportunity = H1_ghq_opportunity,
+        H1_source_ambiguous = H1_ghq_source_ambiguous,
+
+        strict_outcome_change = strict_spell_ghq_change,
+        strict_prior_outcome = strict_prior_spell_ghq,
+        strict_prior_outcome_change = strict_prior_ghq_change,
+        strict_psych_history_available =
+          strict_usable_prior_ghq_change & !is.na(strict_prior_ghq_change)
+      )
+  } else {
+    dat <- dat %>%
+      filter(
+        !is.na(spell_ls_change),
+        !is.na(prior_spell_ls)
+      ) %>%
+      mutate(
+        outcome_change = spell_ls_change,
+        prior_outcome = prior_spell_ls,
+        prior_outcome_change = prior_ls_change,
+        n_prior_outcome_obs = n_prior_ls_obs,
+        psych_history_available =
+          usable_prior_ls_change & !is.na(prior_ls_change),
+        H1_opportunity = H1_ls_opportunity,
+        H1_source_ambiguous = H1_ls_source_ambiguous,
+
+        strict_outcome_change = strict_spell_ls_change,
+        strict_prior_outcome = strict_prior_spell_ls,
+        strict_prior_outcome_change = strict_prior_ls_change,
+        strict_psych_history_available =
+          strict_usable_prior_ls_change & !is.na(strict_prior_ls_change)
+      )
+  }
+
+  dat %>%
+    mutate(
+      rdas_level_available =
+        recent_prior_both_rdas &
+        !is.na(prior_rdas_satisfaction) &
+        !is.na(prior_rdas_cohesion),
+
+      rdas_change_available =
+        usable_prior_rdas_change &
+        !is.na(prior_rdas_sat_change) &
+        !is.na(prior_rdas_coh_change),
+
+      H2_source_ambiguous =
+        H2_sat_source_ambiguous | H2_coh_source_ambiguous,
+
+      H3_source_ambiguous =
+        H3_sat_source_ambiguous | H3_coh_source_ambiguous,
+
+      D2_opportunity =
+        H1_opportunity & H2_opportunity,
+
+      D3_opportunity =
+        H1_opportunity & H2_opportunity & H3_opportunity,
+
+      joint_history_available =
+        psych_history_available &
+        rdas_level_available &
+        rdas_change_available,
+
+      strict_rdas_level_available =
+        strict_recent_prior_both_rdas &
+        !is.na(strict_prior_rdas_satisfaction) &
+        !is.na(strict_prior_rdas_cohesion),
+
+      strict_rdas_change_available =
+        strict_usable_prior_rdas_change &
+        !is.na(strict_prior_rdas_sat_change) &
+        !is.na(strict_prior_rdas_coh_change)
+    )
+}
+
+# Rebuild ATT weights after each complete-history restriction. This prevents
+# old broad-sample n_treated/n_control values from leaking into nested samples.
+make_att_riskset_v2 <- function(dat) {
+  dat <- dat %>%
+    select(-any_of(c("n_treated", "n_control", "att_weight"))) %>%
+    filter(!is.na(riskset_stratum))
+
+  make_att_riskset(dat, treated_var = "treated")
+}
+
+export_proximity_sample <- function(dat, stub, state_var) {
+  if (nrow(dat) == 0L) return(invisible(NULL))
+
+  write_csv_quiet(
+    dat %>%
+      group_by(.data[[state_var]]) %>%
+      summarise(
+        n_landmarks = n(),
+        n_persons = n_distinct(pidp),
+        weighted_mass_ATT = sum(att_weight, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    paste0(stub, "_sample.csv")
+  )
+
+  balance_vars <- c(
+    "cohab_duration_months",
+    "age",
+    "prior_outcome"
+  )
+
+  if ("prior_outcome_change" %in% names(dat) &&
+      any(!is.na(dat$prior_outcome_change))) {
+    balance_vars <- c(balance_vars, "prior_outcome_change")
+  }
+
+  balance <- map_dfr(balance_vars, function(v) {
+    tibble(
+      variable = v,
+      smd_unweighted = smd_two_group(dat[[v]], dat$treated),
+      smd_ATT = smd_two_group(dat[[v]], dat$treated, dat$att_weight)
+    )
+  })
+
+  write_csv_quiet(
+    balance,
+    paste0(stub, "_balance.csv"),
+    subdir = "diagnostics"
+  )
+}
+
+fit_strict_unambiguous_sensitivity <- function(
+  pair,
+  prefix
+) {
+
+  if (!RUN_STRICT_UNAMBIGUOUS_HISTORY_SENSITIVITY) {
+    return(list(
+      D1b_strict = NULL,
+      D2b_strict = NULL,
+      D3b_strict = NULL,
+      counts = tibble()
+    ))
+  }
+
+  d1_dat <- pair %>%
+    filter(
+      !is.na(strict_outcome_change),
+      !is.na(strict_prior_outcome),
+      strict_psych_history_available,
+      !is.na(strict_prior_outcome_change)
+    ) %>%
+    mutate(
+      strict_y = strict_outcome_change,
+      strict_y_lag = strict_prior_outcome,
+      strict_dy_lag = strict_prior_outcome_change
+    )
+
+  d1_rs <- make_att_riskset_v2(d1_dat)
+
+  D1b_strict <- safe_feols(
+    strict_y ~
+      treated +
+      strict_y_lag +
+      strict_dy_lag |
+      riskset_stratum,
+    data = d1_rs,
+    name = paste0(prefix, "_STRICT_D1b_unambiguous_history"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  d2_dat <- d1_dat %>%
+    filter(
+      strict_rdas_level_available,
+      !is.na(strict_prior_rdas_satisfaction),
+      !is.na(strict_prior_rdas_cohesion)
+    ) %>%
+    mutate(
+      strict_rdas_sat_lag = strict_prior_rdas_satisfaction,
+      strict_rdas_coh_lag = strict_prior_rdas_cohesion
+    )
+
+  d2_rs <- make_att_riskset_v2(d2_dat)
+
+  D2b_strict <- safe_feols(
+    strict_y ~
+      treated +
+      strict_y_lag +
+      strict_dy_lag +
+      strict_rdas_sat_lag +
+      strict_rdas_coh_lag |
+      riskset_stratum,
+    data = d2_rs,
+    name = paste0(prefix, "_STRICT_D2b_unambiguous_history"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  d3_dat <- d2_dat %>%
+    filter(
+      strict_rdas_change_available,
+      !is.na(strict_prior_rdas_sat_change),
+      !is.na(strict_prior_rdas_coh_change)
+    ) %>%
+    mutate(
+      strict_rdas_sat_change_lag = strict_prior_rdas_sat_change,
+      strict_rdas_coh_change_lag = strict_prior_rdas_coh_change
+    )
+
+  d3_rs <- make_att_riskset_v2(d3_dat)
+
+  D3b_strict <- safe_feols(
+    strict_y ~
+      treated +
+      strict_y_lag +
+      strict_dy_lag +
+      strict_rdas_sat_lag +
+      strict_rdas_coh_lag +
+      strict_rdas_sat_change_lag +
+      strict_rdas_coh_change_lag |
+      riskset_stratum,
+    data = d3_rs,
+    name = paste0(prefix, "_STRICT_D3b_unambiguous_history"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  list(
+    D1b_strict = D1b_strict,
+    D2b_strict = D2b_strict,
+    D3b_strict = D3b_strict,
+    counts = tibble(
+      stage = c("strict_D1", "strict_D2", "strict_D3"),
+      n_landmarks = c(nrow(d1_rs), nrow(d2_rs), nrow(d3_rs)),
+      n_persons = c(
+        n_distinct(d1_rs$pidp),
+        n_distinct(d2_rs$pidp),
+        n_distinct(d3_rs$pidp)
+      )
+    )
+  )
+}
+
+run_proximity_sequence <- function(
+  data,
+  state_var,
+  treated_state,
+  outcome,
+  arm
+) {
+
+  pair <- prepare_proximity_pair(
+    data = data,
+    state_var = state_var,
+    treated_state = treated_state,
+    outcome = outcome
+  )
+
+  prefix <- paste0(
+    "D_", arm, "_", outcome, "_", treated_state,
+    "_vs_continued_cohab_60m"
+  )
+
+  # ---------------------------------------------------------------------------
+  # D0: broad eligible sample, prior level only.
+  # ---------------------------------------------------------------------------
+  broad_rs <- make_att_riskset_v2(pair)
+  export_proximity_sample(
+    broad_rs,
+    paste0(prefix, "_D0_broad"),
+    state_var
+  )
+
+  broad_rs <- broad_rs %>%
+    mutate(
+      H1_raw = as.integer(psych_history_available),
+      H2_raw = as.integer(rdas_level_available),
+      H3_raw = as.integer(rdas_change_available),
+      H1_opp_raw = as.integer(H1_opportunity),
+      H2_opp_raw = as.integer(H2_opportunity),
+      H3_opp_raw = as.integer(H3_opportunity)
+    )
+
+  opportunity_diagnostics <- broad_rs %>%
+    group_by(treated) %>%
+    summarise(
+      n = n(),
+      H1_opportunity_n = sum(H1_opportunity, na.rm = TRUE),
+      H1_available_n = sum(psych_history_available, na.rm = TRUE),
+      H1_available_given_opp_rate = if_else(
+        H1_opportunity_n > 0,
+        sum(psych_history_available & H1_opportunity, na.rm = TRUE) /
+          H1_opportunity_n,
+        NA_real_
+      ),
+      H1_available_without_opp = sum(
+        psych_history_available & !H1_opportunity,
+        na.rm = TRUE
+      ),
+      H2_opportunity_n = sum(H2_opportunity, na.rm = TRUE),
+      H2_available_n = sum(rdas_level_available, na.rm = TRUE),
+      H2_available_given_opp_rate = if_else(
+        H2_opportunity_n > 0,
+        sum(rdas_level_available & H2_opportunity, na.rm = TRUE) /
+          H2_opportunity_n,
+        NA_real_
+      ),
+      H2_available_without_opp = sum(
+        rdas_level_available & !H2_opportunity,
+        na.rm = TRUE
+      ),
+      H3_opportunity_n = sum(H3_opportunity, na.rm = TRUE),
+      H3_available_n = sum(rdas_change_available, na.rm = TRUE),
+      H3_available_given_opp_rate = if_else(
+        H3_opportunity_n > 0,
+        sum(rdas_change_available & H3_opportunity, na.rm = TRUE) /
+          H3_opportunity_n,
+        NA_real_
+      ),
+      H3_available_without_opp = sum(
+        rdas_change_available & !H3_opportunity,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      arm = arm,
+      horizon = treated_state,
+      outcome = outcome
+    )
+
+  write_csv_quiet(
+    opportunity_diagnostics,
+    paste0(prefix, "_STRUCTURAL_OPPORTUNITY_DIAGNOSTIC.csv"),
+    subdir = "diagnostics"
+  )
+
+  mismatch_total <- opportunity_diagnostics %>%
+    summarise(
+      n = sum(
+        H1_available_without_opp +
+          H2_available_without_opp +
+          H3_available_without_opp,
+        na.rm = TRUE
+      )
+    ) %>%
+    pull(n)
+
+  if (!is.na(mismatch_total) && mismatch_total > 0L) {
+    stop(
+      "Validated structural-opportunity definition failed inside ",
+      prefix,
+      ". Inspect the structural-opportunity diagnostic before continuing."
+    )
+  }
+
+  availability_pattern <- bind_rows(
+    broad_rs %>%
+      count(
+        treated,
+        H1_raw,
+        H2_raw,
+        H3_raw,
+        H1_opp_raw,
+        H2_opp_raw,
+        H3_opp_raw,
+        name = "n"
+      ) %>%
+      group_by(treated) %>%
+      mutate(
+        proportion_within_treatment = n / sum(n),
+        scope = if_else(treated == 1, "treated", "control")
+      ) %>%
+      ungroup(),
+
+    broad_rs %>%
+      count(
+        H1_raw,
+        H2_raw,
+        H3_raw,
+        H1_opp_raw,
+        H2_opp_raw,
+        H3_opp_raw,
+        name = "n"
+      ) %>%
+      mutate(
+        treated = NA_integer_,
+        proportion_within_treatment = n / sum(n),
+        scope = "overall"
+      )
+  ) %>%
+    mutate(
+      H2_without_H1 = H2_raw == 1 & H1_raw == 0,
+      H3_without_H2 = H3_raw == 1 & H2_raw == 0,
+      H3_without_H1 = H3_raw == 1 & H1_raw == 0,
+      arm = arm,
+      horizon = treated_state,
+      outcome = outcome
+    )
+
+  write_csv_quiet(
+    availability_pattern,
+    paste0(prefix, "_RAW_H1_H2_H3_AVAILABILITY_AND_OPPORTUNITY.csv"),
+    subdir = "diagnostics"
+  )
+
+  availability_nonmonotone_summary <- broad_rs %>%
+    summarise(
+      n = n(),
+      pct_H2_without_H1 = 100 * mean(
+        rdas_level_available & !psych_history_available,
+        na.rm = TRUE
+      ),
+      pct_H3_without_H2 = 100 * mean(
+        rdas_change_available & !rdas_level_available,
+        na.rm = TRUE
+      ),
+      pct_H3_without_H1 = 100 * mean(
+        rdas_change_available & !psych_history_available,
+        na.rm = TRUE
+      ),
+      pct_joint_complete = 100 * mean(
+        joint_history_available,
+        na.rm = TRUE
+      )
+    ) %>%
+    mutate(
+      arm = arm,
+      horizon = treated_state,
+      outcome = outcome,
+      interpretation = paste(
+        "Raw availability need not be naturally monotone.",
+        "Sequential D2/D3 probabilities are estimated conditionally within",
+        "the corresponding validated structural-opportunity targets."
+      )
+    )
+
+  write_csv_quiet(
+    availability_nonmonotone_summary,
+    paste0(prefix, "_AVAILABILITY_NESTING_DIAGNOSTIC.csv"),
+    subdir = "diagnostics"
+  )
+
+  D0 <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome |
+      riskset_stratum,
+    data = broad_rs,
+    name = paste0(prefix, "_D0_broad_prior_level"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  # ---------------------------------------------------------------------------
+  # D1: complete psychological history + mandatory D1c sensitivity.
+  # ---------------------------------------------------------------------------
+  # D1b: ATT in the observed-history-complete population.
+  # D1c: same observed-history rows, but ATT and history weights target the
+  #      H1 STRUCTURAL-OPPORTUNITY population.
+
+  D1_support <- broad_rs %>%
+    filter(H1_opportunity) %>%
+    make_att_riskset_v2() %>%
+    rename(D1_target_att_weight = att_weight)
+
+  h1 <- estimate_ipha_stage(
+    D1_support,
+    availability_var = "psych_history_available",
+    opportunity_var = "H1_opportunity",
+    stage_name = paste0(prefix, "_H1_psych_history_D1_target")
+  )
+
+  h1w <- h1$weights %>%
+    rename(
+      H1_available = .H,
+      H1_supported = .S,
+      H1_p_hat = p_hat,
+      H1_weight_raw = ipha_weight_raw,
+      H1_weight_trim = ipha_weight_trim
+    )
+
+  history_complete <- broad_rs %>%
+    filter(
+      psych_history_available,
+      !is.na(prior_outcome_change)
+    )
+
+  history_rs_base <- make_att_riskset_v2(history_complete)
+
+  export_proximity_sample(
+    history_rs_base,
+    paste0(prefix, "_D1_history_complete"),
+    state_var
+  )
+
+  D1a <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome |
+      riskset_stratum,
+    data = history_rs_base,
+    name = paste0(prefix, "_D1a_history_baseline"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  D1b <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change |
+      riskset_stratum,
+    data = history_rs_base,
+    name = paste0(prefix, "_D1b_plus_prior_psych_change"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  history_rs <- history_rs_base %>%
+    left_join(
+      h1w,
+      by = "landmark_id"
+    ) %>%
+    left_join(
+      D1_support %>%
+        select(
+          landmark_id,
+          D1_target_att_weight
+        ),
+      by = "landmark_id"
+    ) %>%
+    filter(
+      H1_available == 1,
+      !is.na(H1_weight_raw),
+      !is.na(D1_target_att_weight)
+    )
+
+  w1 <- make_final_weight_variants(
+    history_rs$D1_target_att_weight,
+    history_rs$H1_weight_raw,
+    history_rs$treated
+  )
+
+  history_rs <- history_rs %>%
+    mutate(
+      combined_weight_H1_raw = w1$raw,
+      combined_weight_H1 = w1$trim_1_99,
+      combined_weight_H1_tight = w1$trim_2p5_97p5
+    )
+
+  D1c <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change |
+      riskset_stratum,
+    data = history_rs,
+    name = paste0(
+      prefix,
+      "_D1c_H1opportunity_target_IPHAW_finaltrim"
+    ),
+    weights = ~combined_weight_H1,
+    vcov = ~pidp
+  )
+
+  D1c_tight <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change |
+      riskset_stratum,
+    data = history_rs,
+    name = paste0(
+      prefix,
+      "_D1c_H1opportunity_target_IPHAW_finaltrim_2p5_97p5"
+    ),
+    weights = ~combined_weight_H1_tight,
+    vcov = ~pidp
+  )
+
+  diag_H1_raw <- weight_stability_diagnostics(
+    history_rs,
+    "combined_weight_H1_raw",
+    "D1c H1-opportunity-target ATT x H1 raw product before final trimming"
+  )
+
+  diag_H1 <- weight_stability_diagnostics(
+    history_rs,
+    "combined_weight_H1",
+    "D1c H1-opportunity-target ATT x H1 final-trimmed IPHAW"
+  )
+
+  write_csv_quiet(
+    bind_rows(
+      diag_H1_raw,
+      diag_H1
+    ),
+    paste0(prefix, "_D1c_FINAL_WEIGHT_DIAGNOSTICS.csv"),
+    subdir = "diagnostics"
+  )
+
+  # ---------------------------------------------------------------------------
+  # D2: H1 + RDAS-level complete. IPHAW target = H1 & H2 opportunity support.
+  # ---------------------------------------------------------------------------
+
+  D2_support <- broad_rs %>%
+    filter(D2_opportunity) %>%
+    make_att_riskset_v2() %>%
+    rename(D2_target_att_weight = att_weight)
+
+  h1_D2 <- estimate_ipha_stage(
+    D2_support,
+    availability_var = "psych_history_available",
+    opportunity_var = "D2_opportunity",
+    stage_name = paste0(prefix, "_H1_for_D2_target")
+  )
+
+  D2_support_H1 <- D2_support %>%
+    mutate(
+      D2_H2_conditional_support = psych_history_available
+    )
+
+  h2_D2 <- estimate_ipha_stage(
+    D2_support_H1,
+    availability_var = "rdas_level_available",
+    opportunity_var = "D2_H2_conditional_support",
+    stage_name = paste0(prefix, "_H2_RDAS_level_D2_target"),
+    enforce_availability_subset = FALSE
+  )
+
+  h1_D2w <- h1_D2$weights %>%
+    rename(
+      H1_D2_weight_raw = ipha_weight_raw,
+      H1_D2_weight_trim = ipha_weight_trim
+    ) %>%
+    select(
+      landmark_id,
+      H1_D2_weight_raw,
+      H1_D2_weight_trim
+    )
+
+  h2_D2w <- h2_D2$weights %>%
+    rename(
+      H2_D2_weight_raw = ipha_weight_raw,
+      H2_D2_weight_trim = ipha_weight_trim
+    ) %>%
+    select(
+      landmark_id,
+      H2_D2_weight_raw,
+      H2_D2_weight_trim
+    )
+
+  rdas_level_complete <- broad_rs %>%
+    filter(
+      psych_history_available,
+      rdas_level_available,
+      !is.na(prior_outcome_change),
+      !is.na(prior_rdas_satisfaction),
+      !is.na(prior_rdas_cohesion)
+    )
+
+  rdas_level_rs_base <- make_att_riskset_v2(rdas_level_complete)
+
+  export_proximity_sample(
+    rdas_level_rs_base,
+    paste0(prefix, "_D2_RDAS_level_complete"),
+    state_var
+  )
+
+  D2a <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change |
+      riskset_stratum,
+    data = rdas_level_rs_base,
+    name = paste0(prefix, "_D2a_RDAS_level_common_sample_baseline"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  D2b <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change +
+      prior_rdas_satisfaction +
+      prior_rdas_cohesion |
+      riskset_stratum,
+    data = rdas_level_rs_base,
+    name = paste0(prefix, "_D2b_plus_prior_RDAS_levels"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  rdas_level_rs <- rdas_level_rs_base %>%
+    left_join(
+      D2_support %>%
+        select(
+          landmark_id,
+          D2_target_att_weight
+        ),
+      by = "landmark_id"
+    ) %>%
+    left_join(h1_D2w, by = "landmark_id") %>%
+    left_join(h2_D2w, by = "landmark_id") %>%
+    filter(
+      !is.na(D2_target_att_weight),
+      !is.na(H1_D2_weight_raw),
+      !is.na(H2_D2_weight_raw)
+    )
+
+  w2 <- make_final_weight_variants(
+    rdas_level_rs$D2_target_att_weight,
+    rdas_level_rs$H1_D2_weight_raw *
+      rdas_level_rs$H2_D2_weight_raw,
+    rdas_level_rs$treated
+  )
+
+  rdas_level_rs <- rdas_level_rs %>%
+    mutate(
+      combined_weight_H2_raw = w2$raw,
+      combined_weight_H2 = w2$trim_1_99,
+      combined_weight_H2_tight = w2$trim_2p5_97p5
+    )
+
+  D2c <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change +
+      prior_rdas_satisfaction +
+      prior_rdas_cohesion |
+      riskset_stratum,
+    data = rdas_level_rs,
+    name = paste0(prefix, "_D2c_D2opportunity_target_IPHAW_finaltrim"),
+    weights = ~combined_weight_H2,
+    vcov = ~pidp
+  )
+
+  D2c_tight <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change +
+      prior_rdas_satisfaction +
+      prior_rdas_cohesion |
+      riskset_stratum,
+    data = rdas_level_rs,
+    name = paste0(prefix, "_D2c_D2opportunity_target_IPHAW_finaltrim_2p5_97p5"),
+    weights = ~combined_weight_H2_tight,
+    vcov = ~pidp
+  )
+
+  diag_H2_raw <- weight_stability_diagnostics(
+    rdas_level_rs,
+    "combined_weight_H2_raw",
+    "D2c D2-opportunity-target ATT x H1 x H2 raw product"
+  )
+
+  diag_H2 <- weight_stability_diagnostics(
+    rdas_level_rs,
+    "combined_weight_H2",
+    "D2c D2-opportunity-target ATT x H1 x H2 final-trimmed IPHAW"
+  )
+
+  write_csv_quiet(
+    bind_rows(
+      diag_H2_raw,
+      diag_H2
+    ),
+    paste0(prefix, "_D2c_FINAL_WEIGHT_DIAGNOSTICS.csv"),
+    subdir = "diagnostics"
+  )
+
+  # ---------------------------------------------------------------------------
+  # D3: H1 + H2 + RDAS-change complete.
+  # IPHAW target = H1 & H2 & H3 structural opportunity support.
+  # ---------------------------------------------------------------------------
+
+  D3_support <- broad_rs %>%
+    filter(D3_opportunity) %>%
+    make_att_riskset_v2() %>%
+    rename(D3_target_att_weight = att_weight)
+
+  h1_D3 <- estimate_ipha_stage(
+    D3_support,
+    availability_var = "psych_history_available",
+    opportunity_var = "D3_opportunity",
+    stage_name = paste0(prefix, "_H1_for_D3_target")
+  )
+
+  D3_support_H1 <- D3_support %>%
+    mutate(
+      D3_H2_conditional_support = psych_history_available
+    )
+
+  h2_D3 <- estimate_ipha_stage(
+    D3_support_H1,
+    availability_var = "rdas_level_available",
+    opportunity_var = "D3_H2_conditional_support",
+    stage_name = paste0(prefix, "_H2_for_D3_target"),
+    enforce_availability_subset = FALSE
+  )
+
+  D3_support_H12 <- D3_support %>%
+    mutate(
+      D3_H3_conditional_support =
+        psych_history_available & rdas_level_available
+    )
+
+  h3_D3 <- estimate_ipha_stage(
+    D3_support_H12,
+    availability_var = "rdas_change_available",
+    opportunity_var = "D3_H3_conditional_support",
+    stage_name = paste0(prefix, "_H3_RDAS_change_D3_target"),
+    enforce_availability_subset = FALSE
+  )
+
+  h1_D3w <- h1_D3$weights %>%
+    rename(H1_D3_weight_raw = ipha_weight_raw) %>%
+    select(landmark_id, H1_D3_weight_raw)
+
+  h2_D3w <- h2_D3$weights %>%
+    rename(H2_D3_weight_raw = ipha_weight_raw) %>%
+    select(landmark_id, H2_D3_weight_raw)
+
+  h3_D3w <- h3_D3$weights %>%
+    rename(H3_D3_weight_raw = ipha_weight_raw) %>%
+    select(landmark_id, H3_D3_weight_raw)
+
+  rdas_change_complete <- broad_rs %>%
+    filter(
+      psych_history_available,
+      rdas_level_available,
+      rdas_change_available,
+      !is.na(prior_outcome_change),
+      !is.na(prior_rdas_satisfaction),
+      !is.na(prior_rdas_cohesion),
+      !is.na(prior_rdas_sat_change),
+      !is.na(prior_rdas_coh_change)
+    )
+
+  rdas_change_rs_base <- make_att_riskset_v2(rdas_change_complete)
+
+  export_proximity_sample(
+    rdas_change_rs_base,
+    paste0(prefix, "_D3_RDAS_change_complete"),
+    state_var
+  )
+
+  D3a <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change +
+      prior_rdas_satisfaction +
+      prior_rdas_cohesion |
+      riskset_stratum,
+    data = rdas_change_rs_base,
+    name = paste0(prefix, "_D3a_RDAS_change_common_sample_baseline"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  D3b <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change +
+      prior_rdas_satisfaction +
+      prior_rdas_cohesion +
+      prior_rdas_sat_change +
+      prior_rdas_coh_change |
+      riskset_stratum,
+    data = rdas_change_rs_base,
+    name = paste0(prefix, "_D3b_plus_prior_RDAS_changes"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  rdas_change_rs <- rdas_change_rs_base %>%
+    left_join(
+      D3_support %>%
+        select(
+          landmark_id,
+          D3_target_att_weight
+        ),
+      by = "landmark_id"
+    ) %>%
+    left_join(h1_D3w, by = "landmark_id") %>%
+    left_join(h2_D3w, by = "landmark_id") %>%
+    left_join(h3_D3w, by = "landmark_id") %>%
+    filter(
+      !is.na(D3_target_att_weight),
+      !is.na(H1_D3_weight_raw),
+      !is.na(H2_D3_weight_raw),
+      !is.na(H3_D3_weight_raw)
+    )
+
+  w3 <- make_final_weight_variants(
+    rdas_change_rs$D3_target_att_weight,
+    rdas_change_rs$H1_D3_weight_raw *
+      rdas_change_rs$H2_D3_weight_raw *
+      rdas_change_rs$H3_D3_weight_raw,
+    rdas_change_rs$treated
+  )
+
+  rdas_change_rs <- rdas_change_rs %>%
+    mutate(
+      combined_weight_H3_raw = w3$raw,
+      combined_weight_H3 = w3$trim_1_99,
+      combined_weight_H3_tight = w3$trim_2p5_97p5
+    )
+
+  D3c <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change +
+      prior_rdas_satisfaction +
+      prior_rdas_cohesion +
+      prior_rdas_sat_change +
+      prior_rdas_coh_change |
+      riskset_stratum,
+    data = rdas_change_rs,
+    name = paste0(prefix, "_D3c_D3opportunity_target_IPHAW_finaltrim"),
+    weights = ~combined_weight_H3,
+    vcov = ~pidp
+  )
+
+  D3c_tight <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change +
+      prior_rdas_satisfaction +
+      prior_rdas_cohesion +
+      prior_rdas_sat_change +
+      prior_rdas_coh_change |
+      riskset_stratum,
+    data = rdas_change_rs,
+    name = paste0(prefix, "_D3c_D3opportunity_target_IPHAW_finaltrim_2p5_97p5"),
+    weights = ~combined_weight_H3_tight,
+    vcov = ~pidp
+  )
+
+  diag_H3_raw <- weight_stability_diagnostics(
+    rdas_change_rs,
+    "combined_weight_H3_raw",
+    "D3c D3-opportunity-target ATT x H1 x H2 x H3 raw product"
+  )
+
+  diag_H3 <- weight_stability_diagnostics(
+    rdas_change_rs,
+    "combined_weight_H3",
+    "D3c D3-opportunity-target ATT x H1 x H2 x H3 final-trimmed sequential IPHAW"
+  )
+
+  write_csv_quiet(
+    bind_rows(
+      diag_H3_raw,
+      diag_H3
+    ),
+    paste0(prefix, "_D3c_FINAL_WEIGHT_DIAGNOSTICS.csv"),
+    subdir = "diagnostics"
+  )
+
+  # Direct joint-history selection model on exactly the D3 opportunity target.
+  hjoint_D3 <- estimate_ipha_stage(
+    D3_support,
+    availability_var = "joint_history_available",
+    opportunity_var = "D3_opportunity",
+    stage_name = paste0(prefix, "_HJOINT_D3_target")
+  )
+
+  hjoint_D3w <- hjoint_D3$weights %>%
+    rename(Hjoint_D3_weight_raw = ipha_weight_raw) %>%
+    select(landmark_id, Hjoint_D3_weight_raw)
+
+  rdas_change_rs <- rdas_change_rs %>%
+    left_join(
+      hjoint_D3w,
+      by = "landmark_id"
+    )
+
+  wj <- make_final_weight_variants(
+    rdas_change_rs$D3_target_att_weight,
+    rdas_change_rs$Hjoint_D3_weight_raw,
+    rdas_change_rs$treated
+  )
+
+  rdas_change_rs <- rdas_change_rs %>%
+    mutate(
+      combined_weight_joint_raw = wj$raw,
+      combined_weight_joint = wj$trim_1_99
+    )
+
+  D3d_joint <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change +
+      prior_rdas_satisfaction +
+      prior_rdas_cohesion +
+      prior_rdas_sat_change +
+      prior_rdas_coh_change |
+      riskset_stratum,
+    data = rdas_change_rs,
+    name = paste0(prefix, "_D3d_joint_history_D3target_IPHAW_finaltrim"),
+    weights = ~combined_weight_joint,
+    vcov = ~pidp
+  )
+
+  diag_joint_raw <- weight_stability_diagnostics(
+    rdas_change_rs,
+    "combined_weight_joint_raw",
+    "D3d D3-opportunity-target ATT x joint-history raw product"
+  )
+
+  diag_joint <- weight_stability_diagnostics(
+    rdas_change_rs,
+    "combined_weight_joint",
+    "D3d D3-opportunity-target ATT x joint-history final-trimmed IPHAW"
+  )
+
+  strict_models <- fit_strict_unambiguous_sensitivity(
+    pair,
+    prefix
+  )
+
+  weight_diagnostics <- bind_rows(
+    diag_H1_raw,
+    diag_H1,
+    diag_H2_raw,
+    diag_H2,
+    diag_H3_raw,
+    diag_H3,
+    diag_joint_raw,
+    diag_joint
+  ) %>%
+    mutate(
+      arm = arm,
+      horizon = treated_state,
+      outcome = outcome
+    )
+
+  support_diagnostics <- bind_rows(
+    h1$support_diagnostics,
+    h1_D2$support_diagnostics,
+    h2_D2$support_diagnostics,
+    h1_D3$support_diagnostics,
+    h2_D3$support_diagnostics,
+    h3_D3$support_diagnostics,
+    hjoint_D3$support_diagnostics
+  ) %>%
+    mutate(
+      arm = arm,
+      horizon = treated_state,
+      outcome = outcome
+    )
+
+  # ---------------------------------------------------------------------------
+  # E fully common-sample accounting sequence.
+  # ---------------------------------------------------------------------------
+  # All four models use EXACTLY rdas_change_rs_base and the same complete-sample ATT
+  # weights. This is descriptive explanatory accounting, NOT causal mediation.
+
+  E0_common <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome |
+      riskset_stratum,
+    data = rdas_change_rs_base,
+    name = paste0(prefix, "_E0_common_prior_level_only"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  E1_common <- safe_feols(
+    outcome_change ~
+      treated +
+      prior_outcome +
+      prior_outcome_change |
+      riskset_stratum,
+    data = rdas_change_rs_base,
+    name = paste0(prefix, "_E1_common_plus_prior_psych_change"),
+    weights = ~att_weight,
+    vcov = ~pidp
+  )
+
+  common_models <- list(
+    "E0 prior outcome level" = E0_common,
+    "E1 + prior psychological change" = E1_common,
+    "E2 + prior RDAS levels" = D3a,
+    "E3 + prior RDAS changes" = D3b
+  )
+
+  common_accounting <- imap_dfr(
+    common_models,
+    function(mod, stage_name) {
+      st <- extract_term_stats(mod, "treated")
+      tibble(
+        arm = arm,
+        horizon = treated_state,
+        outcome = outcome,
+        stage = stage_name,
+        estimate = st$estimate,
+        std_error = st$std_error,
+        conf_low = st$conf_low,
+        conf_high = st$conf_high,
+        p_value = st$p_value,
+        nobs = st$nobs
+      )
+    }
+  )
+
+  if (nrow(common_accounting) > 0L) {
+    base_beta <- common_accounting$estimate[1]
+
+    common_accounting <- common_accounting %>%
+      mutate(
+        previous_estimate = lag(estimate),
+        cumulative_attenuation_pct = if_else(
+          !is.na(base_beta) &
+            abs(base_beta) > 1e-8 &
+            !is.na(estimate) &
+            sign(estimate) == sign(base_beta),
+          100 * (1 - estimate / base_beta),
+          NA_real_
+        ),
+        incremental_attenuation_pct = if_else(
+          !is.na(previous_estimate) &
+            abs(previous_estimate) > 1e-8 &
+            !is.na(estimate) &
+            sign(estimate) == sign(previous_estimate),
+          100 * (1 - estimate / previous_estimate),
+          NA_real_
+        ),
+        accounting_note = paste(
+          "Descriptive common-sample attenuation only;",
+          "not a causal mediated share or mutually exclusive mechanism percentage."
+        )
+      )
+  }
+
+  attenuation <- bind_rows(
+    attenuation_row(
+      D1a,
+      D1b,
+      arm,
+      treated_state,
+      outcome,
+      "add prior psychological change",
+      "psychological-history-complete"
+    ),
+    attenuation_row(
+      D2a,
+      D2b,
+      arm,
+      treated_state,
+      outcome,
+      "add prior RDAS levels",
+      "psychological-history + RDAS-level-complete"
+    ),
+    attenuation_row(
+      D3a,
+      D3b,
+      arm,
+      treated_state,
+      outcome,
+      "add prior RDAS changes",
+      "psychological-history + RDAS-change-complete"
+    )
+  )
+
+  sensitivity <- bind_rows(
+    model_comparison_row(
+      D0,
+      D1a,
+      arm,
+      treated_state,
+      outcome,
+      "broad sample vs history-complete baseline: sample restriction"
+    ),
+    model_comparison_row(
+      D1b,
+      D1c,
+      arm,
+      treated_state,
+      outcome,
+      "D1b complete-history ATT vs H1-opportunity-target D1c IPHAW"
+    ),
+    model_comparison_row(
+      D1c,
+      D1c_tight,
+      arm,
+      treated_state,
+      outcome,
+      "D1c final-weight trimming 1/99 vs 2.5/97.5"
+    ),
+    model_comparison_row(
+      D2b,
+      D2c,
+      arm,
+      treated_state,
+      outcome,
+      "D2 complete-history ATT vs D2-opportunity-target sequential IPHAW"
+    ),
+    model_comparison_row(
+      D2c,
+      D2c_tight,
+      arm,
+      treated_state,
+      outcome,
+      "D2 final-weight trimming 1/99 vs 2.5/97.5"
+    ),
+    model_comparison_row(
+      D3b,
+      D3c,
+      arm,
+      treated_state,
+      outcome,
+      "D3 complete-history ATT vs D3-opportunity-target sequential IPHAW"
+    ),
+    model_comparison_row(
+      D3c,
+      D3c_tight,
+      arm,
+      treated_state,
+      outcome,
+      "D3 final-weight trimming 1/99 vs 2.5/97.5"
+    ),
+    model_comparison_row(
+      D3c,
+      D3d_joint,
+      arm,
+      treated_state,
+      outcome,
+      "D3 sequential vs direct joint history IPHAW on same D3 opportunity target"
+    ),
+    model_comparison_row(
+      D1b,
+      strict_models$D1b_strict,
+      arm,
+      treated_state,
+      outcome,
+      "primary D1b vs strict unambiguous-source D1b sensitivity"
+    ),
+    model_comparison_row(
+      D2b,
+      strict_models$D2b_strict,
+      arm,
+      treated_state,
+      outcome,
+      "D2b vs strict unambiguous-source D2b sensitivity"
+    ),
+    model_comparison_row(
+      D3b,
+      strict_models$D3b_strict,
+      arm,
+      treated_state,
+      outcome,
+      "D3b vs strict unambiguous-source D3b sensitivity"
+    )
+  )
+
+  list(
+    models = list(
+      D0 = D0,
+      D1a = D1a,
+      D1b = D1b,
+      D1c = D1c,
+      D1c_tight = D1c_tight,
+      D2a = D2a,
+      D2b = D2b,
+      D2c = D2c,
+      D2c_tight = D2c_tight,
+      D3a = D3a,
+      D3b = D3b,
+      D3c = D3c,
+      D3c_tight = D3c_tight,
+      D3d_joint = D3d_joint,
+      D1b_strict = strict_models$D1b_strict,
+      D2b_strict = strict_models$D2b_strict,
+      D3b_strict = strict_models$D3b_strict
+    ),
+    attenuation = attenuation,
+    common_accounting = common_accounting,
+    sensitivity = sensitivity,
+    weight_diagnostics = weight_diagnostics,
+    support_diagnostics = support_diagnostics,
+    opportunity_diagnostics = opportunity_diagnostics,
+    availability_patterns = availability_pattern,
+    strict_history_counts = strict_models$counts,
+
+    # Retained for preregistered D1b-vs-D1c respondent-cluster bootstrap/BCa.
+    broad_data = broad_rs,
+    history_data = history_rs_base,
+
+    n_broad = nrow(broad_rs),
+    n_history = nrow(history_rs_base),
+    n_rdas_level = nrow(rdas_level_rs_base),
+    n_rdas_change = nrow(rdas_change_rs_base)
+  )
+}
+
+# -----------------------------------------------------------------------------
+# 11A. D_M: MARRIAGE PROXIMITY
+# -----------------------------------------------------------------------------
+
+D_M_GHQ_NEAR <- run_proximity_sequence(
+  D_marriage_pool, "marriage_horizon_state", "marriage_1_12m", "ghq", "marriage"
+)
+D_M_GHQ_MID <- run_proximity_sequence(
+  D_marriage_pool, "marriage_horizon_state", "marriage_13_24m", "ghq", "marriage"
+)
+D_M_GHQ_DISTAL <- run_proximity_sequence(
+  D_marriage_pool, "marriage_horizon_state", "marriage_25_60m", "ghq", "marriage"
+)
+D_M_LS_NEAR <- run_proximity_sequence(
+  D_marriage_pool, "marriage_horizon_state", "marriage_1_12m", "ls", "marriage"
+)
+D_M_LS_MID <- run_proximity_sequence(
+  D_marriage_pool, "marriage_horizon_state", "marriage_13_24m", "ls", "marriage"
+)
+D_M_LS_DISTAL <- run_proximity_sequence(
+  D_marriage_pool, "marriage_horizon_state", "marriage_25_60m", "ls", "marriage"
+)
+
+# -----------------------------------------------------------------------------
+# 11B. D_B: BREAKUP PROXIMITY - RESTORED DISSOLUTION ARM
+# -----------------------------------------------------------------------------
+# Primary breakup timing uses end_if == 0. This is intentionally symmetric with
+# D_M in horizon and comparison group, while retaining separate interpretation:
+# it is a relationship-dissolution proximity analysis, not a marriage test.
+
+D_B_GHQ_NEAR <- run_proximity_sequence(
+  D_breakup_pool, "breakup_horizon_state", "breakup_1_12m", "ghq", "breakup"
+)
+D_B_GHQ_MID <- run_proximity_sequence(
+  D_breakup_pool, "breakup_horizon_state", "breakup_13_24m", "ghq", "breakup"
+)
+D_B_GHQ_DISTAL <- run_proximity_sequence(
+  D_breakup_pool, "breakup_horizon_state", "breakup_25_60m", "ghq", "breakup"
+)
+D_B_LS_NEAR <- run_proximity_sequence(
+  D_breakup_pool, "breakup_horizon_state", "breakup_1_12m", "ls", "breakup"
+)
+D_B_LS_MID <- run_proximity_sequence(
+  D_breakup_pool, "breakup_horizon_state", "breakup_13_24m", "ls", "breakup"
+)
+D_B_LS_DISTAL <- run_proximity_sequence(
+  D_breakup_pool, "breakup_horizon_state", "breakup_25_60m", "ls", "breakup"
+)
+
+# -----------------------------------------------------------------------------
+# 11C. E: SEQUENTIAL EXPLANATORY ATTENUATION
+# -----------------------------------------------------------------------------
+# This is NOT a causal decomposition. Candidate processes overlap and are not
+# mutually exclusive. Percent attenuation is reported only for nested models
+# estimated on the SAME observations and weights. If the base coefficient is
+# near zero or the sign changes, the percentage is suppressed.
+
+all_D_results <- list(
+  D_M_GHQ_NEAR = D_M_GHQ_NEAR,
+  D_M_GHQ_MID = D_M_GHQ_MID,
+  D_M_GHQ_DISTAL = D_M_GHQ_DISTAL,
+  D_M_LS_NEAR = D_M_LS_NEAR,
+  D_M_LS_MID = D_M_LS_MID,
+  D_M_LS_DISTAL = D_M_LS_DISTAL,
+  D_B_GHQ_NEAR = D_B_GHQ_NEAR,
+  D_B_GHQ_MID = D_B_GHQ_MID,
+  D_B_GHQ_DISTAL = D_B_GHQ_DISTAL,
+  D_B_LS_NEAR = D_B_LS_NEAR,
+  D_B_LS_MID = D_B_LS_MID,
+  D_B_LS_DISTAL = D_B_LS_DISTAL
+)
+
+# -----------------------------------------------------------------------------
+# 11C-0. MANDATORY D1b-vs-D1c SELECTIVE-HISTORY SENSITIVITY
+# -----------------------------------------------------------------------------
+# D1b is confirmatory and targets observed history-complete cases.
+# D1c is mandatory sensitivity and targets the H1 structural-opportunity
+# population using opportunity-target ATT weights plus H1 IPHAW.
+#
+# Material disagreement:
+#   (a) D1b and D1c point estimates reverse sign; OR
+#   (b) the prespecified 95% respondent-cluster BCa CI for
+#           beta_D1c - beta_D1b
+#       excludes zero.
+# If BCa is not numerically reliable, the respondent-cluster percentile CI is
+# the prespecified fallback. D1c can qualify but never rescue D1b.
+# -----------------------------------------------------------------------------
+
+estimate_H1_weights_no_output <- function(dat) {
+
+  D1_support <- dat %>%
+    filter(H1_opportunity) %>%
+    make_att_riskset_v2() %>%
+    rename(D1_target_att_weight = att_weight)
+
+  if (nrow(D1_support) == 0L) {
+    return(tibble())
+  }
+
+  source <- D1_support %>%
+    mutate(
+      .H = as.integer(psych_history_available)
+    ) %>%
+    filter(
+      !is.na(.H),
+      !is.na(treated),
+      !is.na(wave_n),
+      !is.na(sex),
+      !is.na(age),
+      !is.na(cohab_duration_months),
+      !is.na(prior_outcome),
+      !is.na(n_prior_interviews),
+      !is.na(n_prior_outcome_obs),
+      !is.na(panel_tenure_months)
+    )
+
+  if (nrow(source) == 0L) {
+    return(tibble())
+  }
+
+  if (length(unique(source$.H)) == 1L) {
+    p_hat <- rep(mean(source$.H), nrow(source))
+    hweight <- ifelse(source$.H == 1, 1, NA_real_)
+  } else {
+    fitted <- fit_bias_reduced_availability(source)
+
+    if (is.null(fitted$model)) {
+      return(tibble())
+    }
+
+    p_hat <- suppressWarnings(
+      stats::predict(
+        fitted$model,
+        type = "response"
+      )
+    )
+
+    p_hat <- pmin(
+      pmax(p_hat, IPHAW_PROB_EPS),
+      1 - IPHAW_PROB_EPS
+    )
+
+    numerator <- ave(
+      source$.H,
+      source$treated,
+      FUN = function(z) mean(z == 1)
+    )
+
+    hweight <- ifelse(
+      source$.H == 1,
+      numerator / p_hat,
+      NA_real_
+    )
+  }
+
+  source %>%
+    transmute(
+      landmark_id,
+      H1_available = .H,
+      H1_p_hat = p_hat,
+      H1_weight_raw = hweight,
+      D1_target_att_weight
+    )
+}
+
+estimate_D1b_D1c_from_broad <- function(broad_data) {
+
+  broad_rs <- tryCatch(
+    make_att_riskset_v2(broad_data),
+    error = function(e) NULL
+  )
+
+  if (
+    is.null(broad_rs) ||
+      nrow(broad_rs) == 0L
+  ) {
+    return(
+      c(
+        beta_D1b = NA_real_,
+        beta_D1c = NA_real_,
+        difference = NA_real_
+      )
+    )
+  }
+
+  h1w <- estimate_H1_weights_no_output(
+    broad_rs
+  )
+
+  if (nrow(h1w) == 0L) {
+    return(
+      c(
+        beta_D1b = NA_real_,
+        beta_D1c = NA_real_,
+        difference = NA_real_
+      )
+    )
+  }
+
+  history_complete <- broad_rs %>%
+    filter(
+      psych_history_available,
+      !is.na(prior_outcome_change)
+    )
+
+  history_rs <- tryCatch(
+    make_att_riskset_v2(history_complete),
+    error = function(e) NULL
+  )
+
+  if (
+    is.null(history_rs) ||
+      nrow(history_rs) == 0L
+  ) {
+    return(
+      c(
+        beta_D1b = NA_real_,
+        beta_D1c = NA_real_,
+        difference = NA_real_
+      )
+    )
+  }
+
+  history_rs <- history_rs %>%
+    left_join(
+      h1w,
+      by = "landmark_id"
+    ) %>%
+    filter(
+      H1_available == 1,
+      is.finite(H1_weight_raw),
+      H1_weight_raw > 0,
+      is.finite(D1_target_att_weight),
+      D1_target_att_weight > 0
+    )
+
+  if (
+    nrow(history_rs) == 0L ||
+      length(unique(history_rs$treated)) < 2L
+  ) {
+    return(
+      c(
+        beta_D1b = NA_real_,
+        beta_D1c = NA_real_,
+        difference = NA_real_
+      )
+    )
+  }
+
+  w1 <- make_final_weight_variants(
+    history_rs$D1_target_att_weight,
+    history_rs$H1_weight_raw,
+    history_rs$treated
+  )
+
+  history_rs <- history_rs %>%
+    mutate(
+      combined_weight_H1 = w1$trim_1_99
+    ) %>%
+    filter(
+      is.finite(att_weight),
+      att_weight > 0,
+      is.finite(combined_weight_H1),
+      combined_weight_H1 > 0
+    )
+
+  D1b_fit <- tryCatch(
+    suppressWarnings(
+      fixest::feols(
+        outcome_change ~
+          treated +
+          prior_outcome +
+          prior_outcome_change |
+          riskset_stratum,
+        data = history_rs,
+        weights = ~att_weight,
+        notes = FALSE
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  D1c_fit <- tryCatch(
+    suppressWarnings(
+      fixest::feols(
+        outcome_change ~
+          treated +
+          prior_outcome +
+          prior_outcome_change |
+          riskset_stratum,
+        data = history_rs,
+        weights = ~combined_weight_H1,
+        notes = FALSE
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  beta_b <- if (
+    is.null(D1b_fit) ||
+      !"treated" %in% names(coef(D1b_fit))
+  ) {
+    NA_real_
+  } else {
+    unname(coef(D1b_fit)["treated"])
+  }
+
+  beta_c <- if (
+    is.null(D1c_fit) ||
+      !"treated" %in% names(coef(D1c_fit))
+  ) {
+    NA_real_
+  } else {
+    unname(coef(D1c_fit)["treated"])
+  }
+
+  c(
+    beta_D1b = beta_b,
+    beta_D1c = beta_c,
+    difference = ifelse(
+      is.na(beta_b) | is.na(beta_c),
+      NA_real_,
+      beta_c - beta_b
+    )
+  )
+}
+
+bootstrap_one_D1b_D1c <- function(broad_data) {
+
+  ids <- unique(
+    broad_data$pidp[
+      !is.na(broad_data$pidp)
+    ]
+  )
+
+  if (length(ids) < 2L) {
+    return(
+      c(
+        beta_D1b = NA_real_,
+        beta_D1c = NA_real_,
+        difference = NA_real_
+      )
+    )
+  }
+
+  drawn_ids <- sample(
+    ids,
+    size = length(ids),
+    replace = TRUE
+  )
+
+  boot_dat <- purrr::map2_dfr(
+    drawn_ids,
+    seq_along(drawn_ids),
+    function(id_value, draw_index) {
+
+      broad_data %>%
+        filter(pidp == id_value) %>%
+        mutate(
+          pidp_boot = draw_index,
+          landmark_id = paste0(
+            landmark_id,
+            "__boot_",
+            draw_index
+          )
+        )
+    }
+  )
+
+  estimate_D1b_D1c_from_broad(
+    boot_dat
+  )
+}
+
+jackknife_D1b_D1c <- function(broad_data) {
+
+  ids <- unique(
+    broad_data$pidp[
+      !is.na(broad_data$pidp)
+    ]
+  )
+
+  purrr::map_dfr(
+    seq_along(ids),
+    function(i) {
+
+      est <- estimate_D1b_D1c_from_broad(
+        broad_data %>%
+          filter(pidp != ids[i])
+      )
+
+      tibble(
+        jackknife_index = i,
+        omitted_pidp = ids[i],
+        beta_D1b = unname(est["beta_D1b"]),
+        beta_D1c = unname(est["beta_D1c"]),
+        difference = unname(est["difference"])
+      )
+    }
+  )
+}
+
+bca_interval <- function(
+  observed,
+  bootstrap_values,
+  jackknife_values,
+  ci_level = 0.95
+) {
+
+  boot <- bootstrap_values[
+    is.finite(bootstrap_values) &
+      !is.na(bootstrap_values)
+  ]
+
+  jack <- jackknife_values[
+    is.finite(jackknife_values) &
+      !is.na(jackknife_values)
+  ]
+
+  if (
+    length(boot) < 20L ||
+      length(jack) < 10L ||
+      !is.finite(observed)
+  ) {
+    return(list(
+      low = NA_real_,
+      high = NA_real_,
+      z0 = NA_real_,
+      acceleration = NA_real_,
+      valid = FALSE
+    ))
+  }
+
+  less_prop <- mean(boot < observed)
+  eps <- 0.5 / length(boot)
+  less_prop <- min(
+    max(less_prop, eps),
+    1 - eps
+  )
+  z0 <- stats::qnorm(less_prop)
+
+  jack_mean <- mean(jack)
+  u <- jack_mean - jack
+  denom <- 6 * (sum(u^2)^(3 / 2))
+
+  acceleration <- if (
+    is.finite(denom) && denom > 0
+  ) {
+    sum(u^3) / denom
+  } else {
+    NA_real_
+  }
+
+  if (
+    !is.finite(z0) ||
+      !is.finite(acceleration)
+  ) {
+    return(list(
+      low = NA_real_,
+      high = NA_real_,
+      z0 = z0,
+      acceleration = acceleration,
+      valid = FALSE
+    ))
+  }
+
+  alpha <- 1 - ci_level
+  za <- stats::qnorm(
+    c(alpha / 2, 1 - alpha / 2)
+  )
+
+  adj <- stats::pnorm(
+    z0 +
+      (z0 + za) /
+        (1 - acceleration * (z0 + za))
+  )
+
+  if (
+    any(!is.finite(adj)) ||
+      any(adj <= 0) ||
+      any(adj >= 1) ||
+      adj[1] >= adj[2]
+  ) {
+    return(list(
+      low = NA_real_,
+      high = NA_real_,
+      z0 = z0,
+      acceleration = acceleration,
+      valid = FALSE
+    ))
+  }
+
+  q <- stats::quantile(
+    boot,
+    probs = adj,
+    na.rm = TRUE,
+    names = FALSE
+  )
+
+  list(
+    low = q[1],
+    high = q[2],
+    z0 = z0,
+    acceleration = acceleration,
+    valid = TRUE
+  )
+}
+
+run_confirmatory_ipha_disagreement <- function(
+  result,
+  outcome_label,
+  seed
+) {
+
+  d1b <- extract_term_stats(
+    result$models$D1b,
+    "treated"
+  )
+
+  d1c <- extract_term_stats(
+    result$models$D1c,
+    "treated"
+  )
+
+  beta_b <- d1b$estimate[1]
+  beta_c <- d1c$estimate[1]
+
+  observed_difference <- if (
+    is.na(beta_b) || is.na(beta_c)
+  ) {
+    NA_real_
+  } else {
+    beta_c - beta_b
+  }
+
+  outcome_sd <- stats::sd(
+    result$history_data$outcome_change,
+    na.rm = TRUE
+  )
+
+  observed_difference_sd <- if (
+    is.na(observed_difference) ||
+      !is.finite(outcome_sd) ||
+      outcome_sd <= 0
+  ) {
+    NA_real_
+  } else {
+    observed_difference / outcome_sd
+  }
+
+  d1c_diag <- result$weight_diagnostics %>%
+    filter(
+      stage ==
+        "D1c H1-opportunity-target ATT x H1 final-trimmed IPHAW"
+    )
+
+  d1c_ess_acceptable <- if (
+    nrow(d1c_diag) == 0L ||
+      any(is.na(d1c_diag$acceptable_for_robustness))
+  ) {
+    FALSE
+  } else {
+    all(d1c_diag$acceptable_for_robustness)
+  }
+
+  d1c_min_ess_ratio <- if (
+    nrow(d1c_diag) == 0L ||
+      all(is.na(d1c_diag$ess_ratio))
+  ) {
+    NA_real_
+  } else {
+    min(d1c_diag$ess_ratio, na.rm = TRUE)
+  }
+
+  sign_reversal <- if (
+    is.na(beta_b) ||
+      is.na(beta_c) ||
+      beta_b == 0 ||
+      beta_c == 0
+  ) {
+    FALSE
+  } else {
+    sign(beta_b) != sign(beta_c)
+  }
+
+  boot_reps <- tibble(
+    replicate = integer(0),
+    beta_D1b = numeric(0),
+    beta_D1c = numeric(0),
+    difference = numeric(0)
+  )
+
+  if (
+    RUN_CONFIRMATORY_IPHAW_BOOTSTRAP &&
+      !is.null(result$broad_data) &&
+      nrow(result$broad_data) > 0L
+  ) {
+
+    set.seed(seed)
+
+    boot_matrix <- t(
+      replicate(
+        CONFIRMATORY_IPHAW_BOOT_REPS,
+        bootstrap_one_D1b_D1c(
+          result$broad_data
+        )
+      )
+    )
+
+    boot_reps <- tibble(
+      replicate = seq_len(nrow(boot_matrix)),
+      beta_D1b = boot_matrix[, "beta_D1b"],
+      beta_D1c = boot_matrix[, "beta_D1c"],
+      difference = boot_matrix[, "difference"]
+    )
+  }
+
+  valid_boot <- boot_reps %>%
+    filter(
+      is.finite(difference),
+      !is.na(difference)
+    )
+
+  n_boot_requested <- if (
+    RUN_CONFIRMATORY_IPHAW_BOOTSTRAP
+  ) {
+    CONFIRMATORY_IPHAW_BOOT_REPS
+  } else {
+    0L
+  }
+
+  n_boot_valid <- nrow(valid_boot)
+
+  boot_success_ratio <- if (
+    n_boot_requested > 0L
+  ) {
+    n_boot_valid / n_boot_requested
+  } else {
+    NA_real_
+  }
+
+  boot_reliable <-
+    !is.na(boot_success_ratio) &&
+    boot_success_ratio >= CONFIRMATORY_IPHAW_BOOT_MIN_SUCCESS
+
+  alpha_boot <- 1 - CONFIRMATORY_IPHAW_BOOT_CI
+
+  if (n_boot_valid >= 20L) {
+    pct_q <- stats::quantile(
+      valid_boot$difference,
+      probs = c(
+        alpha_boot / 2,
+        1 - alpha_boot / 2
+      ),
+      na.rm = TRUE,
+      names = FALSE
+    )
+    pct_low <- pct_q[1]
+    pct_high <- pct_q[2]
+  } else {
+    pct_low <- NA_real_
+    pct_high <- NA_real_
+  }
+
+  jack_reps <- tibble(
+    jackknife_index = integer(0),
+    omitted_pidp = numeric(0),
+    beta_D1b = numeric(0),
+    beta_D1c = numeric(0),
+    difference = numeric(0)
+  )
+
+  if (
+    RUN_CONFIRMATORY_IPHAW_BCA &&
+      !is.null(result$broad_data) &&
+      nrow(result$broad_data) > 0L
+  ) {
+    jack_reps <- jackknife_D1b_D1c(
+      result$broad_data
+    )
+  }
+
+  n_jack_requested <- if (
+    RUN_CONFIRMATORY_IPHAW_BCA
+  ) {
+    n_distinct(result$broad_data$pidp)
+  } else {
+    0L
+  }
+
+  valid_jack <- jack_reps %>%
+    filter(
+      is.finite(difference),
+      !is.na(difference)
+    )
+
+  n_jack_valid <- nrow(valid_jack)
+
+  jack_success_ratio <- if (
+    n_jack_requested > 0L
+  ) {
+    n_jack_valid / n_jack_requested
+  } else {
+    NA_real_
+  }
+
+  jack_reliable <-
+    !is.na(jack_success_ratio) &&
+    jack_success_ratio >= CONFIRMATORY_IPHAW_JACKKNIFE_MIN_SUCCESS
+
+  bca <- if (
+    RUN_CONFIRMATORY_IPHAW_BCA &&
+      boot_reliable &&
+      jack_reliable
+  ) {
+    bca_interval(
+      observed = observed_difference,
+      bootstrap_values = valid_boot$difference,
+      jackknife_values = valid_jack$difference,
+      ci_level = CONFIRMATORY_IPHAW_BOOT_CI
+    )
+  } else {
+    list(
+      low = NA_real_,
+      high = NA_real_,
+      z0 = NA_real_,
+      acceleration = NA_real_,
+      valid = FALSE
+    )
+  }
+
+  bca_reliable <-
+    isTRUE(bca$valid) &&
+    boot_reliable &&
+    jack_reliable
+
+  ci_method_used <- case_when(
+    bca_reliable ~ "BCa respondent-cluster bootstrap",
+    boot_reliable & !is.na(pct_low) & !is.na(pct_high) ~
+      "percentile respondent-cluster bootstrap fallback",
+    TRUE ~ "no reliable bootstrap CI"
+  )
+
+  decision_ci_low <- if (bca_reliable) bca$low else pct_low
+  decision_ci_high <- if (bca_reliable) bca$high else pct_high
+
+  decision_ci_reliable <- if (bca_reliable) {
+    TRUE
+  } else {
+    boot_reliable && !is.na(pct_low) && !is.na(pct_high)
+  }
+
+  decision_ci_excludes_zero <-
+    decision_ci_reliable &&
+    !is.na(decision_ci_low) &&
+    !is.na(decision_ci_high) &&
+    (
+      decision_ci_low > 0 ||
+        decision_ci_high < 0
+    )
+
+  material_disagreement <-
+    d1c_ess_acceptable &&
+    (
+      sign_reversal ||
+        decision_ci_excludes_zero
+    )
+
+  sensitivity_status <- case_when(
+    is.na(beta_b) | is.na(beta_c) ~
+      paste(
+        "D1b or D1c estimate unavailable;",
+        "sensitivity cannot be adjudicated"
+      ),
+
+    !d1c_ess_acceptable ~
+      paste(
+        "D1c has inadequate ESS under the prespecified >=.50 rule;",
+        "selective-history robustness cannot be assessed reliably"
+      ),
+
+    material_disagreement ~
+      paste(
+        "MATERIAL D1b-D1c DISAGREEMENT: the confirmatory complete-case",
+        "estimate is sensitive to selective history availability within the",
+        "H1 structural-opportunity population; generalization is uncertain"
+      ),
+
+    !decision_ci_reliable ~
+      paste(
+        "D1c ESS is acceptable but neither the BCa nor percentile",
+        "respondent-cluster interval is reliable; selective-history",
+        "robustness is incompletely adjudicated"
+      ),
+
+    TRUE ~
+      paste(
+        "No prespecified material D1b-D1c disagreement detected;",
+        "the confirmatory estimate is robust to observed predictors of",
+        "history availability within the H1 structural-opportunity population",
+        "under the IPHAW assumptions"
+      )
+  )
+
+  summary_row <- tibble(
+    outcome = outcome_label,
+    beta_D1b = beta_b,
+    beta_D1c = beta_c,
+    beta_D1c_minus_D1b = observed_difference,
+    difference_in_outcome_SD_units = observed_difference_sd,
+    sign_reversal = sign_reversal,
+    D1c_min_ESS_ratio = d1c_min_ess_ratio,
+    D1c_ESS_acceptable = d1c_ess_acceptable,
+
+    bootstrap_reps_requested = n_boot_requested,
+    bootstrap_reps_valid = n_boot_valid,
+    bootstrap_success_ratio = boot_success_ratio,
+    bootstrap_reliable = boot_reliable,
+    percentile_CI_low = pct_low,
+    percentile_CI_high = pct_high,
+
+    jackknife_reps_requested = n_jack_requested,
+    jackknife_reps_valid = n_jack_valid,
+    jackknife_success_ratio = jack_success_ratio,
+    jackknife_reliable = jack_reliable,
+
+    BCa_valid = bca_reliable,
+    BCa_bias_correction_z0 = bca$z0,
+    BCa_acceleration = bca$acceleration,
+    BCa_CI_low = bca$low,
+    BCa_CI_high = bca$high,
+
+    decision_CI_method = ci_method_used,
+    decision_CI_low = decision_ci_low,
+    decision_CI_high = decision_ci_high,
+    decision_CI_reliable = decision_ci_reliable,
+    decision_CI_excludes_zero = decision_ci_excludes_zero,
+    material_D1b_D1c_disagreement = material_disagreement,
+    sensitivity_status = sensitivity_status
+  )
+
+  list(
+    summary = summary_row,
+    bootstrap_replicates = boot_reps,
+    jackknife_replicates = jack_reps
+  )
+}
+
+confirmatory_ipha_ghq <-
+  run_confirmatory_ipha_disagreement(
+    D_M_GHQ_NEAR,
+    "GHQ distress",
+    CONFIRMATORY_IPHAW_BOOT_SEED
+  )
+
+confirmatory_ipha_ls <-
+  run_confirmatory_ipha_disagreement(
+    D_M_LS_NEAR,
+    "Life satisfaction",
+    CONFIRMATORY_IPHAW_BOOT_SEED + 1L
+  )
+
+confirmatory_ipha_summary <- bind_rows(
+  confirmatory_ipha_ghq$summary,
+  confirmatory_ipha_ls$summary
+)
+
+write_csv_quiet(
+  confirmatory_ipha_summary,
+  "00_CONFIRMATORY_IPHAW_DISAGREEMENT.csv"
+)
+
+confirmatory_ipha_boot_reps <- bind_rows(
+  confirmatory_ipha_ghq$bootstrap_replicates %>%
+    mutate(outcome = "GHQ distress"),
+  confirmatory_ipha_ls$bootstrap_replicates %>%
+    mutate(outcome = "Life satisfaction")
+)
+
+write_csv_quiet(
+  confirmatory_ipha_boot_reps,
+  "00_CONFIRMATORY_IPHAW_BOOTSTRAP_REPLICATES.csv",
+  subdir = "diagnostics"
+)
+
+confirmatory_ipha_jack_reps <- bind_rows(
+  confirmatory_ipha_ghq$jackknife_replicates %>%
+    mutate(outcome = "GHQ distress"),
+  confirmatory_ipha_ls$jackknife_replicates %>%
+    mutate(outcome = "Life satisfaction")
+)
+
+write_csv_quiet(
+  confirmatory_ipha_jack_reps,
+  "00_CONFIRMATORY_IPHAW_BCA_JACKKNIFE_REPLICATES.csv",
+  subdir = "diagnostics"
+)
+
+
+# -----------------------------------------------------------------------------
+# 11C-1. CONFIRMATORY FAMILY AND MULTIPLICITY
+# -----------------------------------------------------------------------------
+# Exactly two co-primary tests:
+#   D_M D1b, 1-12m, GHQ
+#   D_M D1b, 1-12m, life satisfaction
+# Both use two-sided p-values; Holm controls familywise alpha at .05.
+
+confirmatory_results <- bind_rows(
+  extract_term_stats(
+    D_M_GHQ_NEAR$models$D1b,
+    "treated"
+  ) %>%
+    mutate(
+      outcome = "GHQ distress",
+      expected_direction = "negative",
+      direction_ok = estimate < 0
+    ),
+
+  extract_term_stats(
+    D_M_LS_NEAR$models$D1b,
+    "treated"
+  ) %>%
+    mutate(
+      outcome = "Life satisfaction",
+      expected_direction = "positive",
+      direction_ok = estimate > 0
+    )
+) %>%
+  mutate(
+    family =
+      "Confirmatory co-primary D_M 1-12m D1b",
+    p_holm =
+      stats::p.adjust(
+        p_value,
+        method =
+          CONFIRMATORY_ADJUSTMENT
+      ),
+    alpha_familywise =
+      CONFIRMATORY_ALPHA,
+    supported =
+      !is.na(p_holm) &
+      p_holm <
+        CONFIRMATORY_ALPHA &
+      !is.na(direction_ok) &
+      direction_ok,
+    inferential_role =
+      "confirmatory D1b"
+  ) %>%
+  left_join(
+    confirmatory_ipha_summary,
+    by = "outcome"
+  ) %>%
+  mutate(
+    headline_qualification =
+      case_when(
+
+        !supported ~
+          paste(
+            "Confirmatory D1b not supported for this outcome.",
+            "D1c cannot rescue the confirmatory test."
+          ),
+
+        supported &
+          !D1c_ESS_acceptable ~
+          paste(
+            "Confirmatory D1b supported, but IPHAW ESS is inadequate;",
+            "robustness to selective history availability cannot be",
+            "assessed reliably."
+          ),
+
+        supported &
+          D1c_ESS_acceptable &
+          material_D1b_D1c_disagreement ~
+          paste(
+            "Confirmatory D1b supported BUT materially sensitive to",
+            "selective psychological-history availability;",
+            "generalization beyond the history-complete population",
+            "is uncertain."
+          ),
+
+        supported &
+          D1c_ESS_acceptable &
+          !material_D1b_D1c_disagreement &
+          !decision_CI_reliable ~
+          paste(
+            "Confirmatory D1b supported and D1c ESS is acceptable,",
+            "but neither the BCa nor percentile D1b-D1c interval was reliable;",
+            "selective-history robustness is incompletely adjudicated."
+          ),
+
+        supported &
+          D1c_ESS_acceptable &
+          !material_D1b_D1c_disagreement &
+          decision_CI_reliable ~
+          paste(
+            "Confirmatory D1b supported and no prespecified material",
+            "disagreement with the mandatory IPHAW sensitivity",
+            "was detected."
+          ),
+
+        TRUE ~
+          "Confirmatory interpretation requires manual inspection."
+      )
+  )
+
+write_csv_quiet(
+  confirmatory_results,
+  "00_CONFIRMATORY_HOLM_RESULTS.csv"
+)
+
+confirmatory_base_conclusion <-
+  case_when(
+
+    any(
+      is.na(
+        confirmatory_results$p_value
+      )
+    ) ~
+      paste(
+        "The confirmatory family is incomplete because at least one",
+        "co-primary D1b model/p-value is unavailable; no overall",
+        "confirmatory conclusion is drawn."
+      ),
+
+    all(
+      confirmatory_results$supported
+    ) ~
+      paste(
+        "Both co-primary D1b outcomes are supported after",
+        "Holm correction."
+      ),
+
+    any(
+      confirmatory_results$supported
+    ) ~
+      paste(
+        "Only one co-primary D1b outcome is supported after",
+        "Holm correction; conclusions must remain outcome-specific."
+      ),
+
+    TRUE ~
+      paste(
+        "The confirmatory D1b family does not support a generalized",
+        "near-marriage psychological-change claim. D1c or other",
+        "secondary/robustness results cannot rescue it."
+      )
+  )
+
+confirmatory_sensitivity_lines <-
+  paste0(
+    confirmatory_results$outcome,
+    ": ",
+    confirmatory_results$headline_qualification
+  )
+
+confirmatory_family_conclusion <- paste(
+  confirmatory_base_conclusion,
+  "",
+  "MANDATORY SELECTIVE-HISTORY QUALIFIER:",
+  paste(
+    confirmatory_sensitivity_lines,
+    collapse = "\n"
+  ),
+  sep = "\n"
+)
+
+write_txt(
+  confirmatory_family_conclusion,
+  "00_CONFIRMATORY_FAMILY_CONCLUSION.txt"
+)
+
+secondary_row <- function(x, outcome_label, horizon_label, arm_label) {
+  extract_term_stats(x$models$D1b, "treated") %>%
+    mutate(
+      arm = arm_label,
+      outcome = outcome_label,
+      horizon = horizon_label
+    )
+}
+
+secondary_marriage <- bind_rows(
+  secondary_row(D_M_GHQ_MID, "GHQ distress", "13-24m", "marriage"),
+  secondary_row(D_M_GHQ_DISTAL, "GHQ distress", "25-60m", "marriage"),
+  secondary_row(D_M_LS_MID, "Life satisfaction", "13-24m", "marriage"),
+  secondary_row(D_M_LS_DISTAL, "Life satisfaction", "25-60m", "marriage")
+) %>%
+  mutate(
+    multiplicity_family = "secondary marriage timing D1b",
+    p_adjusted = stats::p.adjust(p_value, method = SECONDARY_ADJUSTMENT),
+    adjustment = SECONDARY_ADJUSTMENT,
+    family_size = 4L,
+    inferential_role = "secondary"
+  )
+
+secondary_breakup <- bind_rows(
+  secondary_row(D_B_GHQ_NEAR, "GHQ distress", "1-12m", "breakup"),
+  secondary_row(D_B_GHQ_MID, "GHQ distress", "13-24m", "breakup"),
+  secondary_row(D_B_GHQ_DISTAL, "GHQ distress", "25-60m", "breakup"),
+  secondary_row(D_B_LS_NEAR, "Life satisfaction", "1-12m", "breakup"),
+  secondary_row(D_B_LS_MID, "Life satisfaction", "13-24m", "breakup"),
+  secondary_row(D_B_LS_DISTAL, "Life satisfaction", "25-60m", "breakup")
+) %>%
+  mutate(
+    multiplicity_family = "secondary breakup timing D1b",
+    p_adjusted = stats::p.adjust(p_value, method = SECONDARY_ADJUSTMENT),
+    adjustment = SECONDARY_ADJUSTMENT,
+    family_size = 6L,
+    inferential_role = "secondary"
+  )
+
+D_secondary_multiplicity <- bind_rows(
+  secondary_marriage,
+  secondary_breakup
+)
+
+write_csv_quiet(
+  D_secondary_multiplicity,
+  "D_SECONDARY_MULTIPLICITY_RESULTS.csv"
+)
+
+D_IPHAW_weight_diagnostics <- bind_rows(
+  lapply(all_D_results, function(x) x$weight_diagnostics)
+)
+
+write_csv_quiet(
+  D_IPHAW_weight_diagnostics,
+  "D01_IPHAW_FINAL_WEIGHT_DIAGNOSTICS.csv",
+  subdir = "diagnostics"
+)
+
+
+D_raw_availability_patterns <- bind_rows(
+  lapply(all_D_results, function(x) x$availability_patterns)
+)
+
+write_csv_quiet(
+  D_raw_availability_patterns,
+  "D02_RAW_HISTORY_AVAILABILITY_PATTERNS.csv",
+  subdir = "diagnostics"
+)
+
+D_structural_support_diagnostics <- bind_rows(
+  lapply(all_D_results, function(x) x$support_diagnostics)
+)
+
+write_csv_quiet(
+  D_structural_support_diagnostics,
+  "D03_STRUCTURAL_OPPORTUNITY_IPHAW_SUPPORT.csv",
+  subdir = "diagnostics"
+)
+
+D_opportunity_validity <- bind_rows(
+  lapply(all_D_results, function(x) x$opportunity_diagnostics)
+)
+
+write_csv_quiet(
+  D_opportunity_validity,
+  "D04_STRUCTURAL_OPPORTUNITY_VALIDITY.csv",
+  subdir = "diagnostics"
+)
+
+D_strict_history_counts <- bind_rows(
+  Map(
+    function(x, nm) {
+      if (nrow(x$strict_history_counts) == 0L) return(tibble())
+      x$strict_history_counts %>% mutate(result_object = nm)
+    },
+    all_D_results,
+    names(all_D_results)
+  )
+)
+
+write_csv_quiet(
+  D_strict_history_counts,
+  "D05_STRICT_UNAMBIGUOUS_HISTORY_SAMPLE_COUNTS.csv",
+  subdir = "diagnostics"
+)
+
+E_attenuation <- bind_rows(
+  lapply(all_D_results, function(x) x$attenuation)
+)
+
+write_csv_quiet(
+  E_attenuation,
+  "E00_sequential_explanatory_attenuation.csv"
+)
+
+E_common_accounting <- bind_rows(
+  lapply(all_D_results, function(x) x$common_accounting)
+)
+
+write_csv_quiet(
+  E_common_accounting,
+  "E02_fully_common_sample_accounting.csv"
+)
+
+E_history_sensitivity <- bind_rows(
+  lapply(all_D_results, function(x) x$sensitivity)
+)
+
+write_csv_quiet(
+  E_history_sensitivity,
+  "E01_history_restriction_and_IPHAW_sensitivity.csv"
+)
+
+D_nested_sample_counts <- bind_rows(
+  tibble(
+    arm = "marriage", outcome = "GHQ",
+    horizon = c("1-12m", "13-24m", "25-60m"),
+    broad = c(D_M_GHQ_NEAR$n_broad, D_M_GHQ_MID$n_broad, D_M_GHQ_DISTAL$n_broad),
+    psych_history = c(D_M_GHQ_NEAR$n_history, D_M_GHQ_MID$n_history, D_M_GHQ_DISTAL$n_history),
+    rdas_level = c(D_M_GHQ_NEAR$n_rdas_level, D_M_GHQ_MID$n_rdas_level, D_M_GHQ_DISTAL$n_rdas_level),
+    rdas_change = c(D_M_GHQ_NEAR$n_rdas_change, D_M_GHQ_MID$n_rdas_change, D_M_GHQ_DISTAL$n_rdas_change)
+  ),
+  tibble(
+    arm = "marriage", outcome = "LS",
+    horizon = c("1-12m", "13-24m", "25-60m"),
+    broad = c(D_M_LS_NEAR$n_broad, D_M_LS_MID$n_broad, D_M_LS_DISTAL$n_broad),
+    psych_history = c(D_M_LS_NEAR$n_history, D_M_LS_MID$n_history, D_M_LS_DISTAL$n_history),
+    rdas_level = c(D_M_LS_NEAR$n_rdas_level, D_M_LS_MID$n_rdas_level, D_M_LS_DISTAL$n_rdas_level),
+    rdas_change = c(D_M_LS_NEAR$n_rdas_change, D_M_LS_MID$n_rdas_change, D_M_LS_DISTAL$n_rdas_change)
+  ),
+  tibble(
+    arm = "breakup", outcome = "GHQ",
+    horizon = c("1-12m", "13-24m", "25-60m"),
+    broad = c(D_B_GHQ_NEAR$n_broad, D_B_GHQ_MID$n_broad, D_B_GHQ_DISTAL$n_broad),
+    psych_history = c(D_B_GHQ_NEAR$n_history, D_B_GHQ_MID$n_history, D_B_GHQ_DISTAL$n_history),
+    rdas_level = c(D_B_GHQ_NEAR$n_rdas_level, D_B_GHQ_MID$n_rdas_level, D_B_GHQ_DISTAL$n_rdas_level),
+    rdas_change = c(D_B_GHQ_NEAR$n_rdas_change, D_B_GHQ_MID$n_rdas_change, D_B_GHQ_DISTAL$n_rdas_change)
+  ),
+  tibble(
+    arm = "breakup", outcome = "LS",
+    horizon = c("1-12m", "13-24m", "25-60m"),
+    broad = c(D_B_LS_NEAR$n_broad, D_B_LS_MID$n_broad, D_B_LS_DISTAL$n_broad),
+    psych_history = c(D_B_LS_NEAR$n_history, D_B_LS_MID$n_history, D_B_LS_DISTAL$n_history),
+    rdas_level = c(D_B_LS_NEAR$n_rdas_level, D_B_LS_MID$n_rdas_level, D_B_LS_DISTAL$n_rdas_level),
+    rdas_change = c(D_B_LS_NEAR$n_rdas_change, D_B_LS_MID$n_rdas_change, D_B_LS_DISTAL$n_rdas_change)
+  )
+)
+
+write_csv_quiet(
+  D_nested_sample_counts,
+  "D00_nested_common_sample_counts.csv"
+)
+
+# -----------------------------------------------------------------------------
+# 11D. C-TO-D DISTAL DIAGNOSTIC - NO MECHANICAL SIGNIFICANCE GATE
+# -----------------------------------------------------------------------------
+# B, C5b and D25-60 do NOT form a three-test OR gate. They address different
+# estimands (level, trajectory interaction, recent change), so combining their
+# p-values into a binary pass/fail rule would be statistically artificial.
+#
+# The PRIMARY temporal diagnostic is D_M D1b at 25-60m because it has the same
+# outcome definition, covariate structure and risk-set framework as the
+# confirmatory D_M D1b 1-12m contrast. B and C5b are contextual diagnostics.
+#
+# Interpretation is based on the magnitude/direction/CI sequence:
+#   D1b 25-60m -> 13-24m -> 1-12m.
+# No p<.05-any-of-three flag is created.
+
+get_treated <- function(x, model_name = "D1b") {
+  extract_term_stats(x$models[[model_name]], "treated")
+}
+
+B_ghq <- extract_term_stats(B1_GHQ_DISTAL, "distal_treated")
+B_ls <- extract_term_stats(B1_LS_DISTAL, "distal_treated")
+B_p_holm <- stats::p.adjust(c(B_ghq$p_value, B_ls$p_value), method = "holm")
+
+C5_ghq_p <- C5b_preprox_tests %>%
+  filter(outcome == "GHQ") %>%
+  pull(p_value)
+C5_ls_p <- C5b_preprox_tests %>%
+  filter(outcome == "Life satisfaction") %>%
+  pull(p_value)
+C5_raw <- c(
+  ifelse(length(C5_ghq_p) == 0, NA_real_, C5_ghq_p[1]),
+  ifelse(length(C5_ls_p) == 0, NA_real_, C5_ls_p[1])
+)
+C5_p_holm <- stats::p.adjust(C5_raw, method = "holm")
+
+Dghq_d <- get_treated(D_M_GHQ_DISTAL, "D1b")
+Dghq_m <- get_treated(D_M_GHQ_MID, "D1b")
+Dghq_n <- get_treated(D_M_GHQ_NEAR, "D1b")
+Dls_d <- get_treated(D_M_LS_DISTAL, "D1b")
+Dls_m <- get_treated(D_M_LS_MID, "D1b")
+Dls_n <- get_treated(D_M_LS_NEAR, "D1b")
+
+# Fetch Holm-adjusted D25-60 secondary p-values from the prespecified family.
+Dghq_d_holm <- secondary_marriage %>%
+  filter(outcome == "GHQ distress", horizon == "25-60m") %>%
+  pull(p_adjusted)
+Dls_d_holm <- secondary_marriage %>%
+  filter(outcome == "Life satisfaction", horizon == "25-60m") %>%
+  pull(p_adjusted)
+
+C_D_distal_diagnostic <- bind_rows(
+  tibble(
+    outcome = "GHQ",
+    B_distal_level_estimate = B_ghq$estimate,
+    B_distal_level_conf_low = B_ghq$conf_low,
+    B_distal_level_conf_high = B_ghq$conf_high,
+    B_distal_level_p_raw = B_ghq$p_value,
+    B_distal_level_p_holm_within_B = B_p_holm[1],
+    C5_preprox_joint_p_raw = C5_raw[1],
+    C5_preprox_joint_p_holm_across_outcomes = C5_p_holm[1],
+    D1b_25_60_estimate = Dghq_d$estimate,
+    D1b_25_60_conf_low = Dghq_d$conf_low,
+    D1b_25_60_conf_high = Dghq_d$conf_high,
+    D1b_25_60_p_raw = Dghq_d$p_value,
+    D1b_25_60_p_holm_secondary_family =
+      ifelse(length(Dghq_d_holm) == 0, NA_real_, Dghq_d_holm[1]),
+    D1b_13_24_estimate = Dghq_m$estimate,
+    D1b_13_24_conf_low = Dghq_m$conf_low,
+    D1b_13_24_conf_high = Dghq_m$conf_high,
+    D1b_1_12_estimate = Dghq_n$estimate,
+    D1b_1_12_conf_low = Dghq_n$conf_low,
+    D1b_1_12_conf_high = Dghq_n$conf_high
+  ),
+  tibble(
+    outcome = "Life satisfaction",
+    B_distal_level_estimate = B_ls$estimate,
+    B_distal_level_conf_low = B_ls$conf_low,
+    B_distal_level_conf_high = B_ls$conf_high,
+    B_distal_level_p_raw = B_ls$p_value,
+    B_distal_level_p_holm_within_B = B_p_holm[2],
+    C5_preprox_joint_p_raw = C5_raw[2],
+    C5_preprox_joint_p_holm_across_outcomes = C5_p_holm[2],
+    D1b_25_60_estimate = Dls_d$estimate,
+    D1b_25_60_conf_low = Dls_d$conf_low,
+    D1b_25_60_conf_high = Dls_d$conf_high,
+    D1b_25_60_p_raw = Dls_d$p_value,
+    D1b_25_60_p_holm_secondary_family =
+      ifelse(length(Dls_d_holm) == 0, NA_real_, Dls_d_holm[1]),
+    D1b_13_24_estimate = Dls_m$estimate,
+    D1b_13_24_conf_low = Dls_m$conf_low,
+    D1b_13_24_conf_high = Dls_m$conf_high,
+    D1b_1_12_estimate = Dls_n$estimate,
+    D1b_1_12_conf_low = Dls_n$conf_low,
+    D1b_1_12_conf_high = Dls_n$conf_high
+  )
+) %>%
+  mutate(
+    diagnostic_role = paste(
+      "No binary gate. D1b 25-60m is the primary distal temporal diagnostic;",
+      "B and C5 provide contextual evidence."
+    ),
+    interpretation_rule = paste(
+      "If the 25-60m D1b estimate is already substantively different from zero",
+      "in the same direction as near-marriage change, describe 1-12m as possible",
+      "continuation/acceleration of earlier differentiation. If the distal",
+      "estimate is close to zero with an informative CI and the 13-24/1-12m",
+      "estimates become progressively larger, a temporally localized proximity",
+      "pattern is more compatible with the data. Wide distal CIs are inconclusive."
+    )
+  )
+
+write_csv_quiet(
+  C_D_distal_diagnostic,
+  "C_D_DISTAL_DIAGNOSTIC_SUMMARY.csv",
+  subdir = "diagnostics"
+)
+
+write_csv_quiet(
+  tibble(
+    component = c(
+      "Primary distal diagnostic",
+      "Contextual level diagnostic",
+      "Contextual trajectory diagnostic",
+      "Prohibited rule"
+    ),
+    rule = c(
+      "Use D_M D1b 25-60m estimate and CI on the same estimand as 1-12m.",
+      "Use B 25-60m level difference as context; do not combine its p-value into a gate.",
+      "Use C5b trajectory test as context; do not combine its p-value into a gate.",
+      "Do not declare distal divergence merely because any one of B/C5/D has p<.05."
+    )
+  ),
+  "C_D_DISTAL_DIAGNOSTIC_RULES.csv",
+  subdir = "diagnostics"
+)
+
+# -----------------------------------------------------------------------------
+# 11E. DATE-QUALITY SENSITIVITY COUNTS
+# -----------------------------------------------------------------------------
+
+D_sens_marriage_counts <- primary_support %>%
+  mutate(
+    marriage_horizon_state_sens = case_when(
+      usable_marriage_date_sens &
+        !is.na(months_to_marriage) &
+        months_to_marriage >= ifelse(EXCLUDE_SAME_MONTH_MARRIAGE, 1, 0) &
+        months_to_marriage <= 12 ~ "marriage_1_12m",
+      usable_marriage_date_sens &
+        !is.na(months_to_marriage) &
+        months_to_marriage >= 13 &
+        months_to_marriage <= 24 ~ "marriage_13_24m",
+      usable_marriage_date_sens &
+        !is.na(months_to_marriage) &
+        months_to_marriage >= 25 &
+        months_to_marriage <= 60 ~ "marriage_25_60m",
+      continued_cohab_60m ~ "continued_cohab_60m",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  count(marriage_horizon_state_sens, name = "n")
+
+write_csv_quiet(
+  D_sens_marriage_counts,
+  "D_SENS_marriage_date_flags_0_or_1_counts.csv"
+)
+
+D_sens_breakup_counts <- primary_support %>%
+  mutate(
+    breakup_horizon_state_sens = case_when(
+      usable_breakup_date_sens &
+        !is.na(months_to_breakup) &
+        months_to_breakup >= 1 &
+        months_to_breakup <= 12 ~ "breakup_1_12m",
+      usable_breakup_date_sens &
+        !is.na(months_to_breakup) &
+        months_to_breakup >= 13 &
+        months_to_breakup <= 24 ~ "breakup_13_24m",
+      usable_breakup_date_sens &
+        !is.na(months_to_breakup) &
+        months_to_breakup >= 25 &
+        months_to_breakup <= 60 ~ "breakup_25_60m",
+      continued_cohab_60m ~ "continued_cohab_60m",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  count(breakup_horizon_state_sens, name = "n")
+
+write_csv_quiet(
+  D_sens_breakup_counts,
+  "D_SENS_breakup_date_flags_0_or_1_counts.csv"
+)
+
+
+# 12. ANALYSIS F: TEMPORALLY ORDERED NCRR12 TRIANGULATION
+# -----------------------------------------------------------------------------
+#
+# F1:
+#   marriage expectation at t -> psychological change from t to t+1
+#
+# V4.2 CODING FIX:
+# ----------------
+# Verified UKHLS labels are:
+#   1 very likely; 2 likely; 3 not sure; 4 unlikely; 5 very unlikely;
+#   6 prefer not to disclose.
+# Category 6 is NOT part of the substantive expectation continuum and is
+# excluded before any F model is fitted.
+#
+# Two complementary F1 tests are exported:
+#   (a) categorical 1-5 model + joint Wald test of categories 2-5;
+#   (b) prespecified ordinal trend with higher score = more likely to marry.
+#
+# This remains LAT/non-coresident relationship triangulation, not a direct
+# wedding-date anticipation test.
+
+lat_panel_base <- panel %>%
+  filter(
+    ncrr1 == 1,
+    !is.na(lat_relationship_start_ym),
+    lat_relationship_start_ym <= interview_ym
+  ) %>%
+  mutate(
+    lat_relationship_id = paste(pidp, lat_relationship_start_ym, sep = "_"),
+    lat_duration_months = interview_ym - lat_relationship_start_ym
+  ) %>%
+  arrange(lat_relationship_id, interview_ym) %>%
+  group_by(lat_relationship_id) %>%
+  mutate(
+    next_interview_ym = lead(interview_ym),
+    next_ghq = lead(ghq),
+    next_ls = lead(life_satisfaction),
+    next_ncrr12 = lead(ncrr12),
+    next_gap_months = next_interview_ym - interview_ym,
+    next_ghq_change = if_else(
+      !is.na(next_ghq) & !is.na(ghq) &
+        next_gap_months >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+        next_gap_months <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+      next_ghq - ghq,
+      NA_real_
+    ),
+    next_ls_change = if_else(
+      !is.na(next_ls) & !is.na(life_satisfaction) &
+        next_gap_months >= PRIOR_PSYCH_MIN_GAP_MONTHS &
+        next_gap_months <= PRIOR_PSYCH_MAX_GAP_MONTHS,
+      next_ls - life_satisfaction,
+      NA_real_
+    ),
+    n_lat_observations = n()
+  ) %>%
+  ungroup() %>%
+  filter(n_lat_observations >= 2)
+
+write_csv_quiet(
+  lat_panel_base %>%
+    filter(ncrr12 %in% 1:6) %>%
+    count(ncrr12, name = "n") %>%
+    mutate(
+      substantive = ncrr12 %in% NCRR12_SUBSTANTIVE_VALUES,
+      label = recode(
+        as.character(ncrr12),
+        `1` = "very likely",
+        `2` = "likely",
+        `3` = "not sure",
+        `4` = "unlikely",
+        `5` = "very unlikely",
+        `6` = "prefer not to disclose"
+      )
+    ),
+  "F00_NCRR12_exclusion_audit.csv",
+  subdir = "diagnostics"
+)
+
+lat_panel <- lat_panel_base %>%
+  filter(ncrr12 %in% NCRR12_SUBSTANTIVE_VALUES) %>%
+  mutate(
+    ncrr12_factor = relevel(
+      factor(ncrr12, levels = NCRR12_SUBSTANTIVE_VALUES),
+      ref = "1"
+    ),
+    marriage_likelihood_score = unname(
+      NCRR12_SCORE_MAP[as.character(ncrr12)]
+    ),
+    next_marriage_likelihood_score = unname(
+      NCRR12_SCORE_MAP[as.character(next_ncrr12)]
+    ),
+    ghq_z = zsafe(ghq),
+    ls_z = zsafe(life_satisfaction),
+    next_ghq_change_z = zsafe(next_ghq_change),
+    next_ls_change_z = zsafe(next_ls_change)
+  )
+
+write_csv_quiet(
+  lat_panel %>%
+    count(ncrr12_factor, name = "n") %>%
+    mutate(
+      label = recode(
+        as.character(ncrr12_factor),
+        `1` = "very likely",
+        `2` = "likely",
+        `3` = "not sure",
+        `4` = "unlikely",
+        `5` = "very unlikely"
+      )
+    ),
+  "F00_NCRR12_category_counts.csv"
+)
+
+F1_GHQ_EXPECTATION_TO_CHANGE <- safe_feols(
+  next_ghq_change_z ~
+    ncrr12_factor +
+    ghq_z +
+    ns(lat_duration_months, df = 3) |
+    lat_relationship_id + wave,
+  data = lat_panel,
+  name = "F1_NCRR12_t_to_next_GHQ_change",
+  vcov = ~pidp
+)
+
+F1_LS_EXPECTATION_TO_CHANGE <- safe_feols(
+  next_ls_change_z ~
+    ncrr12_factor +
+    ls_z +
+    ns(lat_duration_months, df = 3) |
+    lat_relationship_id + wave,
+  data = lat_panel,
+  name = "F1_NCRR12_t_to_next_LS_change",
+  vcov = ~pidp
+)
+
+F1_NCRR12_OMNIBUS <- bind_rows(
+  safe_wald_row(
+    F1_GHQ_EXPECTATION_TO_CHANGE,
+    keep = "^ncrr12_factor",
+    test_name = "F1 categorical NCRR12 omnibus: categories 2-5 vs very likely",
+    outcome = "GHQ",
+    arm = "LAT expectation"
+  ),
+  safe_wald_row(
+    F1_LS_EXPECTATION_TO_CHANGE,
+    keep = "^ncrr12_factor",
+    test_name = "F1 categorical NCRR12 omnibus: categories 2-5 vs very likely",
+    outcome = "Life satisfaction",
+    arm = "LAT expectation"
+  )
+)
+
+write_csv_quiet(
+  F1_NCRR12_OMNIBUS,
+  "F1_NCRR12_categorical_omnibus_tests.csv",
+  subdir = "diagnostics"
+)
+
+# Ordinal trend sensitivity. Higher score = greater perceived likelihood of
+# marriage (5 = very likely ... 1 = very unlikely).
+F1_GHQ_EXPECTATION_TREND <- safe_feols(
+  next_ghq_change_z ~
+    marriage_likelihood_score +
+    ghq_z +
+    ns(lat_duration_months, df = 3) |
+    lat_relationship_id + wave,
+  data = lat_panel,
+  name = "F1_NCRR12_GHQ_linear_likelihood_trend",
+  vcov = ~pidp
+)
+
+F1_LS_EXPECTATION_TREND <- safe_feols(
+  next_ls_change_z ~
+    marriage_likelihood_score +
+    ls_z +
+    ns(lat_duration_months, df = 3) |
+    lat_relationship_id + wave,
+  data = lat_panel,
+  name = "F1_NCRR12_LS_linear_likelihood_trend",
+  vcov = ~pidp
+)
+
+# Reciprocal numeric models using the now-verified substantive 1-5 score.
+lat_numeric <- lat_panel %>%
+  filter(
+    !is.na(marriage_likelihood_score),
+    !is.na(next_marriage_likelihood_score)
+  )
+
+F2_GHQ_TO_EXPECTATION <- safe_feols(
+  next_marriage_likelihood_score ~
+    marriage_likelihood_score +
+    ghq_z +
+    ns(lat_duration_months, df = 3) |
+    lat_relationship_id + wave,
+  data = lat_numeric,
+  name = "F2_GHQ_t_to_next_NCRR12_numeric",
+  vcov = ~pidp
+)
+
+F2_LS_TO_EXPECTATION <- safe_feols(
+  next_marriage_likelihood_score ~
+    marriage_likelihood_score +
+    ls_z +
+    ns(lat_duration_months, df = 3) |
+    lat_relationship_id + wave,
+  data = lat_numeric,
+  name = "F2_LS_t_to_next_NCRR12_numeric",
+  vcov = ~pidp
+)
+# -----------------------------------------------------------------------------
+# 13. ANALYSIS G: MULTIPLE-RELATIONSHIP WITHIN-PERSON ROBUSTNESS
+# -----------------------------------------------------------------------------
+
+multi_spells <- cohab_spells %>%
+  filter(valid_partner, spell_outcome %in% c("marriage", "breakup")) %>%
+  distinct(pidp, relationship_spell_id, cohab_partner, spell_outcome) %>%
+  group_by(pidp) %>%
+  mutate(
+    n_relationships = n_distinct(relationship_spell_id),
+    has_marriage_spell = any(spell_outcome == "marriage"),
+    has_breakup_spell = any(spell_outcome == "breakup")
+  ) %>%
+  ungroup() %>%
+  filter(
+    n_relationships >= 2,
+    has_marriage_spell,
+    has_breakup_spell
+  )
+
+multi_ids <- unique(multi_spells$relationship_spell_id)
+
+multi_panel <- primary_support %>%
+  filter(
+    relationship_spell_id %in% multi_ids,
+    spell_outcome %in% c("marriage", "breakup")
+  ) %>%
+  mutate(
+    spell_outcome = relevel(factor(spell_outcome), ref = "breakup"),
+    ghq_z = zsafe(ghq),
+    ls_z = zsafe(life_satisfaction)
+  )
+
+write_csv_quiet(
+  multi_panel %>%
+    distinct(pidp, relationship_spell_id, spell_outcome) %>%
+    count(spell_outcome, name = "n_spells"),
+  "G00_multiple_relationship_spell_counts.csv"
+)
+
+# Generalizability diagnostic.
+main_first_obs <- primary_support %>%
+  group_by(relationship_spell_id) %>%
+  arrange(cohab_duration_months, interview_ym, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(in_G_subgroup = relationship_spell_id %in% multi_ids)
+
+G_generalizability <- main_first_obs %>%
+  group_by(in_G_subgroup) %>%
+  summarise(
+    n_spells = n(),
+    n_persons = n_distinct(pidp),
+    pct_female = 100 * mean(sex == 2, na.rm = TRUE),
+    mean_age = mean(age, na.rm = TRUE),
+    mean_ghq = mean(ghq, na.rm = TRUE),
+    mean_ls = mean(life_satisfaction, na.rm = TRUE),
+    mean_cohab_duration_months = mean(cohab_duration_months, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv_quiet(
+  G_generalizability,
+  "G00_generalizability_comparison.csv"
+)
+
+multi_entry <- multi_panel %>%
+  group_by(relationship_spell_id) %>%
+  arrange(cohab_duration_months, interview_ym, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup()
+
+G1_GHQ_ENTRY <- safe_feols(
+  ghq_z ~ spell_outcome + cohab_duration_months | pidp + wave,
+  data = multi_entry,
+  name = "G1_GHQ_entry_multiple_relationship_person_FE",
+  vcov = ~pidp
+)
+
+G1_LS_ENTRY <- safe_feols(
+  ls_z ~ spell_outcome + cohab_duration_months | pidp + wave,
+  data = multi_entry,
+  name = "G1_LS_entry_multiple_relationship_person_FE",
+  vcov = ~pidp
+)
+
+G2_GHQ_TRAJECTORY <- safe_feols(
+  ghq_z ~
+    ns(cohab_duration_months, df = 4) +
+    spell_outcome:ns(cohab_duration_months, df = 4) |
+    pidp + wave,
+  data = multi_panel,
+  name = "G2_GHQ_trajectory_multiple_relationship_person_FE",
+  vcov = ~pidp
+)
+
+G2_LS_TRAJECTORY <- safe_feols(
+  ls_z ~
+    ns(cohab_duration_months, df = 4) +
+    spell_outcome:ns(cohab_duration_months, df = 4) |
+    pidp + wave,
+  data = multi_panel,
+  name = "G2_LS_trajectory_multiple_relationship_person_FE",
+  vcov = ~pidp
+)
+
+# -----------------------------------------------------------------------------
+# 14. ANALYTIC POOL COUNTS
+# -----------------------------------------------------------------------------
+
+analytic_pool_counts <- tibble(
+  analysis = c(
+    "A pre-relationship primary",
+    "A pre-relationship 24-60m sensitivity",
+    "B distal matched level pool",
+    "C relationship development",
+    "C5 pre-proximity trajectory pool",
+    "D_M marriage four-state pool",
+    "D_B breakup four-state pool",
+    "F repeated NCRR12 LAT relationships",
+    "G multiple-relationship person-FE panel"
+  ),
+  n_rows = c(
+    nrow(pre_rel_primary),
+    nrow(pre_rel_sensitivity),
+    nrow(B_distal_matched),
+    nrow(development),
+    nrow(C5_preprox),
+    nrow(D_marriage_pool),
+    nrow(D_breakup_pool),
+    nrow(lat_panel),
+    nrow(multi_panel)
+  ),
+  n_persons = c(
+    n_distinct(pre_rel_primary$pidp),
+    n_distinct(pre_rel_sensitivity$pidp),
+    n_distinct(B_distal_matched$pidp),
+    n_distinct(development$pidp),
+    n_distinct(C5_preprox$pidp),
+    n_distinct(D_marriage_pool$pidp),
+    n_distinct(D_breakup_pool$pidp),
+    n_distinct(lat_panel$pidp),
+    n_distinct(multi_panel$pidp)
+  )
+)
+
+write_csv_quiet(
+  analytic_pool_counts,
+  "99_analytic_pool_counts.csv"
+)
+
+# -----------------------------------------------------------------------------
+# 15. ROBUST ACTUAL MODEL N FROM SAVED .RDS FILES
+# -----------------------------------------------------------------------------
+
+model_rds_files <- list.files(
+  file.path(OUT_DIR, "models"),
+  pattern = "\\.rds$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+extract_saved_model_n <- function(path) {
+  model_name <- sub("\\.rds$", "", basename(path), ignore.case = TRUE)
+  obj <- tryCatch(readRDS(path), error = function(e) e)
+
+  if (inherits(obj, "error")) {
+    return(tibble(
+      model = model_name,
+      nobs_actual = NA_integer_,
+      status = paste0("readRDS_error: ", conditionMessage(obj))
+    ))
+  }
+
+  n <- tryCatch(stats::nobs(obj), error = function(e) NA_integer_)
+
+  tibble(
+    model = model_name,
+    nobs_actual = if (
+      length(n) == 0L || is.na(n[1])
+    ) NA_integer_ else as.integer(n[1]),
+    status = if (
+      length(n) == 0L || is.na(n[1])
+    ) "nobs_unavailable" else "estimated"
+  )
+}
+
+if (length(model_rds_files) == 0L) {
+  actual_model_counts <- tibble(
+    model = character(0),
+    nobs_actual = integer(0),
+    status = character(0)
+  )
+} else {
+  actual_model_counts <- bind_rows(
+    lapply(model_rds_files, extract_saved_model_n)
+  ) %>%
+    arrange(model)
+}
+
+write_csv_quiet(
+  actual_model_counts,
+  "99_actual_model_nobs.csv"
+)
+
+# -----------------------------------------------------------------------------
+# 16. SAVE KEY DATASETS
+# -----------------------------------------------------------------------------
+
+saveRDS(
+  pre_rel_primary,
+  file.path(OUT_DIR, "data", "10_A_pre_relationship_primary.rds")
+)
+
+saveRDS(
+  development,
+  file.path(OUT_DIR, "data", "20_C_relationship_development.rds")
+)
+
+saveRDS(
+  D_marriage_pool,
+  file.path(OUT_DIR, "data", "30_D_M_marriage_proximity_riskset_pool.rds")
+)
+
+saveRDS(
+  D_breakup_pool,
+  file.path(OUT_DIR, "data", "31_D_B_breakup_proximity_riskset_pool.rds")
+)
+
+saveRDS(
+  lat_panel,
+  file.path(OUT_DIR, "data", "40_F_NCRR12_LAT_panel.rds")
+)
+
+saveRDS(
+  multi_panel,
+  file.path(OUT_DIR, "data", "50_G_multiple_relationship_panel.rds")
+)
+
+# -----------------------------------------------------------------------------
+# 17. REVISED INTERPRETATION GUIDE
+# -----------------------------------------------------------------------------
+
+interpretation_guide <- tribble(
+  ~analysis,
+  ~finding,
+  ~preferred_interpretation,
+
+  "Confirmatory D_M 1-12m D1b",
+  "GHQ and/or life-satisfaction D1b contrast is supported after Holm correction",
+  paste(
+    "This is the only confirmatory family. GHQ and life satisfaction are",
+    "two co-primary outcomes with Holm familywise correction. If only one is",
+    "supported, conclusions must remain outcome-specific. No secondary model",
+    "may rescue a nonsignificant confirmatory result."
+  ),
+
+  "A pre-relationship",
+  "Psychology differs before the next focal union begins",
+  paste(
+    "Psychological differentiation predates the observed focal relationship",
+    "and is consistent with pre-relationship selection. It does not by itself",
+    "identify a stable trait-selection mechanism."
+  ),
+
+  "B distal 25-60m",
+  "Psychological levels differ 25-60 months before marriage",
+  paste(
+    "Differentiation is detectable before the primary 1-24m proximal window.",
+    "This may reflect earlier selection, relationship development, or",
+    "longer-horizon anticipation. B is not independent corroboration of D."
+  ),
+
+  "C relationship development",
+  "Psychological and RDAS trajectories vary with relationship age",
+  paste(
+    "Psychological and relationship-quality development are temporally",
+    "patterned within relationships. These are descriptive diagnostics,",
+    "not causal relationship effects."
+  ),
+
+  "C5 C-to-D distal diagnostic",
+  "Marriage-bound and continued-cohabitation trajectories differ 25-60m before marriage",
+  paste(
+    "C5 is contextual rather than a binary gate. The D_M D1b 25-60m",
+    "estimate and CI are the primary temporal diagnostic; C5 helps determine",
+    "whether relationship-age trajectories already differ before proximity."
+  ),
+
+  "D_M marriage proximity",
+  "Recent psychological change differs as exact marriage approaches",
+  paste(
+    "There is marriage-proximity-associated psychological change among",
+    "respondents at comparable relationship ages/calendar periods.",
+    "This is not a causal anticipation effect."
+  ),
+
+  "D_B breakup proximity",
+  "Recent psychological change differs as an exact validated breakup approaches",
+  paste(
+    "Psychological change is associated with proximity to relationship",
+    "dissolution. This restores the dissolution-proximity arm and provides",
+    "a relationship-fate comparator to D_M; it is not a causal breakup effect."
+  ),
+
+  "E sequential attenuation",
+  "The proximity coefficient attenuates after prior psychology/RDAS adjustment",
+  paste(
+    "This is descriptive explanatory attenuation calculated only on identical",
+    "common samples. It must not be reported as a causal mediated percentage",
+    "or as mutually exclusive shares of selection/development/anticipation."
+  ),
+
+  "IPHAW sensitivity",
+  "History-adjusted estimates are similar after opportunity-target history weighting",
+  paste(
+    "Structural opportunity is defined from the survey/interview schedule before",
+    "modeling actual history availability. Availability probabilities are estimated",
+    "with brglm2 mean bias-reduced logistic regression within the relevant support",
+    "population. Stage-specific ATT x history-weight products are re-trimmed after",
+    "multiplication. IPHAW can support robustness only when overall and treatment-arm",
+    "ESS/N are all >= .50. Sequential and joint D3 weighting are compared on the",
+    "same D3 opportunity target."
+  ),
+
+  "F NCRR12",
+  "Marriage expectation at t predicts psychological change by t+1",
+  paste(
+    "Explicit expectation is temporally associated with subsequent",
+    "psychological change in LAT relationships. This is cross-stage",
+    "triangulation and remains vulnerable to time-varying relationship appraisal."
+  ),
+
+  "G multiple relationships",
+  "The same person differs across different relationship outcomes",
+  paste(
+    "Stable person-level characteristics alone are insufficient in this",
+    "selected subgroup. Generalization beyond repeatedly partnered",
+    "respondents should be cautious."
+  )
+)
+
+write_csv_quiet(
+  interpretation_guide,
+  "00_ANALYSIS_INTERPRETATION_GUIDE.csv"
+)
+
+# -----------------------------------------------------------------------------
+# 18. README / SESSION INFO
+# -----------------------------------------------------------------------------
+
+write_txt(
+  capture.output(sessionInfo()),
+  "99_sessionInfo.txt",
+  subdir = "diagnostics"
+)
+
+write_txt(
+  c(
+    "UKHLS REVISED SELECTION-DEVELOPMENT-PROXIMITY WORKFLOW V4.2 COMPLETED",
+    "",
+    "CONFIRMATORY FAMILY:",
+    "- D_M D1b, 1-12 months before marriage, GHQ and life satisfaction.",
+    "- D1b is fixed as primary because it targets the observed history-complete",
+    "  eligible population without modeling missing-history probabilities.",
+    "- Two-sided p-values; Holm adjustment across exactly two co-primary tests.",
+    "- GHQ expected favorable direction = negative; life satisfaction = positive.",
+    "- If only one co-primary outcome is supported, conclusions are outcome-specific.",
+    "- D1c is a MANDATORY IPHAW sensitivity targeting the H1 structural-opportunity population.",
+    "- D1c cannot rescue a nonsignificant D1b result.",
+    "- If D1b is supported but stable D1c reverses sign OR the respondent-cluster",
+    "  BCa CI for beta_D1c-beta_D1b excludes zero (percentile fallback), label",
+    "  the conclusion sensitive to selective history availability and qualify",
+    "  generalization beyond the history-complete population.",
+    "- If D1c ESS/N < .50 overall or in either arm, selective-history robustness",
+    "  is considered not reliably assessed rather than robust.",
+    "",
+    "SECONDARY MULTIPLICITY FAMILIES:",
+    "- Marriage D1b 13-24m and 25-60m x GHQ/LS: Holm across 4.",
+    "- Breakup D1b 1-12m, 13-24m, 25-60m x GHQ/LS: Holm across 6.",
+    "",
+    "Inspect first:",
+    "1. tables/00_INFERENCE_AND_MULTIPLICITY_PLAN.csv",
+    "2. tables/00_CONFIRMATORY_HOLM_RESULTS.csv",
+    "3. tables/00_CONFIRMATORY_IPHAW_DISAGREEMENT.csv",
+    "4. tables/00_CONFIRMATORY_FAMILY_CONCLUSION.txt",
+    "5. diagnostics/00_CONFIRMATORY_IPHAW_BOOTSTRAP_REPLICATES.csv",
+    "6. diagnostics/00_CONFIRMATORY_IPHAW_BCA_JACKKNIFE_REPLICATES.csv",
+    "7. tables/D_SECONDARY_MULTIPLICITY_RESULTS.csv",
+    "8. diagnostics/C_D_DISTAL_DIAGNOSTIC_SUMMARY.csv",
+    "9. diagnostics/C00_trajectory_identification_audit.csv",
+    "10. diagnostics/C5a_early_relationship_age_joint_tests.csv",
+    "11. diagnostics/C5b_preprox_25_60m_joint_tests.csv",
+    "12. diagnostics/F1_NCRR12_categorical_omnibus_tests.csv",
+    "13. diagnostics/F00_NCRR12_exclusion_audit.csv",
+    "14. diagnostics/D01_IPHAW_FINAL_WEIGHT_DIAGNOSTICS.csv",
+    "15. diagnostics/D03_STRUCTURAL_OPPORTUNITY_IPHAW_SUPPORT.csv",
+    "16. diagnostics/D04_STRUCTURAL_OPPORTUNITY_VALIDITY.csv",
+    "17. diagnostics/D05_STRICT_UNAMBIGUOUS_HISTORY_SAMPLE_COUNTS.csv",
+    "18. tables/01_sample_flow.csv",
+    "19. tables/99_analytic_pool_counts.csv",
+    "20. tables/99_actual_model_nobs.csv",
+    "21. tables/E00_sequential_explanatory_attenuation.csv",
+    "22. tables/E02_fully_common_sample_accounting.csv",
+    "23. tables/E01_history_restriction_and_IPHAW_sensitivity.csv",
+    "24. tables/00_ANALYSIS_INTERPRETATION_GUIDE.csv",
+    "",
+    "Core sequence:",
+    "A = pre-relationship psychological differentiation",
+    "B = distal 25-60m contextual diagnostic, not independent selection proof",
+    "C = relationship development + non-binary C-to-D distal diagnostic",
+    "D_M = marriage-proximity recent-change risk-set analyses",
+    "D_B = breakup-proximity recent-change risk-set analyses",
+    "E = common-sample descriptive attenuation + history-weight sensitivities",
+    "F = lagged NCRR12 triangulation in LAT relationships",
+    "G = selected-subgroup multiple-relationship robustness",
+    "",
+    "Weighting rules:",
+    "- ATT control weights are n_treated/n_control within risk sets.",
+    "- NO mean-fill/missing-indicator is used for prior psychological change.",
+    "- H1/H2/H3 structural opportunity is defined from module/interview scheduling,",
+    "  independently of actual item response; availability outside opportunity is fatal.",
+    "- IPHAW availability models use brglm2 mean bias-reduced logistic regression.",
+    "- D1c targets H1 opportunity; D2c targets H1+H2 opportunity; D3c targets H1+H2+H3 opportunity.",
+    "- Stage-specific ATT weights are defined in the corresponding opportunity target.",
+    "- Sequential D3 IPHAW is compared with direct joint-history IPHAW on the same D3 target.",
+    "- ATT x history-weight products are re-trimmed AFTER multiplication.",
+    "- Primary final-product trimming is 1/99 within treatment status.",
+    "- 2.5/97.5 final-product trimming is an additional sensitivity.",
+    "- If overall OR either arm ESS/N < .50, the IPHAW stage is report-only and",
+    "  cannot be used as affirmative robustness evidence; <.25 is severely unstable.",
+    "- <30 selected histories in either arm is additionally flagged as sparse support,",
+    "  but is a diagnostic flag rather than an automatic exclusion rule.",
+    "- Strict unambiguous-source ATT sensitivities reconstruct all lag histories after",
+    "  removing ambiguous active-cohabitation source rows; they do not replace D1b.",
+    "",
+    "C-to-D temporal interpretation:",
+    "- There is NO p<.05-any-of-B/C5/D mechanical gate.",
+    "- D_M D1b at 25-60m is the primary distal diagnostic because it shares the",
+    "  same estimand with D1b at 13-24m and 1-12m.",
+    "- B and C5 are contextual diagnostics.",
+    "- Distal divergence implies possible continuation/acceleration, not newly",
+    "  emerging near-marriage change; a near-zero distal estimate with informative",
+    "  CI plus increasing 13-24/1-12 estimates is more compatible with localization.",
+    "",
+    "Other rules:",
+    "- exact marriage dates (start_if=0) define primary marriage horizons;",
+    "- exact breakup dates (end_if=0, cohend=1, ongoing=0) define primary breakup horizons;",
+    "- reference = observed continued cohabitation for >=60 further months;",
+    "- psychological change uses approximately annual 6-18 month intervals;",
+    "- risk-set strata = wave x sex x 6m duration x 2y age;",
+    "- E attenuation percentages are descriptive, not causal mediated proportions;",
+    "- no result is labelled a causal anticipation or breakup effect."
+  ),
+  "00_READ_ME_FIRST.txt",
+  subdir = "."
+)
+
+cat(
+  "\nRevised UKHLS workflow completed.\n",
+  "Output directory:\n",
+  normalizePath(OUT_DIR, winslash = "/", mustWork = FALSE),
+  "\n"
+)
+
+# =============================================================================
+# END
+# =============================================================================

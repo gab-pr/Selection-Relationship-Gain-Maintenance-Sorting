@@ -1,0 +1,40 @@
+PSYCHOLOGICAL-SELECTION CODE REVISION
+=====================================
+
+This reproducibility package uses the final wave-adjusted stable-trait / WPVS
+psychological-selection workflow.
+
+REMOVED FROM THE REPRODUCTION WORKFLOW
+--------------------------------------
+03_current_unpartnered_LAT_selection.R.txt
+04_unpartnered_to_cohab_marriage_Cox.R.txt
+
+Those scripts estimated earlier selection specifications based on prior
+psychological means and current deviations from those means. They are not part
+of the current manuscript's final selection analysis and are not included in
+this package.
+
+CURRENT SELECTION WORKFLOW
+--------------------------
+1. 03_prepare_current_unpartnered_selection_base.R.txt
+   Creates the exact-wave clean-unpartnered landmark base only.
+
+2. 03B_prepare_unpartnered_episode_structure.R.txt
+   Creates non-overlapping clean-unpartnered episode IDs and follow-up
+   boundaries only.
+
+3. UKHLS_latent_stable_WPVS_final_measurement_stage_v2_1_WAVECENTERED_AGEFIX.R.txt
+   Estimates the wave-adjusted stable-trait / WPVS decomposition and creates
+   T=4 primary scores plus T=5/T=6 history-length sensitivities.
+
+4. UKHLS_H1_latent_stable_WPVS_selection_v1.R.txt
+   Fits the final H1 incident-LAT and cohabitation/marriage selection models
+   using stable_score_SD and current_wpvs_SD simultaneously.
+
+ANALYTIC PRINCIPLE
+------------------
+The latent measurement stage and H1 selection stage are kept unchanged from the
+validated final scripts supplied for the revised manuscript. The two preceding
+preparation scripts exist only to recreate intermediate objects required by
+those final scripts without running the obsolete prior-mean/deviation
+inferential analyses.

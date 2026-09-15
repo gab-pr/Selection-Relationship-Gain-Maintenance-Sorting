@@ -1,0 +1,3428 @@
+################################################################################
+# UKHLS LATENT STABLE-TRAIT / WPVS FINAL MEASUREMENT-STAGE WORKFLOW v2
+# ACTUAL-WAVE MEAN ADJUSTMENT
+#
+# PURPOSE
+# -------
+# Final measurement-stage workflow for the model-based stable-trait /
+# within-person variability score (WPVS) decomposition that will be used in
+# the revised H1 psychological-selection analyses.
+#
+# This version implements the final measurement-stage revision: before fitting
+# the stable-trait/WPVS model, each psychological score is centered on the
+# ACTUAL UKHLS SURVEY-WAVE mean estimated in the adult UKHLS panel. This removes
+# common secular/wave-level shifts before stable between-person and within-person
+# components are constructed.
+#
+# This script still DOES NOT estimate the final H1 relationship-transition
+# effects. It produces the final T=4 score lookup for that second-stage analysis,
+# with T=5 and T=6 retained as measurement-history sensitivities.
+#
+# CONCEPTUAL MODEL
+# ----------------
+# For one psychological outcome Y measured at T repeated occasions:
+#
+#   Y_it = mu_t + I_i + Y*_it
+#
+# where:
+#   I_i    = stable between-person factor
+#   Y*_it  = within-person variability score (WPVS)
+#
+# FINAL WAVE-ADJUSTED INPUT
+# -------------------------
+# The model is fitted to:
+#
+#   Yadj_it = Y_it - mean(Y_.t)
+#
+# where mean(Y_.t) is the unweighted adult-sample mean of the corresponding
+# psychological measure in the respondent's ACTUAL UKHLS survey wave. Thus the
+# latent decomposition is performed after removing common survey-wave shifts.
+# For GHQ, wave means are calculated after favorable orientation (-GHQ12).
+#
+# Stable and within-person latent components are constrained to be uncorrelated.
+# Correlation-preserving predicted scores need not themselves be empirically
+# orthogonal; their correlation is therefore reported descriptively but is NOT
+# used as a validity criterion.
+#
+# The measurement model follows the stable-trait / within-person structure used
+# in Usami's two-step approach. The correlation-preserving score calculations
+# below adapt the matrix formulas in the supplied supplementary R code.
+#
+# IMPORTANT PROSPECTIVE RESTRICTION
+# ---------------------------------
+# No observation after the focal clean-unpartnered baseline is ever used to
+# construct or score the person's stable/WPVS predictors.
+#
+# Primary specification:
+#   T = 4 occasions = current clean-unpartnered baseline + 3 preceding UKHLS
+#   waves, all with valid psychological measurements.
+#
+# Sensitivity specifications:
+#   T = 5 and T = 6.
+#
+# For the SEM measurement models, occasions are exact consecutive UKHLS waves.
+# This is intentionally stricter than the manuscript's rolling historical mean
+# and more closely matches the fixed-time-point structure assumed by the
+# stable-trait/WPVS model. The script ALSO reports the less restrictive number
+# of baselines with >=T valid measurements available anywhere up to baseline,
+# so the cost of the consecutive-wave requirement is transparent.
+#
+# GHQ DIRECTION
+# -------------
+# GHQ-12 is reverse-oriented internally:
+#
+#   ghq_favorable = -GHQ12
+#
+# so higher stable and WPVS scores uniformly mean more favorable psychological
+# functioning for both life satisfaction and GHQ.
+#
+# MEASUREMENT-MODEL ESTIMATION SAMPLE
+# -----------------------------------
+# To avoid treating overlapping baseline windows from the same respondent as
+# independent observations in Step 1, the SEM is estimated on the FIRST
+# eligible clean-unpartnered baseline per respondent for each outcome x T.
+#
+# Once population measurement-model parameters are estimated, scores are
+# generated for ALL eligible clean-unpartnered baselines. These score lookups
+# can later be merged into the existing incident-LAT and transition workflows.
+#
+# SCORE METHOD
+# ------------
+# The script calculates:
+#   1. a correlation-preserving stable-trait predictor;
+#   2. correlation-preserving WPVS for all T occasions;
+#   3. the current-baseline WPVS (the final occasion), which is the prospective
+#      state-dependent predictor of interest.
+#
+# Scores are also divided by a common raw current-score SD for interpretability.
+#
+# OUTPUT INTERPRETATION
+# ---------------------
+# The most important outputs are:
+#
+#   00_actual_wave_means.csv
+#   00b_wave_centering_audit.csv
+#   01_history_support_all_clean_baselines.csv
+#   02_endpoint_support_lat_cohab_marriage.csv
+#   03_measurement_model_fit.csv
+#   04_measurement_model_variance_and_identification_audit.csv
+#   05_score_diagnostics.csv
+#   06_old_vs_latent_component_correlations.csv
+#   07_temporal_spacing_diagnostics.csv
+#   08_feasibility_summary.csv
+#
+# and:
+#
+#   data/final_wave_adjusted_latent_score_lookup_T4.rds
+#   data/final_wave_adjusted_latent_score_lookup_T5.rds
+#   data/final_wave_adjusted_latent_score_lookup_T6.rds
+#
+# The T=4 score lookup is the primary measurement input for the later H1
+# re-analysis, conditional on the final diagnostics remaining admissible.
+#
+# REFERENCES / DESIGN BASIS
+# -------------------------
+# Usami's stable-trait / WPVS two-step framework and the user's supplied
+# supplementary R code. This script adapts ONLY the disaggregation/scoring step.
+# It does NOT implement DTRreg/SNMM causal estimation.
+################################################################################
+
+
+# ==============================================================================
+# 0. PACKAGES
+# ==============================================================================
+# NOTE: MASS is required but deliberately NOT attached with library(MASS),
+# because MASS::select masks dplyr::select. MASS::ginv is called explicitly.
+
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "tibble",
+  "readr",
+  "lavaan",
+  "MASS"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install required package(s) before running this script: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(lavaan)
+})
+
+options(dplyr.summarise.inform = FALSE)
+
+
+# ==============================================================================
+# 1. USER-EDITABLE PATHS AND OPTIONS
+# ==============================================================================
+
+UKHLS_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se/ukhls"
+)
+
+COMMON_STATA_DIR <- dirname(UKHLS_DIR)
+
+# Same upstream panel sources used by the current UKHLS Wave 3+ clean-
+# unpartnered selection workflow.
+PERSON_WAVE_RDS <- file.path(
+  COMMON_STATA_DIR,
+  "first_marriage_Tminus5_T0_diagnostic",
+  "combined_person_wave_panel.rds"
+)
+
+TIMING_RDS <- file.path(
+  COMMON_STATA_DIR,
+  "first_marriage_calendar_timing_diagnostic",
+  "combined_interview_timing_panel.rds"
+)
+
+CURRENT_SELECTION_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "psychological_selection_UKHLS_wave3plus_NCRR1_v3_current_unpartnered_primary"
+)
+
+FORMATION_BASE_RDS <- file.path(
+  CURRENT_SELECTION_DIR,
+  "NCRR1_v3_formation_analytic_base.rds"
+)
+
+# Existing incident-LAT identification workflow.
+INCIDENT_LAT_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "incident_LAT_psychological_trajectory_v1"
+)
+
+INCIDENT_LAT_EVENTS_RDS <- file.path(
+  INCIDENT_LAT_DIR,
+  "primary_incident_LAT_events.rds"
+)
+
+OUT_DIR <- "D:/Documenti/UKHLS_latent_stable_WPVS_final_measurement_stage_v2_wavecentered"
+
+TABLE_DIR <- file.path(OUT_DIR, "tables")
+DIAG_DIR  <- file.path(OUT_DIR, "diagnostics")
+MODEL_DIR <- file.path(OUT_DIR, "models")
+DATA_DIR  <- file.path(OUT_DIR, "data")
+
+for (d in c(OUT_DIR, TABLE_DIR, DIAG_DIR, MODEL_DIR, DATA_DIR)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# UKHLS waves available in the current clean-unpartnered selection workflow.
+UKHLS_WAVES <- 3L:15L
+
+# Adult age range used by the current clean-unpartnered selection workflow.
+# These constants are required for estimating and auditing the survey-wave means.
+MIN_AGE <- 18L
+MAX_AGE <- 100L
+
+# Number of total occasions INCLUDING the current clean-unpartnered baseline.
+T_VALUES <- c(4L, 5L, 6L)
+
+# Candidate primary decomposition.
+PRIMARY_T <- 4L
+
+# Tolerance for positive-semidefinite matrix checks.
+PSD_TOL <- 1e-7
+
+# Minimum SEM estimation sample size is NOT used to force a substantive
+# decision. It is only used to flag very small measurement-model samples.
+DESCRIPTIVE_SMALL_SEM_N <- 300L
+
+# Save complete consecutive-wave history windows? They can be useful for audit,
+# but they are larger files.
+SAVE_HISTORY_WINDOWS <- TRUE
+
+# Preliminary transition models are deliberately OFF in this feasibility script.
+# Once the measurement/score results are inspected, use a dedicated second-stage
+# script to rerun H1.
+RUN_PRELIMINARY_TRANSITION_MODELS <- FALSE
+
+
+# ==============================================================================
+# 2. BASIC HELPERS
+# ==============================================================================
+
+normalize_pidp_key <- function(x) {
+
+  z <- x
+
+  if (
+    inherits(z, "haven_labelled") ||
+      inherits(z, "labelled") ||
+      inherits(z, "haven_labelled_spss")
+  ) {
+    z <- unclass(z)
+  }
+
+  if (is.factor(z)) {
+    z <- as.character(z)
+  }
+
+  if (is.numeric(z) || is.integer(z)) {
+    out <- ifelse(
+      is.na(z),
+      NA_character_,
+      format(
+        z,
+        scientific = FALSE,
+        trim = TRUE,
+        digits = 22
+      )
+    )
+    out <- sub("\\.0+$", "", out)
+    return(out)
+  }
+
+  out <- trimws(as.character(z))
+  out[out %in% c("", "NA", "NaN")] <- NA_character_
+  sub("\\.0+$", "", out)
+}
+
+
+stata_month_from_year_month <- function(year, month_num) {
+
+  y <- suppressWarnings(as.integer(year))
+  m <- suppressWarnings(as.integer(month_num))
+
+  ifelse(
+    is.na(y) | is.na(m) | m < 1L | m > 12L,
+    NA_integer_,
+    as.integer((y - 1960L) * 12L + (m - 1L))
+  )
+}
+
+
+write_csv_quiet <- function(x, filename, subdir = "tables") {
+
+  target_dir <- switch(
+    subdir,
+    tables = TABLE_DIR,
+    diagnostics = DIAG_DIR,
+    TABLE_DIR
+  )
+
+  path <- file.path(target_dir, filename)
+
+  readr::write_csv(
+    x,
+    path,
+    na = "",
+    progress = FALSE
+  )
+
+  invisible(path)
+}
+
+
+safe_sd <- function(x) {
+
+  z <- suppressWarnings(as.numeric(x))
+  s <- stats::sd(z, na.rm = TRUE)
+
+  if (!is.finite(s) || s <= 0) {
+    NA_real_
+  } else {
+    s
+  }
+}
+
+
+safe_cor <- function(x, y) {
+
+  ok <- is.finite(x) & is.finite(y)
+
+  if (sum(ok) < 3L) {
+    return(NA_real_)
+  }
+
+  stats::cor(
+    x[ok],
+    y[ok]
+  )
+}
+
+
+safe_fit_measure <- function(fit, measure) {
+
+  out <- tryCatch(
+    lavaan::fitMeasures(fit, measure),
+    error = function(e) NA_real_
+  )
+
+  if (
+    length(out) == 0L ||
+      !is.finite(out[[1L]])
+  ) {
+    NA_real_
+  } else {
+    unname(out[[1L]])
+  }
+}
+
+
+safe_lavinspect <- function(fit, what, default = NA) {
+
+  tryCatch(
+    lavaan::lavInspect(fit, what),
+    error = function(e) default
+  )
+}
+
+
+# ==============================================================================
+# 3. MATRIX HELPERS FOR CORRELATION-PRESERVING SCORES
+# ==============================================================================
+
+symmetrize <- function(M) {
+  (M + t(M)) / 2
+}
+
+
+matrix_psd_audit <- function(M, tol = PSD_TOL) {
+
+  M <- symmetrize(M)
+
+  ee <- tryCatch(
+    eigen(M, symmetric = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(ee)) {
+    return(
+      list(
+        ok = FALSE,
+        min_eigen = NA_real_,
+        max_eigen = NA_real_,
+        eigenvalues = NA_real_
+      )
+    )
+  }
+
+  vals <- ee$values
+
+  list(
+    ok = min(vals) >= -tol,
+    min_eigen = min(vals),
+    max_eigen = max(vals),
+    eigenvalues = vals
+  )
+}
+
+
+matrix_sqrt_psd <- function(M, tol = PSD_TOL) {
+
+  M <- symmetrize(M)
+
+  ee <- eigen(
+    M,
+    symmetric = TRUE
+  )
+
+  vals <- ee$values
+
+  if (min(vals) < -tol) {
+    stop(
+      "Matrix is not positive semidefinite. Minimum eigenvalue = ",
+      format(min(vals), scientific = TRUE)
+    )
+  }
+
+  vals[vals < 0] <- 0
+
+  ee$vectors %*%
+    diag(
+      sqrt(vals),
+      nrow = length(vals)
+    ) %*%
+    t(ee$vectors)
+}
+
+
+safe_ginv <- function(M) {
+  MASS::ginv(M)
+}
+
+
+# ==============================================================================
+# 4. REQUIRED INPUT CHECK
+# ==============================================================================
+
+required_files <- c(
+  PERSON_WAVE_RDS,
+  TIMING_RDS,
+  FORMATION_BASE_RDS,
+  INCIDENT_LAT_EVENTS_RDS
+)
+
+missing_files <- required_files[
+  !file.exists(required_files)
+]
+
+if (length(missing_files) > 0L) {
+  stop(
+    "Required input file(s) not found:\n  - ",
+    paste(missing_files, collapse = "\n  - "),
+    "\n\nCheck the paths in Section 1."
+  )
+}
+
+
+# ==============================================================================
+# 5. LOAD AND HARMONIZE THE UKHLS WAVE PANEL
+# ==============================================================================
+
+panel_raw <- readRDS(PERSON_WAVE_RDS)
+timing_raw <- readRDS(TIMING_RDS)
+formation_base <- readRDS(FORMATION_BASE_RDS)
+incident_lat <- readRDS(INCIDENT_LAT_EVENTS_RDS)
+
+
+required_panel <- c(
+  "pidp",
+  "survey",
+  "wave_num",
+  "ghq12",
+  "life_sat",
+  "age"
+)
+
+required_timing <- c(
+  "pidp",
+  "survey",
+  "wave_num",
+  "interview_year",
+  "interview_month"
+)
+
+required_formation <- c(
+  "pidp_key",
+  "wave_num"
+)
+
+required_incident <- c(
+  "treated_pidp",
+  "baseline_wave"
+)
+
+miss_panel <- setdiff(
+  required_panel,
+  names(panel_raw)
+)
+
+miss_timing <- setdiff(
+  required_timing,
+  names(timing_raw)
+)
+
+miss_formation <- setdiff(
+  required_formation,
+  names(formation_base)
+)
+
+miss_incident <- setdiff(
+  required_incident,
+  names(incident_lat)
+)
+
+if (length(miss_panel) > 0L) {
+  stop(
+    "Person-wave RDS missing: ",
+    paste(miss_panel, collapse = ", ")
+  )
+}
+
+if (length(miss_timing) > 0L) {
+  stop(
+    "Timing RDS missing: ",
+    paste(miss_timing, collapse = ", ")
+  )
+}
+
+if (length(miss_formation) > 0L) {
+  stop(
+    "Formation analytic base missing: ",
+    paste(miss_formation, collapse = ", ")
+  )
+}
+
+if (length(miss_incident) > 0L) {
+  stop(
+    "Incident-LAT event object missing: ",
+    paste(miss_incident, collapse = ", ")
+  )
+}
+
+
+panel <- panel_raw %>%
+  transmute(
+    pidp_key = normalize_pidp_key(pidp),
+    survey = as.character(survey),
+    wave_num = suppressWarnings(as.integer(wave_num)),
+    ghq12 = suppressWarnings(as.numeric(ghq12)),
+    life_sat = suppressWarnings(as.numeric(life_sat)),
+    age = suppressWarnings(as.numeric(age))
+  ) %>%
+  filter(
+    survey == "UKHLS",
+    wave_num %in% UKHLS_WAVES,
+    !is.na(pidp_key)
+  )
+
+
+timing <- timing_raw %>%
+  transmute(
+    pidp_key = normalize_pidp_key(pidp),
+    survey = as.character(survey),
+    wave_num = suppressWarnings(as.integer(wave_num)),
+    interview_year = suppressWarnings(as.integer(interview_year)),
+    interview_month = suppressWarnings(as.integer(interview_month))
+  ) %>%
+  filter(
+    survey == "UKHLS",
+    wave_num %in% UKHLS_WAVES,
+    !is.na(pidp_key)
+  )
+
+
+if (anyDuplicated(panel[c("pidp_key", "wave_num")]) > 0L) {
+  stop(
+    "UKHLS person-wave panel is not unique by pidp_key x wave_num."
+  )
+}
+
+if (anyDuplicated(timing[c("pidp_key", "wave_num")]) > 0L) {
+  stop(
+    "UKHLS timing panel is not unique by pidp_key x wave_num."
+  )
+}
+
+
+panel <- panel %>%
+  left_join(
+    timing %>%
+      dplyr::select(
+        -survey
+      ),
+    by = c(
+      "pidp_key",
+      "wave_num"
+    ),
+    relationship = "one-to-one"
+  ) %>%
+  mutate(
+    interview_month_index =
+      stata_month_from_year_month(
+        interview_year,
+        interview_month
+      ),
+
+    # Positive = more favorable psychological functioning.
+    ghq_favorable = if_else(
+      is.finite(ghq12),
+      -ghq12,
+      NA_real_
+    )
+  ) %>%
+  arrange(
+    pidp_key,
+    wave_num
+  ) %>%
+  group_by(
+    pidp_key
+  ) %>%
+  mutate(
+    ls_valid_cumulative =
+      cumsum(
+        !is.na(life_sat)
+      ),
+    ghq_valid_cumulative =
+      cumsum(
+        !is.na(ghq_favorable)
+      )
+  ) %>%
+  ungroup()
+
+
+# ==============================================================================
+# 5A. FINAL REVISION: REMOVE ACTUAL UKHLS SURVEY-WAVE MEANS
+# ==============================================================================
+#
+# The nuisance time mean is estimated in the adult UKHLS analysis panel, not in
+# the clean-unpartnered risk set. This avoids defining the centering constant
+# from the selected population whose relationship transitions are later modeled.
+#
+# Means are unweighted because their role here is measurement-model centering,
+# not population prevalence estimation. The final H1 transition models should
+# still retain their interview-year fixed effects.
+# ==============================================================================
+
+wave_means <- panel %>%
+  filter(
+    is.finite(age),
+    age >= MIN_AGE,
+    age <= MAX_AGE
+  ) %>%
+  group_by(wave_num) %>%
+  summarise(
+    n_ls_wave_mean = sum(is.finite(life_sat)),
+    ls_wave_mean = if_else(
+      n_ls_wave_mean > 0L,
+      mean(life_sat, na.rm = TRUE),
+      NA_real_
+    ),
+    n_ghq_wave_mean = sum(is.finite(ghq_favorable)),
+    ghq_favorable_wave_mean = if_else(
+      n_ghq_wave_mean > 0L,
+      mean(ghq_favorable, na.rm = TRUE),
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+if (
+  any(!is.finite(wave_means$ls_wave_mean)) ||
+    any(!is.finite(wave_means$ghq_favorable_wave_mean))
+) {
+  stop(
+    "At least one UKHLS wave has a non-finite psychological wave mean. ",
+    "Inspect wave_means before proceeding."
+  )
+}
+
+write_csv_quiet(
+  wave_means,
+  "00_actual_wave_means.csv"
+)
+
+panel <- panel %>%
+  left_join(
+    wave_means,
+    by = "wave_num",
+    relationship = "many-to-one"
+  ) %>%
+  mutate(
+    life_sat_wave_adjusted = if_else(
+      is.finite(life_sat),
+      life_sat - ls_wave_mean,
+      NA_real_
+    ),
+    ghq_favorable_wave_adjusted = if_else(
+      is.finite(ghq_favorable),
+      ghq_favorable - ghq_favorable_wave_mean,
+      NA_real_
+    )
+  )
+
+wave_centering_audit <- panel %>%
+  filter(
+    is.finite(age),
+    age >= MIN_AGE,
+    age <= MAX_AGE
+  ) %>%
+  group_by(wave_num) %>%
+  summarise(
+    n_ls = sum(is.finite(life_sat_wave_adjusted)),
+    mean_ls_wave_adjusted = mean(
+      life_sat_wave_adjusted,
+      na.rm = TRUE
+    ),
+    n_ghq = sum(is.finite(ghq_favorable_wave_adjusted)),
+    mean_ghq_favorable_wave_adjusted = mean(
+      ghq_favorable_wave_adjusted,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ls_abs_centering_error = abs(mean_ls_wave_adjusted),
+    ghq_abs_centering_error = abs(mean_ghq_favorable_wave_adjusted)
+  )
+
+write_csv_quiet(
+  wave_centering_audit,
+  "00b_wave_centering_audit.csv"
+)
+
+if (
+  max(wave_centering_audit$ls_abs_centering_error, na.rm = TRUE) > 1e-10 ||
+    max(wave_centering_audit$ghq_abs_centering_error, na.rm = TRUE) > 1e-10
+) {
+  warning(
+    "Wave-centering residual means exceed numerical tolerance; inspect ",
+    "00b_wave_centering_audit.csv."
+  )
+}
+
+
+formation_base <- formation_base %>%
+  mutate(
+    pidp_key = normalize_pidp_key(pidp_key),
+    wave_num = suppressWarnings(as.integer(wave_num)),
+    baseline_id = paste(
+      pidp_key,
+      wave_num,
+      sep = "__wave__"
+    )
+  )
+
+
+if (anyDuplicated(
+  formation_base[c("pidp_key", "wave_num")]
+) > 0L) {
+  stop(
+    "Formation analytic base is not unique by pidp_key x wave_num."
+  )
+}
+
+
+incident_lat <- incident_lat %>%
+  mutate(
+    treated_pidp = normalize_pidp_key(treated_pidp),
+    baseline_wave = suppressWarnings(as.integer(baseline_wave)),
+    baseline_id = paste(
+      treated_pidp,
+      baseline_wave,
+      sep = "__wave__"
+    )
+  )
+
+
+# ==============================================================================
+# 6. INPUT / ALIGNMENT AUDIT
+# ==============================================================================
+
+baseline_panel_match <- formation_base %>%
+  dplyr::select(
+    baseline_id,
+    pidp_key,
+    wave_num
+  ) %>%
+  left_join(
+    panel %>%
+      transmute(
+        pidp_key,
+        wave_num,
+        panel_row_present = TRUE,
+        panel_ls = life_sat,
+        panel_ghq_favorable = ghq_favorable,
+        panel_interview_month_index =
+          interview_month_index
+      ),
+    by = c(
+      "pidp_key",
+      "wave_num"
+    ),
+    relationship = "many-to-one"
+  )
+
+
+incident_alignment <- incident_lat %>%
+  distinct(
+    baseline_id,
+    treated_pidp,
+    baseline_wave
+  ) %>%
+  left_join(
+    formation_base %>%
+      transmute(
+        baseline_id,
+        in_formation_base = TRUE
+      ),
+    by = "baseline_id"
+  )
+
+
+incident_lat_unmatched_baselines <- incident_alignment %>%
+  filter(is.na(in_formation_base))
+
+write_csv_quiet(
+  incident_lat_unmatched_baselines,
+  "00c_incident_LAT_unmatched_clean_baselines.csv",
+  "diagnostics"
+)
+
+
+input_audit <- tibble(
+  diagnostic = c(
+    "UKHLS Wave 3-15 person-wave rows",
+    "UKHLS Wave 3-15 unique people",
+    "Clean-unpartnered formation-base landmarks",
+    "Clean-unpartnered formation-base people",
+    "Formation baselines found in panel",
+    "Formation baselines not found in panel",
+    "Incident LAT treated events",
+    "Incident LAT treated baselines found in formation base",
+    "Incident LAT treated baselines not found in formation base"
+  ),
+  value = c(
+    nrow(panel),
+    n_distinct(panel$pidp_key),
+    nrow(formation_base),
+    n_distinct(formation_base$pidp_key),
+    sum(
+      baseline_panel_match$panel_row_present %in% TRUE,
+      na.rm = TRUE
+    ),
+    sum(
+      is.na(baseline_panel_match$panel_row_present)
+    ),
+    nrow(incident_lat),
+    sum(
+      incident_alignment$in_formation_base %in% TRUE,
+      na.rm = TRUE
+    ),
+    sum(
+      is.na(incident_alignment$in_formation_base)
+    )
+  )
+)
+
+write_csv_quiet(
+  input_audit,
+  "00_input_and_alignment_audit.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 7. ALL-AVAILABLE PRIOR-HISTORY SUPPORT
+# ==============================================================================
+#
+# This section asks:
+#
+#   At each clean-unpartnered baseline, how many valid measurements exist at
+#   any UKHLS wave up to and including the baseline?
+#
+# These counts do NOT require consecutive waves and provide an upper bound on
+# the support available if a later model accommodates irregular/missing timing.
+# ==============================================================================
+
+history_counts <- formation_base %>%
+  dplyr::select(
+    baseline_id,
+    pidp_key,
+    wave_num
+  ) %>%
+  left_join(
+    panel %>%
+      dplyr::select(
+        pidp_key,
+        wave_num,
+        life_sat,
+        ghq_favorable,
+        ls_valid_cumulative,
+        ghq_valid_cumulative
+      ),
+    by = c(
+      "pidp_key",
+      "wave_num"
+    ),
+    relationship = "many-to-one"
+  ) %>%
+  mutate(
+    ls_total_valid_up_to_baseline =
+      if_else(
+        !is.na(life_sat),
+        ls_valid_cumulative,
+        ls_valid_cumulative
+      ),
+    ghq_total_valid_up_to_baseline =
+      if_else(
+        !is.na(ghq_favorable),
+        ghq_valid_cumulative,
+        ghq_valid_cumulative
+      )
+  )
+
+
+history_support <- purrr::map_dfr(
+  T_VALUES,
+  function(T_now) {
+
+    bind_rows(
+      tibble(
+        measure = "Life satisfaction",
+        T = T_now,
+        requirement =
+          paste0(
+            ">=",
+            T_now,
+            " valid measurements anywhere up to current baseline"
+          ),
+        n_clean_baselines =
+          nrow(history_counts),
+        n_eligible =
+          sum(
+            history_counts$ls_total_valid_up_to_baseline >= T_now &
+              !is.na(history_counts$life_sat),
+            na.rm = TRUE
+          )
+      ),
+
+      tibble(
+        measure = "Psychological distress",
+        T = T_now,
+        requirement =
+          paste0(
+            ">=",
+            T_now,
+            " valid measurements anywhere up to current baseline"
+          ),
+        n_clean_baselines =
+          nrow(history_counts),
+        n_eligible =
+          sum(
+            history_counts$ghq_total_valid_up_to_baseline >= T_now &
+              !is.na(history_counts$ghq_favorable),
+            na.rm = TRUE
+          )
+      )
+    )
+  }
+) %>%
+  mutate(
+    percent_eligible =
+      100 * n_eligible / n_clean_baselines
+  )
+
+write_csv_quiet(
+  history_support,
+  "01_history_support_all_clean_baselines.csv"
+)
+
+
+# ==============================================================================
+# 8. BUILD STRICTLY PROSPECTIVE CONSECUTIVE-WAVE WINDOWS
+# ==============================================================================
+
+build_history_window <- function(
+    baselines,
+    panel_data,
+    measure_var,
+    measure_label,
+    T_now
+) {
+
+  stopifnot(
+    T_now >= 2L
+  )
+
+  out <- baselines %>%
+    dplyr::select(
+      baseline_id,
+      pidp_key,
+      baseline_wave = wave_num,
+      everything()
+    )
+
+  lookup_base <- panel_data %>%
+    dplyr::select(
+      pidp_key,
+      wave_num,
+      interview_month_index,
+      all_of(measure_var)
+    )
+
+  # y1 = oldest included wave
+  # yT = current clean-unpartnered baseline
+  for (lag_now in 0:(T_now - 1L)) {
+
+    pos <- T_now - lag_now
+
+    lookup_now <- lookup_base %>%
+      transmute(
+        pidp_key,
+        join_wave = wave_num,
+        !!paste0("y", pos) :=
+          .data[[measure_var]],
+        !!paste0("m", pos) :=
+          interview_month_index
+      )
+
+    out <- out %>%
+      mutate(
+        join_wave =
+          baseline_wave - lag_now
+      ) %>%
+      left_join(
+        lookup_now,
+        by = c(
+          "pidp_key",
+          "join_wave"
+        ),
+        relationship = "many-to-one"
+      ) %>%
+      dplyr::select(
+        -join_wave
+      )
+  }
+
+  y_names <- paste0(
+    "y",
+    seq_len(T_now)
+  )
+
+  m_names <- paste0(
+    "m",
+    seq_len(T_now)
+  )
+
+  Y <- as.matrix(
+    out[
+      ,
+      y_names,
+      drop = FALSE
+    ]
+  )
+
+  M <- as.matrix(
+    out[
+      ,
+      m_names,
+      drop = FALSE
+    ]
+  )
+
+  complete_measure <-
+    rowSums(
+      is.finite(Y)
+    ) == T_now
+
+  complete_months <-
+    rowSums(
+      is.finite(M)
+    ) == T_now
+
+  all_complete <-
+    complete_measure &
+    complete_months
+
+  temporal_span <- rep(
+    NA_real_,
+    nrow(out)
+  )
+
+  min_gap <- rep(
+    NA_real_,
+    nrow(out)
+  )
+
+  max_gap <- rep(
+    NA_real_,
+    nrow(out)
+  )
+
+  if (any(all_complete)) {
+
+    idx <- which(
+      all_complete
+    )
+
+    temporal_span[idx] <-
+      M[
+        idx,
+        T_now
+      ] -
+      M[
+        idx,
+        1L
+      ]
+
+    gap_mat <- t(
+      apply(
+        M[
+          idx,
+          ,
+          drop = FALSE
+        ],
+        1L,
+        diff
+      )
+    )
+
+    if (T_now == 2L) {
+      gap_mat <- matrix(
+        gap_mat,
+        ncol = 1L
+      )
+    }
+
+    min_gap[idx] <-
+      apply(
+        gap_mat,
+        1L,
+        min
+      )
+
+    max_gap[idx] <-
+      apply(
+        gap_mat,
+        1L,
+        max
+      )
+  }
+
+  out %>%
+    mutate(
+      measure = measure_label,
+      T = T_now,
+      exact_consecutive_complete =
+        all_complete,
+      total_span_months =
+        temporal_span,
+      min_adjacent_gap_months =
+        min_gap,
+      max_adjacent_gap_months =
+        max_gap
+    )
+}
+
+
+MEASURE_SPECS <- tibble::tribble(
+  ~measure,                 ~panel_var,                      ~raw_var,        ~wave_mean_var,
+  "Life satisfaction",      "life_sat_wave_adjusted",       "life_sat",      "ls_wave_mean",
+  "Psychological distress", "ghq_favorable_wave_adjusted",  "ghq_favorable", "ghq_favorable_wave_mean"
+)
+
+
+history_windows <- list()
+window_index <- list()
+widx <- 0L
+
+
+for (i in seq_len(
+  nrow(MEASURE_SPECS)
+)) {
+
+  for (T_now in T_VALUES) {
+
+    widx <- widx + 1L
+
+    spec <- MEASURE_SPECS[
+      i,
+    ]
+
+    w <- build_history_window(
+      baselines = formation_base,
+      panel_data = panel,
+      measure_var =
+        spec$panel_var[[1L]],
+      measure_label =
+        spec$measure[[1L]],
+      T_now = T_now
+    )
+
+    history_windows[[paste(
+      spec$measure[[1L]],
+      T_now,
+      sep = "__T"
+    )]] <- w
+
+    window_index[[widx]] <-
+      w %>%
+      transmute(
+        baseline_id,
+        pidp_key,
+        baseline_wave,
+        measure,
+        T,
+        exact_consecutive_complete,
+        total_span_months,
+        min_adjacent_gap_months,
+        max_adjacent_gap_months
+      )
+  }
+}
+
+
+window_index <- bind_rows(
+  window_index
+)
+
+
+# ==============================================================================
+# 9. CONSECUTIVE-WAVE SUPPORT AND TEMPORAL-SPACING DIAGNOSTICS
+# ==============================================================================
+
+consecutive_support <- window_index %>%
+  group_by(
+    measure,
+    T
+  ) %>%
+  summarise(
+    n_clean_baselines =
+      n(),
+    n_exact_consecutive_complete =
+      sum(
+        exact_consecutive_complete,
+        na.rm = TRUE
+      ),
+    percent_exact_consecutive_complete =
+      100 *
+      n_exact_consecutive_complete /
+      n_clean_baselines,
+    .groups = "drop"
+  )
+
+
+history_support_combined <- history_support %>%
+  dplyr::select(
+    measure,
+    T,
+    n_clean_baselines,
+    n_available_anywhere = n_eligible,
+    percent_available_anywhere =
+      percent_eligible
+  ) %>%
+  left_join(
+    consecutive_support,
+    by = c(
+      "measure",
+      "T",
+      "n_clean_baselines"
+    )
+  )
+
+
+write_csv_quiet(
+  history_support_combined,
+  "01_history_support_all_clean_baselines.csv"
+)
+
+
+spacing_diagnostics <- window_index %>%
+  filter(
+    exact_consecutive_complete
+  ) %>%
+  group_by(
+    measure,
+    T
+  ) %>%
+  summarise(
+    n =
+      n(),
+    total_span_median_months =
+      median(
+        total_span_months,
+        na.rm = TRUE
+      ),
+    total_span_p10_months =
+      quantile(
+        total_span_months,
+        0.10,
+        na.rm = TRUE
+      ),
+    total_span_p90_months =
+      quantile(
+        total_span_months,
+        0.90,
+        na.rm = TRUE
+      ),
+    adjacent_gap_median_of_max_months =
+      median(
+        max_adjacent_gap_months,
+        na.rm = TRUE
+      ),
+    adjacent_gap_p90_of_max_months =
+      quantile(
+        max_adjacent_gap_months,
+        0.90,
+        na.rm = TRUE
+      ),
+    percent_any_gap_gt_18m =
+      100 *
+      mean(
+        max_adjacent_gap_months > 18,
+        na.rm = TRUE
+      ),
+    percent_any_gap_gt_24m =
+      100 *
+      mean(
+        max_adjacent_gap_months > 24,
+        na.rm = TRUE
+      ),
+    .groups = "drop"
+  )
+
+
+write_csv_quiet(
+  spacing_diagnostics,
+  "07_temporal_spacing_diagnostics.csv"
+)
+
+
+# ==============================================================================
+# 10. ENDPOINT-SPECIFIC SUPPORT: INCIDENT LAT, COHABITATION, MARRIAGE
+# ==============================================================================
+
+endpoint_support_rows <- list()
+eidx <- 0L
+
+
+for (measure_now in unique(
+  window_index$measure
+)) {
+
+  for (T_now in T_VALUES) {
+
+    elig <- window_index %>%
+      filter(
+        measure == measure_now,
+        T == T_now
+      ) %>%
+      dplyr::select(
+        baseline_id,
+        exact_consecutive_complete
+      )
+
+    # --------------------------------------------------------------------------
+    # Incident LAT treated events
+    # --------------------------------------------------------------------------
+
+    lat_dat <- incident_lat %>%
+      distinct(
+        baseline_id,
+        treated_pidp,
+        baseline_wave
+      ) %>%
+      left_join(
+        elig,
+        by = "baseline_id"
+      )
+
+    eidx <- eidx + 1L
+
+    endpoint_support_rows[[eidx]] <-
+      tibble(
+        endpoint =
+          "Incident LAT formation: treated events",
+        measure =
+          measure_now,
+        T =
+          T_now,
+        denominator =
+          nrow(lat_dat),
+        eligible =
+          sum(
+            lat_dat$exact_consecutive_complete %in% TRUE,
+            na.rm = TRUE
+          ),
+        percent_eligible =
+          100 *
+          eligible /
+          denominator
+      )
+
+    # --------------------------------------------------------------------------
+    # Cohabitation/formal-union within 12 months
+    # --------------------------------------------------------------------------
+
+    cohab_vars <- c(
+      "ascertain_coresident_union_12m",
+      "coresident_union_12m"
+    )
+
+    if (all(
+      cohab_vars %in%
+        names(formation_base)
+    )) {
+
+      cohab_dat <-
+        formation_base %>%
+        filter(
+          .data[["ascertain_coresident_union_12m"]] %in% TRUE,
+          .data[["coresident_union_12m"]] == 1L
+        ) %>%
+        dplyr::select(
+          baseline_id
+        ) %>%
+        left_join(
+          elig,
+          by = "baseline_id"
+        )
+
+      eidx <- eidx + 1L
+
+      endpoint_support_rows[[eidx]] <-
+        tibble(
+          endpoint =
+            "Cohabitation/formal union within 12m: events",
+          measure =
+            measure_now,
+          T =
+            T_now,
+          denominator =
+            nrow(cohab_dat),
+          eligible =
+            sum(
+              cohab_dat$exact_consecutive_complete %in% TRUE,
+              na.rm = TRUE
+            ),
+          percent_eligible =
+            100 *
+            eligible /
+            denominator
+        )
+    }
+
+    # --------------------------------------------------------------------------
+    # Marriage within 36 months
+    # --------------------------------------------------------------------------
+
+    marriage_vars <- c(
+      "ascertain_marriage_36m",
+      "marriage_36m"
+    )
+
+    if (all(
+      marriage_vars %in%
+        names(formation_base)
+    )) {
+
+      marriage_dat <-
+        formation_base %>%
+        filter(
+          .data[["ascertain_marriage_36m"]] %in% TRUE,
+          .data[["marriage_36m"]] == 1L
+        ) %>%
+        dplyr::select(
+          baseline_id
+        ) %>%
+        left_join(
+          elig,
+          by = "baseline_id"
+        )
+
+      eidx <- eidx + 1L
+
+      endpoint_support_rows[[eidx]] <-
+        tibble(
+          endpoint =
+            "Marriage within 36m: events",
+          measure =
+            measure_now,
+          T =
+            T_now,
+          denominator =
+            nrow(marriage_dat),
+          eligible =
+            sum(
+              marriage_dat$exact_consecutive_complete %in% TRUE,
+              na.rm = TRUE
+            ),
+          percent_eligible =
+            100 *
+            eligible /
+            denominator
+        )
+    }
+  }
+}
+
+
+endpoint_support <- bind_rows(
+  endpoint_support_rows
+)
+
+
+write_csv_quiet(
+  endpoint_support,
+  "02_endpoint_support_lat_cohab_marriage.csv"
+)
+
+
+# ==============================================================================
+# 11. STABLE-TRAIT / WITHIN-PERSON SEM SYNTAX
+# ==============================================================================
+
+make_stable_wpvs_model <- function(T_now) {
+
+  y <- paste0(
+    "y",
+    seq_len(T_now)
+  )
+
+  w <- paste0(
+    "w",
+    seq_len(T_now)
+  )
+
+  lines <- character(0)
+
+  # Stable trait with unit loadings.
+  lines <- c(
+    lines,
+    paste0(
+      "Trait =~ ",
+      paste(
+        paste0(
+          "1*",
+          y
+        ),
+        collapse = " + "
+      )
+    )
+  )
+
+  # Single-indicator within-person latent variables.
+  for (j in seq_len(T_now)) {
+    lines <- c(
+      lines,
+      paste0(
+        w[j],
+        " =~ 1*",
+        y[j]
+      )
+    )
+  }
+
+  # Observed residual variances fixed at zero: exact decomposition.
+  for (j in seq_len(T_now)) {
+    lines <- c(
+      lines,
+      paste0(
+        y[j],
+        " ~~ 0*",
+        y[j]
+      )
+    )
+  }
+
+  # Stable factor orthogonal to all WPVS factors.
+  for (j in seq_len(T_now)) {
+    lines <- c(
+      lines,
+      paste0(
+        "Trait ~~ 0*",
+        w[j]
+      )
+    )
+  }
+
+  # Stable-trait variance.
+  lines <- c(
+    lines,
+    "Trait ~~ trait_var*Trait"
+  )
+
+  # First within-person variance.
+  lines <- c(
+    lines,
+    "w1 ~~ wpvs_var_1*w1"
+  )
+
+  # First-order within-person dynamics.
+  #
+  # Betas and innovation variances are allowed to differ by lag. This is less
+  # restrictive than forcing stationarity and gives a direct feasibility check.
+  if (T_now >= 2L) {
+    for (j in 2:T_now) {
+
+      lines <- c(
+        lines,
+        paste0(
+          "w",
+          j,
+          " ~ beta_",
+          j,
+          "*w",
+          j - 1L
+        )
+      )
+
+      lines <- c(
+        lines,
+        paste0(
+          "w",
+          j,
+          " ~~ wpvs_innov_var_",
+          j,
+          "*w",
+          j
+        )
+      )
+    }
+  }
+
+  # Stable and within-person latent means fixed at zero.
+  lines <- c(
+    lines,
+    "Trait ~ 0*1"
+  )
+
+  for (j in seq_len(T_now)) {
+    lines <- c(
+      lines,
+      paste0(
+        w[j],
+        " ~ 0*1"
+      )
+    )
+  }
+
+  # Observed occasion-specific means are freely estimated.
+  for (j in seq_len(T_now)) {
+    lines <- c(
+      lines,
+      paste0(
+        y[j],
+        " ~ mu_",
+        j,
+        "*1"
+      )
+    )
+  }
+
+  paste(
+    lines,
+    collapse = "\n"
+  )
+}
+
+
+# ==============================================================================
+# 12. FIT ONE MEASUREMENT MODEL
+# ==============================================================================
+
+fit_one_measurement_model <- function(
+    window_data,
+    measure_label,
+    T_now
+) {
+
+  y_names <- paste0(
+    "y",
+    seq_len(T_now)
+  )
+
+  complete_data <- window_data %>%
+    filter(
+      exact_consecutive_complete
+    ) %>%
+    arrange(
+      pidp_key,
+      baseline_wave
+    )
+
+  # Avoid pseudo-replication from overlapping windows in Step 1 parameter
+  # estimation: use first eligible baseline per person.
+  fit_data <- complete_data %>%
+    group_by(
+      pidp_key
+    ) %>%
+    slice_head(
+      n = 1L
+    ) %>%
+    ungroup()
+
+  if (nrow(fit_data) < 50L) {
+
+    return(
+      list(
+        fit = NULL,
+        complete_data = complete_data,
+        fit_data = fit_data,
+        error = paste0(
+          "Too few independent respondent windows for SEM: N=",
+          nrow(fit_data)
+        ),
+        syntax = make_stable_wpvs_model(T_now)
+      )
+    )
+  }
+
+  model_syntax <-
+    make_stable_wpvs_model(
+      T_now
+    )
+
+  fit <- tryCatch(
+    lavaan::sem(
+      model = model_syntax,
+      data = fit_data %>%
+        dplyr::select(
+          all_of(
+            y_names
+          )
+        ),
+      estimator = "MLR",
+      meanstructure = TRUE,
+      fixed.x = FALSE,
+      std.lv = FALSE,
+      missing = "listwise"
+    ),
+    error = function(e) e
+  )
+
+  if (inherits(
+    fit,
+    "error"
+  )) {
+
+    return(
+      list(
+        fit = NULL,
+        complete_data = complete_data,
+        fit_data = fit_data,
+        error = conditionMessage(fit),
+        syntax = model_syntax
+      )
+    )
+  }
+
+  list(
+    fit = fit,
+    complete_data = complete_data,
+    fit_data = fit_data,
+    error = NA_character_,
+    syntax = model_syntax
+  )
+}
+
+
+# ==============================================================================
+# 13. USAMI-STYLE CORRELATION-PRESERVING SCORE CALCULATION
+# ==============================================================================
+
+score_usami_univariate <- function(
+    fit,
+    fit_reference_data,
+    score_data,
+    T_now,
+    tol = PSD_TOL
+) {
+
+  y_names <- paste0(
+    "y",
+    seq_len(T_now)
+  )
+
+  if (is.null(fit)) {
+    return(
+      list(
+        scores = NULL,
+        audit = tibble(
+          scoring_status =
+            "measurement_model_missing"
+        )
+      )
+    )
+  }
+
+  pe <- lavaan::parameterEstimates(
+    fit
+  )
+
+  phi_row <- pe %>%
+    filter(
+      lhs == "Trait",
+      op == "~~",
+      rhs == "Trait"
+    )
+
+  if (nrow(phi_row) != 1L) {
+    return(
+      list(
+        scores = NULL,
+        audit = tibble(
+          scoring_status =
+            "trait_variance_not_uniquely_identified"
+        )
+      )
+    )
+  }
+
+  phi <- phi_row$est[[1L]]
+
+  if (
+    !is.finite(phi) ||
+      phi <= 0
+  ) {
+    return(
+      list(
+        scores = NULL,
+        audit = tibble(
+          scoring_status =
+            "nonpositive_trait_variance",
+          trait_variance = phi
+        )
+      )
+    )
+  }
+
+  Y_fit <- as.matrix(
+    fit_reference_data[
+      ,
+      y_names,
+      drop = FALSE
+    ]
+  )
+
+  Y_score <- as.matrix(
+    score_data[
+      ,
+      y_names,
+      drop = FALSE
+    ]
+  )
+
+  if (
+    any(
+      !is.finite(
+        Y_fit
+      )
+    ) ||
+      any(
+        !is.finite(
+          Y_score
+        )
+      )
+  ) {
+    stop(
+      "score_usami_univariate requires complete finite history windows."
+    )
+  }
+
+  # Time-specific means from the fitted SEM.
+  mu <- tryCatch(
+    lavaan::lavInspect(
+      fit,
+      "mean.ov"
+    ),
+    error = function(e) NULL
+  )
+
+  if (
+    is.null(mu) ||
+      length(mu) != T_now ||
+      any(
+        !is.finite(
+          mu
+        )
+      )
+  ) {
+
+    mu <- colMeans(
+      Y_fit
+    )
+  }
+
+  mu <- as.numeric(
+    mu[
+      y_names
+    ]
+  )
+
+  if (
+    length(mu) != T_now ||
+      any(
+        !is.finite(
+          mu
+        )
+      )
+  ) {
+    mu <- colMeans(
+      Y_fit
+    )
+  }
+
+  Y_fit_c <- sweep(
+    Y_fit,
+    2L,
+    mu,
+    "-"
+  )
+
+  Y_score_c <- sweep(
+    Y_score,
+    2L,
+    mu,
+    "-"
+  )
+
+  # Following the supplied Usami code, Sigma is the observed covariance matrix.
+  Sigma <- stats::cov(
+    Y_fit_c
+  )
+
+  Sigma <- symmetrize(
+    Sigma
+  )
+
+  sigma_audit <-
+    matrix_psd_audit(
+      Sigma,
+      tol
+    )
+
+  if (!sigma_audit$ok) {
+    return(
+      list(
+        scores = NULL,
+        audit = tibble(
+          scoring_status =
+            "observed_covariance_not_psd",
+          trait_variance = phi,
+          sigma_min_eigen =
+            sigma_audit$min_eigen
+        )
+      )
+    )
+  }
+
+  lambda <- matrix(
+    1,
+    nrow = T_now,
+    ncol = 1L
+  )
+
+  Sigma_inv <- safe_ginv(
+    Sigma
+  )
+
+  trait_denom <- as.numeric(
+    t(lambda) %*%
+      Sigma_inv %*%
+      lambda
+  )
+
+  if (
+    !is.finite(
+      trait_denom
+    ) ||
+      trait_denom <= 0
+  ) {
+    return(
+      list(
+        scores = NULL,
+        audit = tibble(
+          scoring_status =
+            "invalid_trait_score_denominator",
+          trait_variance = phi
+        )
+      )
+    )
+  }
+
+  # Correlation-preserving stable-trait predictor:
+  #
+  # sqrt(phi) / sqrt(lambda' Sigma^-1 lambda)
+  #   * lambda' Sigma^-1 Y
+  trait_weight_row <-
+    sqrt(phi) /
+    sqrt(trait_denom) *
+    t(lambda) %*%
+    Sigma_inv
+
+  stable_score <- as.numeric(
+    Y_score_c %*%
+      t(
+        trait_weight_row
+      )
+  )
+
+  # Build the stable-trait covariance contribution.
+  I_mat <- phi *
+    (
+      lambda %*%
+        t(lambda)
+    )
+
+  # Within-person covariance target.
+  Psi <- symmetrize(
+    Sigma -
+      I_mat
+  )
+
+  psi_audit <-
+    matrix_psd_audit(
+      Psi,
+      tol
+    )
+
+  if (!psi_audit$ok) {
+    return(
+      list(
+        scores = NULL,
+        audit = tibble(
+          scoring_status =
+            "within_person_covariance_not_psd",
+          trait_variance = phi,
+          sigma_min_eigen =
+            sigma_audit$min_eigen,
+          psi_min_eigen =
+            psi_audit$min_eigen
+        )
+      )
+    )
+  }
+
+  Psi_half <-
+    matrix_sqrt_psd(
+      Psi,
+      tol
+    )
+
+  # Adaptation of the correlation-preserving WPVS matrix formula in the
+  # supplied supplementary R code.
+  SIG <-
+    Psi %*%
+    Psi_half %*%
+    Sigma_inv %*%
+    Psi %*%
+    Psi_half
+
+  SIG <- symmetrize(
+    SIG
+  )
+
+  sig_audit <-
+    matrix_psd_audit(
+      SIG,
+      tol
+    )
+
+  if (!sig_audit$ok) {
+    return(
+      list(
+        scores = NULL,
+        audit = tibble(
+          scoring_status =
+            "WPVS_intermediate_matrix_not_psd",
+          trait_variance = phi,
+          sigma_min_eigen =
+            sigma_audit$min_eigen,
+          psi_min_eigen =
+            psi_audit$min_eigen,
+          wpvs_intermediate_min_eigen =
+            sig_audit$min_eigen
+        )
+      )
+    )
+  }
+
+  SIG_half <-
+    matrix_sqrt_psd(
+      SIG,
+      tol
+    )
+
+  W_wpvs <-
+    Psi_half %*%
+    safe_ginv(
+      SIG_half
+    ) %*%
+    Psi %*%
+    Psi_half %*%
+    Sigma_inv
+
+  WPVS <- Y_score_c %*%
+    t(
+      W_wpvs
+    )
+
+  colnames(WPVS) <-
+    paste0(
+      "wpvs_",
+      seq_len(T_now)
+    )
+
+  score_tibble <- bind_cols(
+    score_data %>%
+      dplyr::select(
+        baseline_id,
+        pidp_key,
+        baseline_wave
+      ),
+    tibble(
+      stable_score_raw =
+        stable_score
+    ),
+    as_tibble(
+      WPVS
+    )
+  )
+
+  # Empirical score audit on the SEM estimation sample.
+  stable_fit <- as.numeric(
+    Y_fit_c %*%
+      t(
+        trait_weight_row
+      )
+  )
+
+  wpvs_fit <- Y_fit_c %*%
+    t(
+      W_wpvs
+    )
+
+  empirical_wpvs_cov <-
+    stats::cov(
+      wpvs_fit
+    )
+
+  stable_wpvs_current_cor <-
+    safe_cor(
+      stable_fit,
+      wpvs_fit[
+        ,
+        T_now
+      ]
+    )
+
+  audit <- tibble(
+    scoring_status = "estimated",
+    trait_variance = phi,
+    sigma_min_eigen =
+      sigma_audit$min_eigen,
+    psi_min_eigen =
+      psi_audit$min_eigen,
+    wpvs_intermediate_min_eigen =
+      sig_audit$min_eigen,
+    stable_score_variance_fit_sample =
+      stats::var(
+        stable_fit
+      ),
+    target_trait_variance =
+      phi,
+    abs_stable_variance_minus_trait_variance =
+      abs(
+        stats::var(
+          stable_fit
+        ) -
+          phi
+      ),
+    max_abs_wpvs_covariance_error =
+      max(
+        abs(
+          empirical_wpvs_cov -
+            Psi
+        ),
+        na.rm = TRUE
+      ),
+    stable_vs_current_wpvs_correlation_fit_sample =
+      stable_wpvs_current_cor
+  )
+
+  list(
+    scores = score_tibble,
+    audit = audit,
+    Sigma = Sigma,
+    Psi = Psi,
+    means = mu,
+    trait_weights = trait_weight_row,
+    wpvs_weights = W_wpvs
+  )
+}
+
+
+# ==============================================================================
+# 14. FIT ALL MEASUREMENT MODELS AND CREATE SCORES
+# ==============================================================================
+
+fit_objects <- list()
+fit_rows <- list()
+var_rows <- list()
+score_audit_rows <- list()
+score_lookup_by_T <- list()
+
+fit_counter <- 0L
+var_counter <- 0L
+score_counter <- 0L
+
+
+for (i in seq_len(
+  nrow(MEASURE_SPECS)
+)) {
+
+  measure_label <-
+    MEASURE_SPECS$measure[[i]]
+
+  panel_var <-
+    MEASURE_SPECS$panel_var[[i]]
+
+  raw_var <-
+    MEASURE_SPECS$raw_var[[i]]
+
+  wave_mean_var <-
+    MEASURE_SPECS$wave_mean_var[[i]]
+
+  for (T_now in T_VALUES) {
+
+    key <- paste(
+      measure_label,
+      T_now,
+      sep = "__T"
+    )
+
+    w <- history_windows[[key]]
+
+    fitted_obj <-
+      fit_one_measurement_model(
+        window_data = w,
+        measure_label =
+          measure_label,
+        T_now = T_now
+      )
+
+    model_key <- paste0(
+      ifelse(
+        measure_label ==
+          "Life satisfaction",
+        "LS",
+        "GHQ"
+      ),
+      "_T",
+      T_now
+    )
+
+    fit_objects[[model_key]] <-
+      fitted_obj
+
+    fit_counter <- fit_counter + 1L
+
+    if (is.null(
+      fitted_obj$fit
+    )) {
+
+      fit_rows[[fit_counter]] <-
+        tibble(
+          model = model_key,
+          measure = measure_label,
+          T = T_now,
+          n_all_eligible_windows =
+            nrow(
+              fitted_obj$complete_data
+            ),
+          n_independent_people_sem =
+            nrow(
+              fitted_obj$fit_data
+            ),
+          converged = FALSE,
+          post_check_ok = FALSE,
+          df = NA_real_,
+          chisq = NA_real_,
+          p_value = NA_real_,
+          cfi = NA_real_,
+          tli = NA_real_,
+          rmsea = NA_real_,
+          srmr = NA_real_,
+          aic = NA_real_,
+          bic = NA_real_,
+          status = paste0(
+            "fit_failed: ",
+            fitted_obj$error
+          )
+        )
+
+      next
+    }
+
+    fit <- fitted_obj$fit
+
+    converged <-
+      isTRUE(
+        safe_lavinspect(
+          fit,
+          "converged",
+          FALSE
+        )
+      )
+
+    post_check <-
+      safe_lavinspect(
+        fit,
+        "post.check",
+        NA
+      )
+
+    if (
+      length(post_check) != 1L
+    ) {
+      post_check <- NA
+    }
+
+    fit_rows[[fit_counter]] <-
+      tibble(
+        model = model_key,
+        measure = measure_label,
+        T = T_now,
+        n_all_eligible_windows =
+          nrow(
+            fitted_obj$complete_data
+          ),
+        n_independent_people_sem =
+          nrow(
+            fitted_obj$fit_data
+          ),
+        converged = converged,
+        post_check_ok =
+          as.logical(
+            post_check
+          ),
+        df =
+          safe_fit_measure(
+            fit,
+            "df"
+          ),
+        chisq =
+          safe_fit_measure(
+            fit,
+            "chisq"
+          ),
+        p_value =
+          safe_fit_measure(
+            fit,
+            "pvalue"
+          ),
+        cfi =
+          safe_fit_measure(
+            fit,
+            "cfi"
+          ),
+        tli =
+          safe_fit_measure(
+            fit,
+            "tli"
+          ),
+        rmsea =
+          safe_fit_measure(
+            fit,
+            "rmsea"
+          ),
+        srmr =
+          safe_fit_measure(
+            fit,
+            "srmr"
+          ),
+        aic =
+          safe_fit_measure(
+            fit,
+            "aic"
+          ),
+        bic =
+          safe_fit_measure(
+            fit,
+            "bic"
+          ),
+        status =
+          ifelse(
+            converged,
+            "estimated",
+            "not_converged"
+          )
+      )
+
+    saveRDS(
+      fit,
+      file.path(
+        MODEL_DIR,
+        paste0(
+          model_key,
+          "_stable_WPVS_measurement_model.rds"
+        )
+      )
+    )
+
+    pe <- lavaan::parameterEstimates(
+      fit
+    )
+
+    trait_var <- pe %>%
+      filter(
+        lhs == "Trait",
+        op == "~~",
+        rhs == "Trait"
+      ) %>%
+      pull(
+        est
+      )
+
+    wpvs_variances <- pe %>%
+      filter(
+        op == "~~",
+        lhs == rhs,
+        grepl(
+          "^w[0-9]+$",
+          lhs
+        )
+      ) %>%
+      dplyr::select(
+        latent = lhs,
+        estimate = est
+      )
+
+    var_counter <- var_counter + 1L
+
+    var_rows[[var_counter]] <-
+      tibble(
+        model = model_key,
+        measure = measure_label,
+        T = T_now,
+        trait_variance =
+          ifelse(
+            length(trait_var) == 1L,
+            trait_var,
+            NA_real_
+          ),
+        min_wpvs_or_innovation_variance =
+          ifelse(
+            nrow(wpvs_variances) > 0L,
+            min(
+              wpvs_variances$estimate,
+              na.rm = TRUE
+            ),
+            NA_real_
+          ),
+        n_nonpositive_wpvs_or_innovation_variances =
+          sum(
+            wpvs_variances$estimate <= 0,
+            na.rm = TRUE
+          ),
+        sem_sample_small_flag =
+          nrow(
+            fitted_obj$fit_data
+          ) <
+          DESCRIPTIVE_SMALL_SEM_N
+      )
+
+    score_obj <-
+      score_usami_univariate(
+        fit =
+          fit,
+        fit_reference_data =
+          fitted_obj$fit_data,
+        score_data =
+          fitted_obj$complete_data,
+        T_now =
+          T_now
+      )
+
+    score_counter <- score_counter + 1L
+
+    score_audit_rows[[score_counter]] <-
+      bind_cols(
+        tibble(
+          model = model_key,
+          measure = measure_label,
+          T = T_now,
+          n_scored =
+            ifelse(
+              is.null(
+                score_obj$scores
+              ),
+              0L,
+              nrow(
+                score_obj$scores
+              )
+            )
+        ),
+        score_obj$audit
+      )
+
+    if (
+      !is.null(
+        score_obj$scores
+      )
+    ) {
+
+      scores <- score_obj$scores
+
+      # Scale both latent components by the SAME SD of the RAW current score,
+      # not by the SD of the wave-adjusted score. This preserves the manuscript's
+      # common observed-score metric for comparing stable and state components.
+      baseline_raw_lookup <- fitted_obj$complete_data %>%
+        dplyr::select(
+          baseline_id,
+          pidp_key,
+          baseline_wave
+        ) %>%
+        left_join(
+          panel %>%
+            transmute(
+              pidp_key,
+              baseline_wave = wave_num,
+              baseline_raw_score = .data[[raw_var]],
+              baseline_wave_mean = .data[[wave_mean_var]],
+              baseline_wave_adjusted_score = .data[[panel_var]],
+              baseline_interview_year = interview_year,
+              baseline_interview_month = interview_month
+            ),
+          by = c(
+            "pidp_key",
+            "baseline_wave"
+          ),
+          relationship = "many-to-one"
+        )
+
+      current_sd <- safe_sd(
+        baseline_raw_lookup$baseline_raw_score
+      )
+
+      if (!is.finite(current_sd) || current_sd <= 0) {
+        stop(
+          "Could not obtain a valid raw current-score SD for ",
+          measure_label,
+          " T=",
+          T_now
+        )
+      }
+
+      scores <- scores %>%
+        left_join(
+          baseline_raw_lookup %>%
+            dplyr::select(
+              baseline_id,
+              baseline_raw_score,
+              baseline_wave_mean,
+              baseline_wave_adjusted_score,
+              baseline_interview_year,
+              baseline_interview_month
+            ),
+          by = "baseline_id",
+          relationship = "many-to-one"
+        ) %>%
+        mutate(
+          measure =
+            measure_label,
+          T =
+            T_now,
+          wave_adjustment =
+            "actual UKHLS survey-wave mean removed before decomposition",
+          raw_current_score_sd =
+            current_sd,
+          stable_score_SD =
+            stable_score_raw /
+            current_sd,
+          current_wpvs_raw =
+            .data[[paste0("wpvs_", T_now)]],
+          current_wpvs_SD =
+            current_wpvs_raw /
+            current_sd
+        )
+
+      if (
+        is.null(
+          score_lookup_by_T[[as.character(T_now)]]
+        )
+      ) {
+
+        score_lookup_by_T[[as.character(T_now)]] <- scores
+
+      } else {
+
+        score_lookup_by_T[[as.character(T_now)]] <- bind_rows(
+          score_lookup_by_T[[as.character(T_now)]],
+          scores
+        )
+      }
+
+      # Save scoring matrices for full reproducibility.
+      saveRDS(
+        list(
+          Sigma = score_obj$Sigma,
+          Psi = score_obj$Psi,
+          means = score_obj$means,
+          trait_weights =
+            score_obj$trait_weights,
+          wpvs_weights =
+            score_obj$wpvs_weights
+        ),
+        file.path(
+          MODEL_DIR,
+          paste0(
+            model_key,
+            "_correlation_preserving_scoring_matrices.rds"
+          )
+        )
+      )
+    }
+  }
+}
+
+
+measurement_fit <- bind_rows(
+  fit_rows
+)
+
+variance_audit <- bind_rows(
+  var_rows
+)
+
+score_diagnostics <- bind_rows(
+  score_audit_rows
+)
+
+
+write_csv_quiet(
+  measurement_fit,
+  "03_measurement_model_fit.csv"
+)
+
+write_csv_quiet(
+  variance_audit,
+  "04_measurement_model_variance_and_identification_audit.csv"
+)
+
+write_csv_quiet(
+  score_diagnostics,
+  "05_score_diagnostics.csv"
+)
+
+
+# ==============================================================================
+# 15. SAVE SCORE LOOKUPS
+# ==============================================================================
+
+for (T_now in T_VALUES) {
+
+  scores_T <-
+    score_lookup_by_T[[as.character(T_now)]]
+
+  if (
+    is.null(
+      scores_T
+    )
+  ) {
+    next
+  }
+
+  saveRDS(
+    scores_T,
+    file.path(
+      DATA_DIR,
+      paste0(
+        "final_wave_adjusted_latent_score_lookup_T",
+        T_now,
+        ".rds"
+      )
+    )
+  )
+
+  # CSV is convenient for inspection; RDS should be used for later merging.
+  readr::write_csv(
+    scores_T,
+    file.path(
+      DATA_DIR,
+      paste0(
+        "final_wave_adjusted_latent_score_lookup_T",
+        T_now,
+        ".csv"
+      )
+    ),
+    na = "",
+    progress = FALSE
+  )
+}
+
+
+# ==============================================================================
+# 16. COMPARE LATENT SCORES WITH EXISTING PRIOR-MEAN / DEVIATION COMPONENTS
+# ==============================================================================
+
+old_component_rows <- list()
+oc_idx <- 0L
+
+
+for (T_now in T_VALUES) {
+
+  scores_T <-
+    score_lookup_by_T[[as.character(T_now)]]
+
+  if (
+    is.null(
+      scores_T
+    )
+  ) {
+    next
+  }
+
+  # ---------------------------------------------------------------------------
+  # Life satisfaction
+  # ---------------------------------------------------------------------------
+
+  ls_scores <- scores_T %>%
+    filter(
+      measure ==
+        "Life satisfaction"
+    )
+
+  if (
+    all(
+      c(
+        "ls_prior_mean",
+        "ls_history_deviation"
+      ) %in%
+        names(
+          formation_base
+        )
+    )
+  ) {
+
+    ls_compare <-
+      ls_scores %>%
+      left_join(
+        formation_base %>%
+          dplyr::select(
+            baseline_id,
+            old_prior_mean =
+              ls_prior_mean,
+            old_state_deviation =
+              ls_history_deviation
+          ),
+        by = "baseline_id"
+      )
+
+    oc_idx <- oc_idx + 1L
+
+    old_component_rows[[oc_idx]] <-
+      tibble(
+        measure =
+          "Life satisfaction",
+        T =
+          T_now,
+        n =
+          nrow(
+            ls_compare
+          ),
+        correlation_latent_stable_vs_old_prior_mean =
+          safe_cor(
+            ls_compare$stable_score_raw,
+            ls_compare$old_prior_mean
+          ),
+        correlation_current_WPVS_vs_old_state_deviation =
+          safe_cor(
+            ls_compare$current_wpvs_raw,
+            ls_compare$old_state_deviation
+          ),
+        correlation_latent_stable_vs_current_WPVS =
+          safe_cor(
+            ls_compare$stable_score_raw,
+            ls_compare$current_wpvs_raw
+          )
+      )
+  }
+
+  # ---------------------------------------------------------------------------
+  # GHQ favorable orientation
+  # ---------------------------------------------------------------------------
+
+  ghq_scores <- scores_T %>%
+    filter(
+      measure ==
+        "Psychological distress"
+    )
+
+  if (
+    all(
+      c(
+        "ghq_prior_mean",
+        "ghq_history_deviation"
+      ) %in%
+        names(
+          formation_base
+        )
+    )
+  ) {
+
+    ghq_compare <-
+      ghq_scores %>%
+      left_join(
+        formation_base %>%
+          dplyr::select(
+            baseline_id,
+            old_prior_mean =
+              ghq_prior_mean,
+            old_state_deviation =
+              ghq_history_deviation
+          ),
+        by = "baseline_id"
+      )
+
+    oc_idx <- oc_idx + 1L
+
+    old_component_rows[[oc_idx]] <-
+      tibble(
+        measure =
+          "Psychological distress",
+        T =
+          T_now,
+        n =
+          nrow(
+            ghq_compare
+          ),
+        correlation_latent_stable_vs_old_prior_mean =
+          safe_cor(
+            ghq_compare$stable_score_raw,
+            ghq_compare$old_prior_mean
+          ),
+        correlation_current_WPVS_vs_old_state_deviation =
+          safe_cor(
+            ghq_compare$current_wpvs_raw,
+            ghq_compare$old_state_deviation
+          ),
+        correlation_latent_stable_vs_current_WPVS =
+          safe_cor(
+            ghq_compare$stable_score_raw,
+            ghq_compare$current_wpvs_raw
+          )
+      )
+  }
+}
+
+
+old_vs_latent <-
+  bind_rows(
+    old_component_rows
+  )
+
+
+write_csv_quiet(
+  old_vs_latent,
+  "06_old_vs_latent_component_correlations.csv"
+)
+
+
+# ==============================================================================
+# 17. SCORE COVERAGE AT THE THREE SELECTION ENDPOINTS
+# ==============================================================================
+
+score_coverage_rows <- list()
+sc_idx <- 0L
+
+
+for (T_now in T_VALUES) {
+
+  scores_T <-
+    score_lookup_by_T[[as.character(T_now)]]
+
+  if (
+    is.null(
+      scores_T
+    )
+  ) {
+    next
+  }
+
+  for (measure_now in unique(
+    scores_T$measure
+  )) {
+
+    score_ids <-
+      scores_T %>%
+      filter(
+        measure ==
+          measure_now
+      ) %>%
+      distinct(
+        baseline_id
+      ) %>%
+      pull(
+        baseline_id
+      )
+
+    # Incident LAT
+    lat_ids <-
+      incident_lat %>%
+      distinct(
+        baseline_id
+      ) %>%
+      pull(
+        baseline_id
+      )
+
+    sc_idx <- sc_idx + 1L
+
+    score_coverage_rows[[sc_idx]] <-
+      tibble(
+        endpoint =
+          "Incident LAT formation: treated events",
+        measure =
+          measure_now,
+        T =
+          T_now,
+        denominator =
+          length(
+            lat_ids
+          ),
+        scored =
+          sum(
+            lat_ids %in%
+              score_ids
+          ),
+        percent_scored =
+          100 *
+          scored /
+          denominator
+      )
+
+    # Cohab/formal event
+    if (
+      all(
+        c(
+          "ascertain_coresident_union_12m",
+          "coresident_union_12m"
+        ) %in%
+          names(
+            formation_base
+          )
+      )
+    ) {
+
+      ids <-
+        formation_base %>%
+        filter(
+          ascertain_coresident_union_12m %in% TRUE,
+          coresident_union_12m == 1L
+        ) %>%
+        distinct(
+          baseline_id
+        ) %>%
+        pull(
+          baseline_id
+        )
+
+      sc_idx <- sc_idx + 1L
+
+      score_coverage_rows[[sc_idx]] <-
+        tibble(
+          endpoint =
+            "Cohabitation/formal union within 12m: events",
+          measure =
+            measure_now,
+          T =
+            T_now,
+          denominator =
+            length(
+              ids
+            ),
+          scored =
+            sum(
+              ids %in%
+                score_ids
+            ),
+          percent_scored =
+            100 *
+            scored /
+            denominator
+        )
+    }
+
+    # Marriage event
+    if (
+      all(
+        c(
+          "ascertain_marriage_36m",
+          "marriage_36m"
+        ) %in%
+          names(
+            formation_base
+          )
+      )
+    ) {
+
+      ids <-
+        formation_base %>%
+        filter(
+          ascertain_marriage_36m %in% TRUE,
+          marriage_36m == 1L
+        ) %>%
+        distinct(
+          baseline_id
+        ) %>%
+        pull(
+          baseline_id
+        )
+
+      sc_idx <- sc_idx + 1L
+
+      score_coverage_rows[[sc_idx]] <-
+        tibble(
+          endpoint =
+            "Marriage within 36m: events",
+          measure =
+            measure_now,
+          T =
+            T_now,
+          denominator =
+            length(
+              ids
+            ),
+          scored =
+            sum(
+              ids %in%
+                score_ids
+            ),
+          percent_scored =
+            100 *
+            scored /
+            denominator
+        )
+    }
+  }
+}
+
+
+score_endpoint_coverage <-
+  bind_rows(
+    score_coverage_rows
+  )
+
+
+write_csv_quiet(
+  score_endpoint_coverage,
+  "02b_endpoint_score_coverage.csv"
+)
+
+
+# ==============================================================================
+# 18. OPTIONAL: SAVE COMPLETE HISTORY WINDOWS
+# ==============================================================================
+
+if (SAVE_HISTORY_WINDOWS) {
+
+  for (nm in names(
+    history_windows
+  )) {
+
+    w <- history_windows[[nm]] %>%
+      filter(
+        exact_consecutive_complete
+      )
+
+    saveRDS(
+      w,
+      file.path(
+        DATA_DIR,
+        paste0(
+          "history_window_",
+          gsub(
+            "[^A-Za-z0-9]+",
+            "_",
+            nm
+          ),
+          ".rds"
+        )
+      )
+    )
+  }
+}
+
+
+# ==============================================================================
+# 19. AUTOMATED FEASIBILITY SUMMARY
+# ==============================================================================
+
+feasibility_summary <- measurement_fit %>%
+  left_join(
+    variance_audit,
+    by = c(
+      "model",
+      "measure",
+      "T"
+    )
+  ) %>%
+  left_join(
+    score_diagnostics %>%
+      dplyr::select(
+        model,
+        measure,
+        T,
+        n_scored,
+        scoring_status,
+        psi_min_eigen,
+        max_abs_wpvs_covariance_error,
+        stable_vs_current_wpvs_correlation_fit_sample
+      ),
+    by = c(
+      "model",
+      "measure",
+      "T"
+    )
+  ) %>%
+  mutate(
+    measurement_convergence_ok =
+      converged %in% TRUE,
+
+    positive_trait_variance =
+      is.finite(
+        trait_variance
+      ) &
+      trait_variance > 0,
+
+    no_nonpositive_wpvs_variance =
+      n_nonpositive_wpvs_or_innovation_variances == 0L,
+
+    score_generation_ok =
+      scoring_status ==
+      "estimated",
+
+    provisional_feasibility =
+      case_when(
+        !measurement_convergence_ok ~
+          "NO: measurement model did not converge",
+        !positive_trait_variance ~
+          "NO: stable-trait variance is nonpositive",
+        !no_nonpositive_wpvs_variance ~
+          "CAUTION: nonpositive WPVS/innovation variance",
+        !score_generation_ok ~
+          "NO: correlation-preserving scores could not be generated",
+        n_independent_people_sem <
+          DESCRIPTIVE_SMALL_SEM_N ~
+          "CAUTION: technically usable but SEM sample is small",
+        TRUE ~
+          "YES: technically feasible; inspect fit and score diagnostics"
+      )
+  )
+
+
+write_csv_quiet(
+  feasibility_summary,
+  "08_feasibility_summary.csv"
+)
+
+
+primary_T4_measurement_summary <- feasibility_summary %>%
+  filter(T == PRIMARY_T) %>%
+  dplyr::select(
+    model,
+    measure,
+    T,
+    n_all_eligible_windows,
+    n_independent_people_sem,
+    converged,
+    cfi,
+    tli,
+    rmsea,
+    srmr,
+    trait_variance,
+    n_nonpositive_wpvs_or_innovation_variances,
+    n_scored,
+    scoring_status,
+    max_abs_wpvs_covariance_error,
+    stable_vs_current_wpvs_correlation_fit_sample,
+    provisional_feasibility
+  )
+
+write_csv_quiet(
+  primary_T4_measurement_summary,
+  "09_PRIMARY_T4_final_measurement_summary.csv"
+)
+
+
+# ==============================================================================
+# 20. README
+# ==============================================================================
+
+readme <- c(
+  "UKHLS LATENT STABLE-TRAIT / WPVS FINAL MEASUREMENT STAGE v2 - WAVE CENTERED",
+  "",
+  "PURPOSE",
+  "This is the final measurement/decomposition stage before the revised H1 transition models.",
+  "",
+  "PRIMARY SPECIFICATION",
+  "T=4 = current clean-unpartnered baseline + 3 immediately preceding UKHLS waves.",
+  "T=5 and T=6 are stronger-history sensitivities.",
+  "",
+  "STRICT TEMPORAL RULE",
+  "No wave after the focal baseline is used in any person's score.",
+  "",
+  "STEP-1 SEM SAMPLE",
+  "For each measure x T, the first eligible clean-unpartnered baseline per respondent",
+  "is used to estimate population measurement-model parameters. This avoids treating",
+  "overlapping windows from one person as independent Step-1 observations.",
+  "",
+  "ACTUAL-WAVE MEAN ADJUSTMENT",
+  "Before decomposition, each score is centered on its actual UKHLS survey-wave mean",
+  "estimated in the adult UKHLS panel. This removes common secular/wave shifts.",
+  "",
+  "SCORES",
+  "Stable-trait and WPVS scores use correlation-preserving matrix formulas adapted",
+  "from the supplied Usami supplementary R code. GHQ is reverse-oriented so that",
+  "higher scores indicate more favorable psychological functioning.",
+  "",
+  "FINAL PRE-H1 CHECKS",
+  "Inspect, in order:",
+  "  1. tables/00_actual_wave_means.csv",
+  "  2. tables/00b_wave_centering_audit.csv",
+  "  3. tables/01_history_support_all_clean_baselines.csv",
+  "  4. tables/02_endpoint_support_lat_cohab_marriage.csv",
+  "  5. tables/03_measurement_model_fit.csv",
+  "  6. tables/04_measurement_model_variance_and_identification_audit.csv",
+  "  7. tables/05_score_diagnostics.csv",
+  "  8. tables/06_old_vs_latent_component_correlations.csv",
+  "  9. tables/07_temporal_spacing_diagnostics.csv",
+  " 10. tables/08_feasibility_summary.csv",
+  "",
+  "KEY INTERPRETIVE CHECKS",
+  "- Stable-trait variance should be positive.",
+  "- WPVS/innovation variances should not show serious Heywood problems.",
+  "- The measurement model should converge.",
+  "- Psi and the scoring intermediate matrix must be positive semidefinite.",
+  "- Predicted-score stable/WPVS correlation is descriptive, not an orthogonality test.",
+  "- The score reconstruction error should be small.",
+  "- Endpoint event coverage at T=4 must remain adequate.",
+  "",
+  "MODEL FIT",
+  "Do not make a go/no-go decision from CFI/RMSEA/SRMR alone. The model is a",
+  "substantive decomposition model; fit indices, variance diagnostics, temporal",
+  "spacing, score behavior, and endpoint support should be considered jointly.",
+  "",
+  "NEXT STEP",
+  "Use data/final_wave_adjusted_latent_score_lookup_T4.rds in the dedicated second-stage",
+  "script that reruns the incident-LAT matched model and the clean-unpartnered",
+  "cohabitation/marriage transition models with stable_score_SD and current_wpvs_SD",
+  "entered simultaneously. T=5/T=6 should be retained as history-length sensitivities."
+)
+
+writeLines(
+  readme,
+  con = file.path(
+    OUT_DIR,
+    "00_READ_ME_FIRST.txt"
+  )
+)
+
+
+# ==============================================================================
+# 21. OUTPUT CHECK
+# ==============================================================================
+
+expected_files <- c(
+  "00_READ_ME_FIRST.txt",
+  "diagnostics/00_input_and_alignment_audit.csv",
+  "diagnostics/00c_incident_LAT_unmatched_clean_baselines.csv",
+  "tables/00_actual_wave_means.csv",
+  "tables/00b_wave_centering_audit.csv",
+  "tables/01_history_support_all_clean_baselines.csv",
+  "tables/02_endpoint_support_lat_cohab_marriage.csv",
+  "tables/02b_endpoint_score_coverage.csv",
+  "tables/03_measurement_model_fit.csv",
+  "tables/04_measurement_model_variance_and_identification_audit.csv",
+  "tables/05_score_diagnostics.csv",
+  "tables/06_old_vs_latent_component_correlations.csv",
+  "tables/07_temporal_spacing_diagnostics.csv",
+  "tables/08_feasibility_summary.csv",
+  "tables/09_PRIMARY_T4_final_measurement_summary.csv"
+)
+
+output_check <- tibble(
+  file = expected_files,
+  exists = file.exists(
+    file.path(
+      OUT_DIR,
+      expected_files
+    )
+  )
+)
+
+write_csv_quiet(
+  output_check,
+  "99_output_check.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 22. CONSOLE SUMMARY
+# ==============================================================================
+
+cat("\n============================================================\n")
+cat("LATENT STABLE-TRAIT / WPVS FINAL MEASUREMENT STAGE COMPLETE\n")
+cat("============================================================\n")
+
+cat("\nOutput directory:\n")
+cat("  ", OUT_DIR, "\n", sep = "")
+
+cat("\nHISTORY SUPPORT\n")
+cat("---------------\n")
+print(
+  history_support_combined,
+  n = Inf
+)
+
+cat("\nENDPOINT SUPPORT\n")
+cat("----------------\n")
+print(
+  endpoint_support,
+  n = Inf
+)
+
+cat("\nMEASUREMENT-MODEL FIT\n")
+cat("---------------------\n")
+print(
+  measurement_fit %>%
+    dplyr::select(
+      model,
+      measure,
+      T,
+      n_all_eligible_windows,
+      n_independent_people_sem,
+      converged,
+      df,
+      cfi,
+      rmsea,
+      srmr,
+      status
+    ),
+  n = Inf
+)
+
+cat("\nSCORE DIAGNOSTICS\n")
+cat("-----------------\n")
+print(
+  score_diagnostics,
+  n = Inf
+)
+
+cat("\nOLD VS LATENT COMPONENT CORRELATIONS\n")
+cat("------------------------------------\n")
+print(
+  old_vs_latent,
+  n = Inf
+)
+
+cat("\nPROVISIONAL FEASIBILITY\n")
+cat("-----------------------\n")
+print(
+  feasibility_summary %>%
+    dplyr::select(
+      model,
+      measure,
+      T,
+      n_independent_people_sem,
+      trait_variance,
+      n_nonpositive_wpvs_or_innovation_variances,
+      scoring_status,
+      provisional_feasibility
+    ),
+  n = Inf
+)
+
+cat("\nIMPORTANT:\n")
+cat(
+  "This script produces the final wave-adjusted measurement scores; H1 effects are estimated in the next-stage script.\n"
+)
+
+cat("============================================================\n\n")
+
+################################################################################
+# END
+################################################################################

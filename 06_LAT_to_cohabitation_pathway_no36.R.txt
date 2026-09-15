@@ -1,0 +1,2782 @@
+################################################################################
+# UKHLS: INCIDENT LAT -> COHABITATION, NO FIXED 36-MONTH HORIZON
+# Risk-set matched psychological trajectory analysis - v2 AUDIT ENHANCED
+#
+# PRIMARY QUESTION
+# ----------------
+# Among clean incident LAT relationships, do psychological trajectories DURING
+# LAT differ according to whether the linked focal LAT episode subsequently
+# progresses to cohabitation, compared with incident LAT relationships that are
+# still LAT at the same relationship duration?
+#
+# KEY DESIGN FEATURES
+# -------------------
+# 1. Starts from the validated CLEAN INCIDENT LAT cohort.
+# 2. Links the incident LAT event to the reconstructed focal LAT episode.
+# 3. Defines treated relationships as focal LAT episodes with a conservatively
+#    linked cohabitation transition at ANY later observed time. There is NO
+#    36-month upper limit.
+# 4. Uses incidence-density / risk-set matching. For a treated relationship that
+#    cohabits d months after LAT onset, eligible controls are comparable clean
+#    incident LAT relationships still at risk at duration d.
+# 5. For BOTH treated relationships and controls, psychological observations are
+#    used only while the relationship is LAT and STRICTLY BEFORE the matched
+#    cohabitation time. If a control later cohabits, its observations are also
+#    strictly before its own cohabitation transition.
+# 6. The PRIMARY trajectory inference is SUPPORT-QUALIFIED: only duration stages
+#    with at least 20 outcome-complete treated matched sets enter the omnibus
+#    test. The all-estimable-stage omnibus is retained as a descriptive
+#    sensitivity because very sparse late stages can otherwise dominate the df.
+# 7. Adds a sequential matching-attrition audit and treated event-time summaries
+#    for retained versus unmatched cohabitation progressors.
+# 8. Adds achieved matching-balance diagnostics for age and timing variables.
+# 9. Adds an OBSERVED-CONTINUING-LAT sensitivity: every control must have an
+#    observed LAT interview at or beyond the treated relationship's event-
+#    equivalent duration. Later cohabiters remain eligible controls.
+# 10. Retains the stricter never-observed-cohabitation-control sensitivity.
+# 11. Adds a first-LAT -> last-precohabitation CHANGE sensitivity using the latest
+#     available pre-event LAT psychological observation rather than broad bins;
+#     the model adjusts for the exact elapsed observation interval.
+# 12. Balanced stage analyses explicitly flag estimates based on too few sets or
+#     non-finite standard errors as descriptive/insufficient rather than "OK".
+#
+# INTERPRETATION
+# --------------
+# A favorable differential trajectory among future cohabiters is evidence of
+# post-LAT psychological trajectory differentiation associated with subsequent
+# progression to cohabitation. It is compatible with relationship development,
+# selective progression, and/or anticipation, but is not by itself a causal test
+# of anticipation.
+################################################################################
+
+
+# ==============================================================================
+# 0. PACKAGES
+# ==============================================================================
+
+required_packages <- c(
+  "dplyr", "tidyr", "purrr", "tibble", "readr", "stringr", "fixest"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install required package(s) before running this script: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(fixest)
+})
+
+options(dplyr.summarise.inform = FALSE)
+
+
+# ==============================================================================
+# 1. PATHS AND USER-EDITABLE OPTIONS
+# ==============================================================================
+
+COMMON_STATA_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se"
+)
+
+# Validated v4.1 output directory used by the existing pathway workflows.
+# If this directory is elsewhere, edit only this line.
+V41_OUT_DIR <- file.path(
+  getwd(),
+  "UKHLS_REVISED_selection_development_proximity_v4_1"
+)
+
+# Fallback if v4.1 was written beneath COMMON_STATA_DIR.
+if (!dir.exists(V41_OUT_DIR)) {
+  alt_v41 <- file.path(
+    COMMON_STATA_DIR,
+    "UKHLS_REVISED_selection_development_proximity_v4_1"
+  )
+  if (dir.exists(alt_v41)) V41_OUT_DIR <- alt_v41
+}
+
+PANEL_RDS <- file.path(V41_OUT_DIR, "data", "01_panel_person_wave.rds")
+PHISTORY_RDS <- file.path(V41_OUT_DIR, "data", "02_phistory_clean.rds")
+
+INCIDENT_LAT_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "incident_LAT_psychological_trajectory_v1"
+)
+
+INCIDENT_EVENTS_RDS <- file.path(
+  INCIDENT_LAT_DIR,
+  "primary_incident_LAT_events.rds"
+)
+
+INCIDENT_TREATED_STACK_RDS <- file.path(
+  INCIDENT_LAT_DIR,
+  "treated_only_LAT_event_stack.rds"
+)
+
+OUT_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "incident_LAT_to_cohab_no36_riskset_trajectory_v2_AUDITENHANCED"
+)
+
+TABLE_DIR <- file.path(OUT_DIR, "tables")
+DIAG_DIR <- file.path(OUT_DIR, "diagnostics")
+MODEL_DIR <- file.path(OUT_DIR, "models")
+DATA_DIR <- file.path(OUT_DIR, "data")
+
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIAG_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(MODEL_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
+
+required_inputs <- c(
+  PANEL_RDS,
+  PHISTORY_RDS,
+  INCIDENT_EVENTS_RDS,
+  INCIDENT_TREATED_STACK_RDS
+)
+
+missing_inputs <- required_inputs[!file.exists(required_inputs)]
+if (length(missing_inputs) > 0L) {
+  stop(
+    "Missing required upstream file(s):\n",
+    paste0("  - ", missing_inputs, collapse = "\n"),
+    "\n\nRun the validated upstream workflows first or edit the paths above."
+  )
+}
+
+# Conservative LAT -> cohabitation linkage parameters retained from the validated
+# pathway workflow. These are LINKAGE constraints, not a follow-up horizon.
+MAX_LAT_START_DATE_SHIFT_MONTHS <- 6L
+MAX_GAP_WITHIN_LAT_EPISODE_MONTHS <- 18L
+LAT_COHAB_MAX_LAST_LAT_GAP <- 18L
+LAT_COHAB_START_FLAGS <- 0L
+
+# Matching at incident LAT onset. Retained from the validated pathway workflow.
+MATCH_AGE_CALIPER <- 1
+MATCH_BASELINE_MONTH_CALIPER <- 3L
+MATCH_FOLLOWUP_INTERVAL_CALIPER <- 3L
+MIN_CONTROLS_PER_SET <- 1L
+
+# LAT-duration stages. No maximum follow-up is imposed; the last category is 120+.
+LAT_STAGE_SPECS <- tibble::tribble(
+  ~stage,        ~lower, ~upper, ~target, ~selection_rule,
+  "LAT_12_23",     12L,    23L,    17.5, "nearest",
+  "LAT_24_35",     24L,    35L,    29.5, "nearest",
+  "LAT_36_59",     36L,    59L,    47.5, "nearest",
+  "LAT_60_83",     60L,    83L,    71.5, "nearest",
+  "LAT_84_119",    84L,   119L,   101.5, "nearest",
+  "LAT_120_PLUS", 120L,     Inf,   120.0, "earliest"
+)
+
+LAT_STAGE_ORDER <- c("first_LAT", LAT_STAGE_SPECS$stage)
+
+# Support threshold used only for a SECONDARY support-qualified omnibus
+# sensitivity. The primary omnibus uses all estimable post-LAT stages.
+MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY <- 20L
+
+# Balanced/first-to-last analyses with fewer than this many treated matched sets
+# are retained descriptively but are not treated as reliable inferential tests.
+MIN_BALANCED_SETS_FOR_INFERENCE <- 20L
+
+# Minimum elapsed time between the first-LAT reference observation and the last
+# pre-event observation in the continuous-interval change sensitivity.
+MIN_CHANGE_INTERVAL_MONTHS <- 6L
+
+# Save large analytic stacks as RDS for reproducibility.
+SAVE_ANALYTIC_STACKS <- TRUE
+
+
+# ==============================================================================
+# 2. HELPERS
+# ==============================================================================
+
+id_chr <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (inherits(x, "haven_labelled")) x <- as.vector(x)
+  if (is.numeric(x) || is.integer(x)) {
+    return(format(x, scientific = FALSE, trim = TRUE))
+  }
+  as.character(x)
+}
+
+code_chr <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (inherits(x, "haven_labelled")) x <- as.vector(x)
+  as.character(x)
+}
+
+safe_sd <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 2L) return(NA_real_)
+  stats::sd(x)
+}
+
+safe_median <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0L) return(NA_real_)
+  stats::median(x)
+}
+
+safe_quantile <- function(x, prob) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0L) return(NA_real_)
+  as.numeric(stats::quantile(x, prob, names = FALSE))
+}
+
+safe_max <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0L) return(NA_real_)
+  max(x)
+}
+
+write_csv_quiet <- function(x, filename, subdir = "tables") {
+  base <- switch(
+    subdir,
+    tables = TABLE_DIR,
+    diagnostics = DIAG_DIR,
+    data = DATA_DIR,
+    stop("Unknown output subdir: ", subdir)
+  )
+  readr::write_csv(x, file.path(base, filename), na = "")
+  invisible(x)
+}
+
+write_txt <- function(x, filename, subdir = "diagnostics") {
+  base <- switch(
+    subdir,
+    tables = TABLE_DIR,
+    diagnostics = DIAG_DIR,
+    data = DATA_DIR,
+    stop("Unknown output subdir: ", subdir)
+  )
+  writeLines(x, file.path(base, filename), useBytes = TRUE)
+  invisible(x)
+}
+
+safe_p_adjust <- function(p, method = "holm") {
+  out <- rep(NA_real_, length(p))
+  ok <- is.finite(p)
+  if (any(ok)) out[ok] <- stats::p.adjust(p[ok], method = method)
+  out
+}
+
+safe_feols <- function(formula, data, name, ...) {
+  fit <- tryCatch(
+    fixest::feols(formula, data = data, ...),
+    error = function(e) e
+  )
+  if (inherits(fit, "error")) {
+    write_txt(
+      c(
+        paste0("MODEL FAILURE: ", name),
+        paste0("Message: ", conditionMessage(fit)),
+        paste0("Rows supplied: ", nrow(data))
+      ),
+      paste0(name, "_ERROR.txt")
+    )
+    return(NULL)
+  }
+  saveRDS(fit, file.path(MODEL_DIR, paste0(name, ".rds")))
+  fit
+}
+
+coef_table <- function(model, analysis, outcome) {
+  if (is.null(model)) {
+    return(tibble::tibble(
+      analysis = analysis,
+      outcome = outcome,
+      term = NA_character_,
+      stage = NA_character_,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value = NA_real_,
+      status = "MODEL_FAILED"
+    ))
+  }
+
+  ct <- as.data.frame(fixest::coeftable(model))
+  ct$term <- rownames(ct)
+  rownames(ct) <- NULL
+
+  est_col <- grep("Estimate", names(ct), value = TRUE)[1]
+  se_col <- grep("Std", names(ct), value = TRUE)[1]
+  p_col <- grep("Pr", names(ct), value = TRUE)[1]
+
+  ct %>%
+    dplyr::transmute(
+      analysis = analysis,
+      outcome = outcome,
+      term,
+      stage = dplyr::case_when(
+        stringr::str_detect(term, "LAT_12_23") ~ "LAT_12_23",
+        stringr::str_detect(term, "LAT_24_35") ~ "LAT_24_35",
+        stringr::str_detect(term, "LAT_36_59") ~ "LAT_36_59",
+        stringr::str_detect(term, "LAT_60_83") ~ "LAT_60_83",
+        stringr::str_detect(term, "LAT_84_119") ~ "LAT_84_119",
+        stringr::str_detect(term, "LAT_120_PLUS") ~ "LAT_120_PLUS",
+        TRUE ~ NA_character_
+      ),
+      estimate = .data[[est_col]],
+      std_error = .data[[se_col]],
+      conf_low = estimate - 1.96 * std_error,
+      conf_high = estimate + 1.96 * std_error,
+      p_value = .data[[p_col]],
+      status = "OK"
+    ) %>%
+    dplyr::filter(!is.na(stage))
+}
+
+find_stage_terms <- function(model, stages) {
+  if (is.null(model)) return(character())
+  nm <- names(stats::coef(model))
+  unique(unlist(lapply(stages, function(s) nm[stringr::str_detect(nm, fixed(s))])))
+}
+
+manual_wald <- function(model, terms, analysis, outcome, test_label) {
+  if (is.null(model)) {
+    return(tibble::tibble(
+      analysis = analysis,
+      outcome = outcome,
+      test = test_label,
+      df = NA_integer_,
+      chi_square = NA_real_,
+      p_value = NA_real_,
+      terms_tested = NA_character_,
+      status = "MODEL_FAILED"
+    ))
+  }
+
+  b_all <- stats::coef(model)
+  V_all <- stats::vcov(model)
+  terms <- intersect(unique(terms), names(b_all))
+
+  if (length(terms) == 0L) {
+    return(tibble::tibble(
+      analysis = analysis,
+      outcome = outcome,
+      test = test_label,
+      df = 0L,
+      chi_square = NA_real_,
+      p_value = NA_real_,
+      terms_tested = "",
+      status = "NO_ESTIMABLE_TERMS"
+    ))
+  }
+
+  b <- b_all[terms]
+  V <- V_all[terms, terms, drop = FALSE]
+
+  invV <- tryCatch(solve(V), error = function(e) NULL)
+  if (is.null(invV)) {
+    return(tibble::tibble(
+      analysis = analysis,
+      outcome = outcome,
+      test = test_label,
+      df = length(terms),
+      chi_square = NA_real_,
+      p_value = NA_real_,
+      terms_tested = paste(terms, collapse = " | "),
+      status = "SINGULAR_VCOV"
+    ))
+  }
+
+  W <- as.numeric(t(b) %*% invV %*% b)
+  p <- stats::pchisq(W, df = length(terms), lower.tail = FALSE)
+
+  tibble::tibble(
+    analysis = analysis,
+    outcome = outcome,
+    test = test_label,
+    df = length(terms),
+    chi_square = W,
+    p_value = p,
+    terms_tested = paste(terms, collapse = " | "),
+    status = "OK"
+  )
+}
+
+# Assign one LAT-duration category to every observed LAT row.
+assign_lat_stage <- function(duration) {
+  dplyr::case_when(
+    duration >= 12 & duration <= 23 ~ "LAT_12_23",
+    duration >= 24 & duration <= 35 ~ "LAT_24_35",
+    duration >= 36 & duration <= 59 ~ "LAT_36_59",
+    duration >= 60 & duration <= 83 ~ "LAT_60_83",
+    duration >= 84 & duration <= 119 ~ "LAT_84_119",
+    duration >= 120 ~ "LAT_120_PLUS",
+    TRUE ~ NA_character_
+  )
+}
+
+stage_target <- function(stage) {
+  out <- LAT_STAGE_SPECS$target[match(stage, LAT_STAGE_SPECS$stage)]
+  as.numeric(out)
+}
+
+# Select one observation within each matched-set x unit x stage AFTER the
+# risk-set-specific pre-event censoring has been applied.
+choose_one_stage_row <- function(dat) {
+  if (nrow(dat) == 0L) return(dat)
+
+  dat %>%
+    dplyr::mutate(
+      target_duration = stage_target(stage),
+      selection_distance = dplyr::if_else(
+        stage == "LAT_120_PLUS",
+        lat_duration_months - 120,
+        abs(lat_duration_months - target_duration)
+      )
+    ) %>%
+    dplyr::arrange(
+      match_set_id,
+      unit_pidp,
+      unit_episode_id,
+      stage,
+      selection_distance,
+      observed_ym
+    ) %>%
+    dplyr::group_by(match_set_id, unit_pidp, unit_episode_id, stage) %>%
+    dplyr::slice_head(n = 1L) %>%
+    dplyr::ungroup()
+}
+
+# Keep matched sets that have exactly one treated unit and >=1 control unit.
+prune_match_index <- function(idx) {
+  idx %>%
+    dplyr::group_by(match_set_id) %>%
+    dplyr::filter(
+      sum(treated == 1L) == 1L,
+      sum(treated == 0L) >= 1L
+    ) %>%
+    dplyr::ungroup()
+}
+
+# Build risk-set matching. Controls are compared at the SAME LAT relationship
+# duration as the treated relationship's actual cohabitation time.
+#
+# Modes:
+#   primary: a later conservatively linked cohabitation can itself establish that
+#            the control remained in the focal LAT relationship through the risk
+#            time; alternatively an observed LAT interview at/beyond risk time can.
+#   observed: control MUST have an observed LAT interview at/beyond risk time;
+#             later cohabitation is allowed.
+#   strict: control must have no observed linked cohabitation anywhere AND must
+#           have an observed LAT interview at/beyond risk time.
+build_riskset_match_index <- function(
+    event_data,
+    strict_never_cohab_controls = FALSE,
+    require_observed_LAT_at_risk_time = FALSE) {
+
+  if (strict_never_cohab_controls && require_observed_LAT_at_risk_time) {
+    mode_prefix <- "STRICT_"
+  } else if (strict_never_cohab_controls) {
+    mode_prefix <- "STRICT_"
+  } else if (require_observed_LAT_at_risk_time) {
+    mode_prefix <- "OBSERVED_"
+  } else {
+    mode_prefix <- "RISKSET_"
+  }
+
+  treated <- event_data %>%
+    dplyr::filter(
+      linked_cohab_any %in% TRUE,
+      is.finite(months_LATstart_to_cohab),
+      months_LATstart_to_cohab > 0
+    ) %>%
+    dplyr::arrange(pidp, onset_ym) %>%
+    dplyr::mutate(
+      match_set_id = paste0(mode_prefix, "COHAB_", dplyr::row_number())
+    )
+
+  controls <- event_data
+  if (strict_never_cohab_controls) {
+    controls <- controls %>% dplyr::filter(!linked_cohab_any)
+  }
+
+  if (nrow(treated) == 0L || nrow(controls) == 0L) {
+    return(tibble::tibble())
+  }
+
+  tr <- treated %>% dplyr::rename_with(~ paste0("tr_", .x))
+  ct <- controls %>% dplyr::rename_with(~ paste0("ct_", .x))
+
+  candidates <- tr %>%
+    dplyr::inner_join(
+      ct,
+      by = c(
+        "tr_sex" = "ct_sex",
+        "tr_positive_wave" = "ct_positive_wave"
+      ),
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::filter(
+      tr_pidp != ct_pidp,
+      abs(tr_age - ct_age) <= MATCH_AGE_CALIPER,
+      abs(tr_baseline_month - ct_baseline_month) <= MATCH_BASELINE_MONTH_CALIPER,
+      abs(tr_baseline_to_positive_months - ct_baseline_to_positive_months) <=
+        MATCH_FOLLOWUP_INTERVAL_CALIPER
+    ) %>%
+    dplyr::mutate(
+      risk_duration_months = tr_months_LATstart_to_cohab,
+      ct_pseudo_event_ym = ct_onset_ym + risk_duration_months,
+      ct_no_cohab_by_risk_time =
+        is.na(ct_linked_cohab_start_ym) |
+        ct_linked_cohab_start_ym > ct_pseudo_event_ym,
+      ct_primary_at_risk_evidence = dplyr::case_when(
+        !is.na(ct_linked_cohab_start_ym) &
+          ct_linked_cohab_start_ym > ct_pseudo_event_ym ~ TRUE,
+        ct_last_lat_interview_ym >= ct_pseudo_event_ym ~ TRUE,
+        TRUE ~ FALSE
+      )
+    ) %>%
+    dplyr::filter(ct_no_cohab_by_risk_time, ct_primary_at_risk_evidence)
+
+  if (require_observed_LAT_at_risk_time) {
+    candidates <- candidates %>%
+      dplyr::filter(ct_last_lat_interview_ym >= ct_pseudo_event_ym)
+  }
+
+  if (strict_never_cohab_controls) {
+    candidates <- candidates %>%
+      dplyr::filter(
+        is.na(ct_linked_cohab_start_ym),
+        ct_last_lat_interview_ym >= ct_pseudo_event_ym
+      )
+  }
+
+  retained <- candidates %>%
+    dplyr::count(tr_match_set_id, name = "n_controls") %>%
+    dplyr::filter(n_controls >= MIN_CONTROLS_PER_SET)
+
+  candidates <- candidates %>%
+    dplyr::inner_join(retained, by = "tr_match_set_id")
+
+  if (nrow(candidates) == 0L) return(tibble::tibble())
+
+  treated_index <- candidates %>%
+    dplyr::distinct(
+      tr_match_set_id,
+      tr_pidp,
+      tr_episode_id,
+      tr_onset_ym,
+      tr_linked_cohab_start_ym,
+      tr_months_LATstart_to_cohab,
+      n_controls
+    ) %>%
+    dplyr::transmute(
+      match_set_id = tr_match_set_id,
+      unit_pidp = tr_pidp,
+      unit_episode_id = tr_episode_id,
+      unit_onset_ym = tr_onset_ym,
+      unit_actual_cohab_ym = tr_linked_cohab_start_ym,
+      treated = 1L,
+      condition = "future_cohabiter",
+      risk_duration_months = tr_months_LATstart_to_cohab,
+      pseudo_event_ym = tr_linked_cohab_start_ym,
+      n_controls,
+      weight = 1
+    )
+
+  control_index <- candidates %>%
+    dplyr::distinct(
+      tr_match_set_id,
+      ct_pidp,
+      ct_episode_id,
+      ct_onset_ym,
+      ct_linked_cohab_start_ym,
+      tr_months_LATstart_to_cohab,
+      ct_pseudo_event_ym,
+      n_controls
+    ) %>%
+    dplyr::transmute(
+      match_set_id = tr_match_set_id,
+      unit_pidp = ct_pidp,
+      unit_episode_id = ct_episode_id,
+      unit_onset_ym = ct_onset_ym,
+      unit_actual_cohab_ym = ct_linked_cohab_start_ym,
+      treated = 0L,
+      condition = "continuing_LAT_control",
+      risk_duration_months = tr_months_LATstart_to_cohab,
+      pseudo_event_ym = ct_pseudo_event_ym,
+      n_controls,
+      weight = 1 / n_controls
+    )
+
+  dplyr::bind_rows(treated_index, control_index) %>%
+    prune_match_index() %>%
+    dplyr::arrange(match_set_id, dplyr::desc(treated), unit_pidp)
+}
+
+summarise_match_index <- function(idx, label) {
+  if (nrow(idx) == 0L) {
+    return(tibble::tibble(
+      analysis = label,
+      matched_sets = 0L,
+      treated_relationships = 0L,
+      unique_control_relationships = 0L,
+      unique_control_people = 0L,
+      median_controls_per_set = NA_real_,
+      min_controls_per_set = NA_real_,
+      max_controls_per_set = NA_real_,
+      median_risk_duration_months = NA_real_
+    ))
+  }
+
+  tr <- idx %>% dplyr::filter(treated == 1L)
+  ct <- idx %>% dplyr::filter(treated == 0L)
+
+  tibble::tibble(
+    analysis = label,
+    matched_sets = dplyr::n_distinct(tr$match_set_id),
+    treated_relationships = dplyr::n_distinct(tr$unit_episode_id),
+    unique_control_relationships = dplyr::n_distinct(ct$unit_episode_id),
+    unique_control_people = dplyr::n_distinct(ct$unit_pidp),
+    median_controls_per_set = stats::median(tr$n_controls),
+    min_controls_per_set = min(tr$n_controls),
+    max_controls_per_set = max(tr$n_controls),
+    median_risk_duration_months = stats::median(tr$risk_duration_months)
+  )
+}
+
+# Sequential treated-retention audit. This distinguishes losses attributable to
+# matching calipers from losses attributable to the risk-set control definition.
+matching_attrition_audit <- function(
+    event_data,
+    analysis_label,
+    strict_never_cohab_controls = FALSE,
+    require_observed_LAT_at_risk_time = FALSE) {
+
+  treated <- event_data %>%
+    dplyr::filter(
+      linked_cohab_any %in% TRUE,
+      is.finite(months_LATstart_to_cohab),
+      months_LATstart_to_cohab > 0
+    ) %>%
+    dplyr::arrange(pidp, onset_ym) %>%
+    dplyr::mutate(tr_key = paste0(pidp, "__", episode_id))
+
+  controls <- event_data
+  if (strict_never_cohab_controls) {
+    controls <- controls %>% dplyr::filter(!linked_cohab_any)
+  }
+
+  n0 <- nrow(treated)
+
+  retain_count <- function(x) {
+    if (nrow(x) == 0L) return(0L)
+    dplyr::n_distinct(x$tr_key)
+  }
+
+  mk_row <- function(step, n, prev) {
+    tibble::tibble(
+      analysis = analysis_label,
+      step = step,
+      treated_progressors_retained = as.integer(n),
+      lost_from_previous_step = as.integer(prev - n),
+      percent_of_all_progressors = ifelse(n0 > 0, 100 * n / n0, NA_real_)
+    )
+  }
+
+  tr <- treated %>% dplyr::rename_with(~ paste0("tr_", .x))
+  ct <- controls %>% dplyr::rename_with(~ paste0("ct_", .x))
+
+  s1 <- tr %>%
+    dplyr::inner_join(
+      ct,
+      by = c("tr_sex" = "ct_sex", "tr_positive_wave" = "ct_positive_wave"),
+      relationship = "many-to-many"
+    )
+  s1$tr_key <- s1$tr_tr_key
+
+  s2 <- s1 %>% dplyr::filter(tr_pidp != ct_pidp)
+  s3 <- s2 %>% dplyr::filter(abs(tr_age - ct_age) <= MATCH_AGE_CALIPER)
+  s4 <- s3 %>%
+    dplyr::filter(abs(tr_baseline_month - ct_baseline_month) <= MATCH_BASELINE_MONTH_CALIPER)
+  s5 <- s4 %>%
+    dplyr::filter(
+      abs(tr_baseline_to_positive_months - ct_baseline_to_positive_months) <=
+        MATCH_FOLLOWUP_INTERVAL_CALIPER
+    ) %>%
+    dplyr::mutate(
+      risk_duration_months = tr_months_LATstart_to_cohab,
+      ct_pseudo_event_ym = ct_onset_ym + risk_duration_months
+    )
+
+  s6 <- s5 %>%
+    dplyr::filter(
+      is.na(ct_linked_cohab_start_ym) |
+        ct_linked_cohab_start_ym > ct_pseudo_event_ym
+    )
+
+  s7 <- s6 %>%
+    dplyr::filter(
+      (!is.na(ct_linked_cohab_start_ym) &
+         ct_linked_cohab_start_ym > ct_pseudo_event_ym) |
+        ct_last_lat_interview_ym >= ct_pseudo_event_ym
+    )
+
+  if (require_observed_LAT_at_risk_time) {
+    s8 <- s7 %>% dplyr::filter(ct_last_lat_interview_ym >= ct_pseudo_event_ym)
+    final_label <- "observed LAT at/beyond matched risk time"
+  } else if (strict_never_cohab_controls) {
+    s8 <- s7 %>%
+      dplyr::filter(
+        is.na(ct_linked_cohab_start_ym),
+        ct_last_lat_interview_ym >= ct_pseudo_event_ym
+      )
+    final_label <- "never cohabits + observed LAT at/beyond risk time"
+  } else {
+    s8 <- s7
+    final_label <- "primary at-risk evidence"
+  }
+
+  counts <- c(
+    n0,
+    retain_count(s1),
+    retain_count(s2),
+    retain_count(s3),
+    retain_count(s4),
+    retain_count(s5),
+    retain_count(s6),
+    retain_count(s7),
+    retain_count(s8)
+  )
+
+  steps <- c(
+    "all any-time incident-LAT cohabitation progressors",
+    "at least one same-sex + same-positive-wave candidate control",
+    "different respondent",
+    paste0("age within +/-", MATCH_AGE_CALIPER, " year"),
+    paste0("baseline month within +/-", MATCH_BASELINE_MONTH_CALIPER, " months"),
+    paste0("baseline-to-first-LAT interval within +/-", MATCH_FOLLOWUP_INTERVAL_CALIPER, " months"),
+    "control has not cohabited by matched risk time",
+    "control has primary evidence of remaining LAT through risk time",
+    final_label
+  )
+
+  purrr::map2_dfr(seq_along(steps), seq_along(steps), function(i, j) {
+    prev <- if (i == 1L) counts[[1]] else counts[[i - 1L]]
+    mk_row(steps[[i]], counts[[i]], prev)
+  })
+}
+
+# Achieved balance after matching. Continuous variables compare each treated
+# relationship with the weighted mean of its controls within its matched set.
+achieved_onset_balance <- function(match_index, event_data, analysis_label) {
+  if (nrow(match_index) == 0L) return(tibble::tibble())
+
+  d <- match_index %>%
+    dplyr::inner_join(
+      event_data %>%
+        dplyr::select(
+          pidp, episode_id, age, baseline_month, positive_month,
+          baseline_to_positive_months, onset_ym, sex, positive_wave
+        ),
+      by = c("unit_pidp" = "pidp", "unit_episode_id" = "episode_id"),
+      relationship = "many-to-one"
+    )
+
+  numeric_vars <- c(
+    "age", "baseline_month", "positive_month",
+    "baseline_to_positive_months", "onset_ym"
+  )
+
+  numeric_balance <- purrr::map_dfr(numeric_vars, function(v) {
+    ss <- d %>%
+      dplyr::group_by(match_set_id) %>%
+      dplyr::summarise(
+        treated_value = {
+          z <- .data[[v]][treated == 1L]
+          if (length(z) == 0L) NA_real_ else as.numeric(z[[1]])
+        },
+        control_weighted_mean = {
+          x <- as.numeric(.data[[v]][treated == 0L])
+          w <- weight[treated == 0L]
+          ok <- is.finite(x) & is.finite(w)
+          if (!any(ok)) NA_real_ else stats::weighted.mean(x[ok], w[ok])
+        },
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        signed_difference = treated_value - control_weighted_mean,
+        absolute_difference = abs(signed_difference)
+      )
+
+    tibble::tibble(
+      analysis = analysis_label,
+      variable = v,
+      matched_sets_with_data = sum(is.finite(ss$signed_difference)),
+      mean_signed_difference = mean(ss$signed_difference, na.rm = TRUE),
+      mean_absolute_difference = mean(ss$absolute_difference, na.rm = TRUE),
+      median_absolute_difference = stats::median(ss$absolute_difference, na.rm = TRUE),
+      max_absolute_difference = max(ss$absolute_difference, na.rm = TRUE),
+      exact_match_failure_sets = NA_integer_
+    )
+  })
+
+  exact_balance <- tibble::tibble(
+    analysis = analysis_label,
+    variable = c("sex_exact_match", "positive_wave_exact_match"),
+    matched_sets_with_data = dplyr::n_distinct(d$match_set_id),
+    mean_signed_difference = NA_real_,
+    mean_absolute_difference = NA_real_,
+    median_absolute_difference = NA_real_,
+    max_absolute_difference = NA_real_,
+    exact_match_failure_sets = c(
+      d %>%
+        dplyr::group_by(match_set_id) %>%
+        dplyr::summarise(ok = dplyr::n_distinct(sex) == 1L, .groups = "drop") %>%
+        dplyr::summarise(n = sum(!ok)) %>%
+        dplyr::pull(n),
+      d %>%
+        dplyr::group_by(match_set_id) %>%
+        dplyr::summarise(ok = dplyr::n_distinct(positive_wave) == 1L, .groups = "drop") %>%
+        dplyr::summarise(n = sum(!ok)) %>%
+        dplyr::pull(n)
+    )
+  )
+
+  dplyr::bind_rows(numeric_balance, exact_balance)
+}
+
+# Construct a risk-set-specific trajectory stack. Crucially, every row is
+# censored strictly before pseudo_event_ym. For treated units this is the actual
+# cohabitation month. For controls it is the same LAT duration as the treated
+# event in that matched set.
+build_trajectory_stack <- function(match_index, first_lat_ref, lat_rows_incident) {
+
+  if (nrow(match_index) == 0L) return(tibble::tibble())
+
+  first_rows <- match_index %>%
+    dplyr::inner_join(
+      first_lat_ref,
+      by = c(
+        "unit_pidp" = "pidp",
+        "unit_episode_id" = "episode_id"
+      ),
+      relationship = "many-to-one"
+    ) %>%
+    dplyr::filter(observed_ym < pseudo_event_ym) %>%
+    dplyr::transmute(
+      match_set_id,
+      unit_pidp,
+      unit_episode_id,
+      treated,
+      condition,
+      weight,
+      risk_duration_months,
+      pseudo_event_ym,
+      unit_actual_cohab_ym,
+      stage = "first_LAT",
+      lat_duration_months,
+      observed_ym,
+      life_sat_z,
+      distress_z
+    )
+
+  first_ref_times <- first_lat_ref %>%
+    dplyr::select(
+      pidp, episode_id, first_lat_reference_ym = observed_ym
+    )
+
+  later_candidates <- match_index %>%
+    dplyr::inner_join(
+      lat_rows_incident,
+      by = c(
+        "unit_pidp" = "pidp",
+        "unit_episode_id" = "episode_id"
+      ),
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::left_join(
+      first_ref_times,
+      by = c(
+        "unit_pidp" = "pidp",
+        "unit_episode_id" = "episode_id"
+      ),
+      relationship = "many-to-one"
+    ) %>%
+    dplyr::filter(
+      observed_ym > first_lat_reference_ym,
+      observed_ym < pseudo_event_ym,
+      # Extra safeguard: if a control itself later cohabits, included psychology
+      # must also precede the control's OWN actual cohabitation.
+      is.na(unit_actual_cohab_ym) | observed_ym < unit_actual_cohab_ym
+    ) %>%
+    dplyr::mutate(stage = assign_lat_stage(lat_duration_months)) %>%
+    dplyr::filter(!is.na(stage)) %>%
+    choose_one_stage_row() %>%
+    dplyr::transmute(
+      match_set_id,
+      unit_pidp,
+      unit_episode_id,
+      treated,
+      condition,
+      weight,
+      risk_duration_months,
+      pseudo_event_ym,
+      unit_actual_cohab_ym,
+      stage,
+      lat_duration_months,
+      observed_ym,
+      life_sat_z,
+      distress_z
+    )
+
+  dplyr::bind_rows(first_rows, later_candidates) %>%
+    dplyr::mutate(
+      stage = factor(stage, levels = LAT_STAGE_ORDER, ordered = TRUE),
+      match_person_fe = paste(match_set_id, unit_episode_id, sep = "__P__"),
+      match_stage_fe = paste(match_set_id, as.character(stage), sep = "__S__")
+    ) %>%
+    dplyr::arrange(match_set_id, dplyr::desc(treated), unit_pidp, stage)
+}
+
+fit_trajectory <- function(stack, outcome_var, model_stub) {
+  d <- stack %>%
+    dplyr::filter(is.finite(.data[[outcome_var]])) %>%
+    dplyr::group_by(match_set_id, stage) %>%
+    dplyr::mutate(
+      has_treated_at_stage = any(treated == 1L),
+      n_controls_at_stage = sum(treated == 0L)
+    ) %>%
+    dplyr::filter(has_treated_at_stage, n_controls_at_stage >= 1L) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      # Re-normalize controls within each actually observed set x stage cell.
+      # This prevents control attrition at later stages from shrinking the total
+      # comparison weight below the treated weight.
+      model_weight = dplyr::if_else(
+        treated == 1L,
+        1,
+        1 / n_controls_at_stage
+      )
+    )
+
+  if (nrow(d) == 0L) return(NULL)
+
+  fml <- stats::as.formula(
+    paste0(
+      outcome_var,
+      " ~ i(stage, treated, ref = 'first_LAT') | match_person_fe + match_stage_fe"
+    )
+  )
+
+  safe_feols(
+    fml,
+    data = d,
+    name = model_stub,
+    weights = ~model_weight,
+    vcov = ~unit_pidp
+  )
+}
+
+# Stage support relevant to identification: a matched set contributes to a
+# stage-specific interaction only if the treated unit and >=1 control have the
+# outcome at BOTH first_LAT and the target stage.
+stage_support_for_outcome <- function(stack, outcome_var, outcome_label, analysis_label) {
+  if (nrow(stack) == 0L) return(tibble::tibble())
+
+  purrr::map_dfr(LAT_STAGE_SPECS$stage, function(target_stage) {
+    d <- stack %>%
+      dplyr::filter(
+        as.character(stage) %in% c("first_LAT", target_stage),
+        is.finite(.data[[outcome_var]])
+      )
+
+    complete_units <- d %>%
+      dplyr::group_by(match_set_id, unit_episode_id, treated) %>%
+      dplyr::summarise(
+        has_first = any(as.character(stage) == "first_LAT"),
+        has_target = any(as.character(stage) == target_stage),
+        .groups = "drop"
+      ) %>%
+      dplyr::filter(has_first, has_target)
+
+    ok_sets <- complete_units %>%
+      dplyr::group_by(match_set_id) %>%
+      dplyr::summarise(
+        complete_treated = any(treated == 1L),
+        complete_controls = sum(treated == 0L),
+        .groups = "drop"
+      ) %>%
+      dplyr::filter(complete_treated, complete_controls >= 1L)
+
+    tibble::tibble(
+      analysis = analysis_label,
+      outcome = outcome_label,
+      stage = target_stage,
+      outcome_complete_matched_sets = nrow(ok_sets),
+      treated_sets = nrow(ok_sets),
+      complete_control_units = ifelse(
+        nrow(ok_sets) > 0L,
+        sum(ok_sets$complete_controls),
+        0L
+      )
+    )
+  })
+}
+
+fit_balanced_stage <- function(
+    stack,
+    target_stage,
+    outcome_var,
+    outcome_label,
+    analysis_label,
+    model_stub) {
+
+  d <- stack %>%
+    dplyr::filter(
+      as.character(stage) %in% c("first_LAT", target_stage),
+      is.finite(.data[[outcome_var]])
+    )
+
+  complete_units <- d %>%
+    dplyr::group_by(match_set_id, unit_episode_id, treated) %>%
+    dplyr::summarise(
+      has_first = any(as.character(stage) == "first_LAT"),
+      has_target = any(as.character(stage) == target_stage),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(has_first, has_target)
+
+  ok_sets_tbl <- complete_units %>%
+    dplyr::group_by(match_set_id) %>%
+    dplyr::summarise(
+      complete_treated = any(treated == 1L),
+      complete_controls = sum(treated == 0L),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(complete_treated, complete_controls >= 1L)
+
+  ok_sets <- ok_sets_tbl$match_set_id
+
+  keep_units <- complete_units %>%
+    dplyr::filter(match_set_id %in% ok_sets) %>%
+    dplyr::select(match_set_id, unit_episode_id)
+
+  d <- d %>%
+    dplyr::inner_join(
+      keep_units,
+      by = c("match_set_id", "unit_episode_id"),
+      relationship = "many-to-one"
+    )
+
+  if (length(ok_sets) < 2L || nrow(d) == 0L) {
+    return(tibble::tibble(
+      analysis = analysis_label,
+      outcome = outcome_label,
+      target_stage = target_stage,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value = NA_real_,
+      matched_sets = length(ok_sets),
+      status = "INSUFFICIENT_BALANCED_SETS"
+    ))
+  }
+
+  set_controls <- d %>%
+    dplyr::filter(treated == 0L) %>%
+    dplyr::distinct(match_set_id, unit_episode_id) %>%
+    dplyr::count(match_set_id, name = "n_bal_controls")
+
+  d <- d %>%
+    dplyr::left_join(set_controls, by = "match_set_id") %>%
+    dplyr::mutate(
+      weight_balanced = dplyr::if_else(treated == 1L, 1, 1 / n_bal_controls),
+      stage_bal = factor(
+        as.character(stage),
+        levels = c("first_LAT", target_stage),
+        ordered = TRUE
+      ),
+      match_stage_fe_bal = paste(match_set_id, as.character(stage_bal), sep = "__SB__")
+    )
+
+  fml <- stats::as.formula(
+    paste0(
+      outcome_var,
+      " ~ i(stage_bal, treated, ref = 'first_LAT') | ",
+      "match_person_fe + match_stage_fe_bal"
+    )
+  )
+
+  fit <- safe_feols(
+    fml,
+    data = d,
+    name = paste0(model_stub, "_", target_stage),
+    weights = ~weight_balanced,
+    vcov = ~unit_pidp
+  )
+
+  if (is.null(fit)) {
+    return(tibble::tibble(
+      analysis = analysis_label,
+      outcome = outcome_label,
+      target_stage = target_stage,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value = NA_real_,
+      matched_sets = length(ok_sets),
+      status = "MODEL_FAILED"
+    ))
+  }
+
+  nm <- names(stats::coef(fit))
+  term <- nm[stringr::str_detect(nm, fixed(target_stage))][1]
+
+  if (is.na(term) || length(term) == 0L) {
+    return(tibble::tibble(
+      analysis = analysis_label,
+      outcome = outcome_label,
+      target_stage = target_stage,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value = NA_real_,
+      matched_sets = length(ok_sets),
+      status = "TERM_NOT_ESTIMATED"
+    ))
+  }
+
+  ct <- as.data.frame(fixest::coeftable(fit))
+  est <- as.numeric(ct[term, grep("Estimate", names(ct), value = TRUE)[1]])
+  se <- as.numeric(ct[term, grep("Std", names(ct), value = TRUE)[1]])
+  p <- as.numeric(ct[term, grep("Pr", names(ct), value = TRUE)[1]])
+
+  status <- dplyr::case_when(
+    !is.finite(est) | !is.finite(se) | !is.finite(p) ~ "INSUFFICIENT_INFERENCE",
+    length(ok_sets) < MIN_BALANCED_SETS_FOR_INFERENCE ~ "DESCRIPTIVE_LOW_SUPPORT",
+    TRUE ~ "OK"
+  )
+
+  tibble::tibble(
+    analysis = analysis_label,
+    outcome = outcome_label,
+    target_stage = target_stage,
+    estimate = est,
+    std_error = ifelse(is.finite(se), se, NA_real_),
+    conf_low = ifelse(is.finite(se), est - 1.96 * se, NA_real_),
+    conf_high = ifelse(is.finite(se), est + 1.96 * se, NA_real_),
+    p_value = ifelse(is.finite(p), p, NA_real_),
+    matched_sets = length(ok_sets),
+    status
+  )
+}
+
+# First-LAT -> last-precohabitation change dataset. This uses the latest usable
+# LAT psychological observation before the matched risk-set event time and, for
+# controls that later cohabit, before their own cohabitation. It avoids broad
+# duration bins while preserving temporal ordering.
+build_first_to_last_change_dataset <- function(
+    match_index,
+    first_lat_ref,
+    lat_rows_incident,
+    outcome_var,
+    outcome_label) {
+
+  if (nrow(match_index) == 0L) return(tibble::tibble())
+
+  first <- match_index %>%
+    dplyr::inner_join(
+      first_lat_ref %>%
+        dplyr::transmute(
+          pidp, episode_id,
+          first_observed_ym = observed_ym,
+          first_value = .data[[outcome_var]]
+        ),
+      by = c("unit_pidp" = "pidp", "unit_episode_id" = "episode_id"),
+      relationship = "many-to-one"
+    ) %>%
+    dplyr::filter(is.finite(first_value))
+
+  later <- first %>%
+    dplyr::select(
+      match_set_id, unit_pidp, unit_episode_id, treated, condition,
+      pseudo_event_ym, unit_actual_cohab_ym, first_observed_ym, first_value
+    ) %>%
+    dplyr::inner_join(
+      lat_rows_incident %>%
+        dplyr::transmute(
+          pidp, episode_id,
+          last_observed_ym = observed_ym,
+          last_value = .data[[outcome_var]]
+        ),
+      by = c("unit_pidp" = "pidp", "unit_episode_id" = "episode_id"),
+      relationship = "many-to-many"
+    ) %>%
+    dplyr::filter(
+      is.finite(last_value),
+      last_observed_ym > first_observed_ym,
+      last_observed_ym < pseudo_event_ym,
+      is.na(unit_actual_cohab_ym) | last_observed_ym < unit_actual_cohab_ym,
+      last_observed_ym - first_observed_ym >= MIN_CHANGE_INTERVAL_MONTHS
+    ) %>%
+    dplyr::arrange(
+      match_set_id, unit_episode_id,
+      dplyr::desc(last_observed_ym)
+    ) %>%
+    dplyr::group_by(match_set_id, unit_episode_id, treated) %>%
+    dplyr::slice_head(n = 1L) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      change_sd = last_value - first_value,
+      elapsed_months = last_observed_ym - first_observed_ym,
+      months_last_to_pseudo_event = pseudo_event_ym - last_observed_ym
+    )
+
+  ok_sets <- later %>%
+    dplyr::group_by(match_set_id) %>%
+    dplyr::summarise(
+      has_treated = any(treated == 1L),
+      n_controls = sum(treated == 0L),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(has_treated, n_controls >= 1L)
+
+  d <- later %>%
+    dplyr::inner_join(ok_sets, by = "match_set_id") %>%
+    dplyr::mutate(
+      model_weight = dplyr::if_else(treated == 1L, 1, 1 / n_controls),
+      outcome = outcome_label
+    )
+
+  d
+}
+
+fit_first_to_last_change <- function(dat, outcome_label, model_stub, analysis_label) {
+  if (nrow(dat) == 0L || dplyr::n_distinct(dat$match_set_id) < 2L) {
+    return(tibble::tibble(
+      analysis = analysis_label,
+      outcome = outcome_label,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value = NA_real_,
+      matched_sets = dplyr::n_distinct(dat$match_set_id),
+      treated_relationships = dplyr::n_distinct(dat$unit_episode_id[dat$treated == 1L]),
+      control_relationships = dplyr::n_distinct(dat$unit_episode_id[dat$treated == 0L]),
+      median_elapsed_treated = NA_real_,
+      median_elapsed_controls = NA_real_,
+      status = "INSUFFICIENT_SETS"
+    ))
+  }
+
+  fit <- safe_feols(
+    change_sd ~ treated + elapsed_months | match_set_id,
+    data = dat,
+    name = model_stub,
+    weights = ~model_weight,
+    vcov = ~unit_pidp
+  )
+
+  if (is.null(fit) || !("treated" %in% names(stats::coef(fit)))) {
+    return(tibble::tibble(
+      analysis = analysis_label,
+      outcome = outcome_label,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      p_value = NA_real_,
+      matched_sets = dplyr::n_distinct(dat$match_set_id),
+      treated_relationships = dplyr::n_distinct(dat$unit_episode_id[dat$treated == 1L]),
+      control_relationships = dplyr::n_distinct(dat$unit_episode_id[dat$treated == 0L]),
+      median_elapsed_treated = stats::median(dat$elapsed_months[dat$treated == 1L]),
+      median_elapsed_controls = stats::median(dat$elapsed_months[dat$treated == 0L]),
+      status = "MODEL_FAILED_OR_TERM_MISSING"
+    ))
+  }
+
+  ct <- as.data.frame(fixest::coeftable(fit))
+  est <- as.numeric(ct["treated", grep("Estimate", names(ct), value = TRUE)[1]])
+  se <- as.numeric(ct["treated", grep("Std", names(ct), value = TRUE)[1]])
+  p <- as.numeric(ct["treated", grep("Pr", names(ct), value = TRUE)[1]])
+  n_sets <- dplyr::n_distinct(dat$match_set_id)
+
+  status <- dplyr::case_when(
+    !is.finite(est) | !is.finite(se) | !is.finite(p) ~ "INSUFFICIENT_INFERENCE",
+    n_sets < MIN_BALANCED_SETS_FOR_INFERENCE ~ "DESCRIPTIVE_LOW_SUPPORT",
+    TRUE ~ "OK"
+  )
+
+  tibble::tibble(
+    analysis = analysis_label,
+    outcome = outcome_label,
+    estimate = est,
+    std_error = ifelse(is.finite(se), se, NA_real_),
+    conf_low = ifelse(is.finite(se), est - 1.96 * se, NA_real_),
+    conf_high = ifelse(is.finite(se), est + 1.96 * se, NA_real_),
+    p_value = ifelse(is.finite(p), p, NA_real_),
+    matched_sets = n_sets,
+    treated_relationships = dplyr::n_distinct(dat$unit_episode_id[dat$treated == 1L]),
+    control_relationships = dplyr::n_distinct(dat$unit_episode_id[dat$treated == 0L]),
+    median_elapsed_treated = stats::median(dat$elapsed_months[dat$treated == 1L]),
+    median_elapsed_controls = stats::median(dat$elapsed_months[dat$treated == 0L]),
+    status
+  )
+}
+
+
+# ==============================================================================
+# 3. LOAD AND HARMONIZE VALIDATED INPUTS
+# ==============================================================================
+
+panel <- readRDS(PANEL_RDS)
+ph <- readRDS(PHISTORY_RDS)
+incident_events <- readRDS(INCIDENT_EVENTS_RDS)
+incident_treated_stack <- readRDS(INCIDENT_TREATED_STACK_RDS)
+
+panel <- panel %>%
+  dplyr::mutate(
+    pidp = id_chr(pidp),
+    sex = code_chr(sex)
+  )
+
+ph <- ph %>% dplyr::mutate(pidp = id_chr(pidp))
+
+# Incident-LAT absolute month indices use Stata monthly dates, whereas v4.1 uses
+# year * 12 + month - 1. Shift incident absolute month variables by 1960*12.
+V41_YM_OFFSET_FROM_STATA_MONTH <- 1960L * 12L
+
+incident_events <- incident_events %>%
+  dplyr::mutate(
+    treated_pidp = id_chr(treated_pidp),
+    treated_sex = code_chr(treated_sex),
+    dplyr::across(
+      dplyr::any_of(c("baseline_month", "positive_month", "event_month")),
+      ~ as.numeric(.x) + V41_YM_OFFSET_FROM_STATA_MONTH
+    )
+  )
+
+incident_treated_stack <- incident_treated_stack %>%
+  dplyr::mutate(
+    unit_pidp = id_chr(unit_pidp),
+    sex = code_chr(sex),
+    dplyr::across(
+      dplyr::any_of(c(
+        "interview_month_index", "event_month", "baseline_month", "endpoint_month"
+      )),
+      ~ as.numeric(.x) + V41_YM_OFFSET_FROM_STATA_MONTH
+    )
+  )
+
+required_panel <- c(
+  "pidp", "wave", "wave_n", "interview_ym", "age", "sex",
+  "ghq", "life_satisfaction", "ncrr1", "lat_relationship_start_ym"
+)
+missing_panel <- setdiff(required_panel, names(panel))
+if (length(missing_panel) > 0L) {
+  stop("v4.1 panel is missing: ", paste(missing_panel, collapse = ", "))
+}
+
+required_ph <- c(
+  "pidp", "status", "start_ym", "end_ym", "start_if", "end_if",
+  "spellno", "partner", "ongoing", "cohend", "next_status",
+  "next_partner", "next_start_ym", "next_start_if", "same_partner_next"
+)
+missing_ph <- setdiff(required_ph, names(ph))
+if (length(missing_ph) > 0L) {
+  stop("v4.1 PHISTORY object is missing: ", paste(missing_ph, collapse = ", "))
+}
+
+required_incident <- c(
+  "match_set_id", "treated_pidp", "baseline_wave", "positive_wave",
+  "baseline_month", "positive_month", "event_month", "treated_age",
+  "treated_sex", "baseline_to_positive_months"
+)
+missing_incident <- setdiff(required_incident, names(incident_events))
+if (length(missing_incident) > 0L) {
+  stop("Incident LAT event object is missing: ", paste(missing_incident, collapse = ", "))
+}
+
+required_stack <- c(
+  "match_set_id", "unit_pidp", "period", "wave_num", "age", "sex",
+  "interview_month_index", "life_sat", "ghq_wb"
+)
+missing_stack <- setdiff(required_stack, names(incident_treated_stack))
+if (length(missing_stack) > 0L) {
+  stop("Incident treated stack is missing: ", paste(missing_stack, collapse = ", "))
+}
+
+# Natural-direction psychological distress: higher = more distress.
+panel <- panel %>%
+  dplyr::mutate(
+    distress = as.numeric(ghq)
+  )
+
+write_csv_quiet(
+  tibble::tibble(
+    object = c(
+      "panel", "PHISTORY", "incident_events", "incident_treated_stack"
+    ),
+    rows = c(
+      nrow(panel), nrow(ph), nrow(incident_events), nrow(incident_treated_stack)
+    ),
+    people = c(
+      dplyr::n_distinct(panel$pidp),
+      dplyr::n_distinct(ph$pidp),
+      dplyr::n_distinct(incident_events$treated_pidp),
+      dplyr::n_distinct(incident_treated_stack$unit_pidp)
+    )
+  ),
+  "00_input_audit.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 4. RECONSTRUCT OBSERVED LAT EPISODES
+# ==============================================================================
+
+valid_ncrr <- panel %>%
+  dplyr::filter(ncrr1 %in% c(1, 2)) %>%
+  dplyr::arrange(pidp, interview_ym, wave_n) %>%
+  dplyr::group_by(pidp) %>%
+  dplyr::mutate(
+    prev_valid_ncrr1 = dplyr::lag(ncrr1),
+    prev_valid_ym = dplyr::lag(interview_ym),
+    prev_valid_lat_start = dplyr::lag(lat_relationship_start_ym),
+    valid_gap = interview_ym - prev_valid_ym,
+    start_date_shift = abs(lat_relationship_start_ym - prev_valid_lat_start),
+    new_lat_episode = ncrr1 == 1 & (
+      is.na(prev_valid_ncrr1) |
+        prev_valid_ncrr1 != 1 |
+        is.na(valid_gap) |
+        valid_gap > MAX_GAP_WITHIN_LAT_EPISODE_MONTHS |
+        (
+          !is.na(lat_relationship_start_ym) &
+            !is.na(prev_valid_lat_start) &
+            start_date_shift > MAX_LAT_START_DATE_SHIFT_MONTHS
+        )
+    ),
+    lat_episode_number = cumsum(dplyr::coalesce(new_lat_episode, FALSE)),
+    lat_episode_id = dplyr::if_else(
+      ncrr1 == 1,
+      paste0(pidp, "_LAT_", lat_episode_number),
+      NA_character_
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    pidp, interview_ym, lat_episode_id, new_lat_episode, start_date_shift, ncrr1
+  )
+
+panel_ep <- panel %>%
+  dplyr::left_join(
+    valid_ncrr %>% dplyr::select(-ncrr1),
+    by = c("pidp", "interview_ym"),
+    relationship = "one-to-one"
+  )
+
+lat_rows <- panel_ep %>%
+  dplyr::filter(ncrr1 == 1, !is.na(lat_episode_id)) %>%
+  dplyr::arrange(pidp, lat_episode_id, interview_ym) %>%
+  dplyr::group_by(lat_episode_id) %>%
+  dplyr::mutate(
+    lat_first_observed_ym = min(interview_ym, na.rm = TRUE),
+    reported_start_median = {
+      z <- lat_relationship_start_ym[!is.na(lat_relationship_start_ym)]
+      if (length(z) == 0L) NA_real_ else stats::median(z)
+    },
+    episode_reference_start_ym = dplyr::if_else(
+      !is.na(reported_start_median) & reported_start_median <= lat_first_observed_ym,
+      reported_start_median,
+      as.numeric(lat_first_observed_ym)
+    ),
+    lat_duration_months = interview_ym - episode_reference_start_ym
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(!is.na(lat_duration_months), lat_duration_months >= 0)
+
+lat_episode_audit <- lat_rows %>%
+  dplyr::group_by(pidp, lat_episode_id) %>%
+  dplyr::summarise(
+    episode_reference_start_ym = dplyr::first(episode_reference_start_ym),
+    first_lat_interview_ym = min(interview_ym),
+    last_lat_interview_ym = max(interview_ym),
+    n_lat_interviews = dplyr::n(),
+    first_lat_wave = dplyr::first(wave[order(interview_ym)]),
+    first_lat_wave_n = dplyr::first(wave_n[order(interview_ym)]),
+    first_lat_age = dplyr::first(age[order(interview_ym)]),
+    first_lat_sex = dplyr::first(sex[order(interview_ym)]),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(pidp, first_lat_interview_ym) %>%
+  dplyr::group_by(pidp) %>%
+  dplyr::mutate(next_lat_episode_first_ym = dplyr::lead(first_lat_interview_ym)) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(
+  lat_episode_audit %>%
+    dplyr::summarise(
+      lat_episodes = dplyr::n(),
+      people = dplyr::n_distinct(pidp),
+      median_lat_interviews = stats::median(n_lat_interviews),
+      episodes_with_2plus_interviews = sum(n_lat_interviews >= 2),
+      episodes_with_3plus_interviews = sum(n_lat_interviews >= 3)
+    ),
+  "01_LAT_episode_summary.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 5. LINK LAT EPISODES TO COHABITATION AT ANY LATER OBSERVED TIME
+# ==============================================================================
+
+cohab_spells <- ph %>%
+  dplyr::filter(status == 10, !is.na(start_ym), !is.na(end_ym)) %>%
+  dplyr::mutate(
+    relationship_spell_id = paste0(pidp, "_COHAB_", spellno),
+    marriage_link_ok =
+      next_status == 2 &
+      (same_partner_next | is.na(partner) | partner <= 0 |
+         is.na(next_partner) | next_partner <= 0),
+    marriage_start_ym = dplyr::if_else(
+      marriage_link_ok,
+      next_start_ym,
+      NA_real_
+    ),
+    spell_outcome = dplyr::case_when(
+      ongoing == 0 & cohend == 1 ~ "breakup",
+      ongoing == 0 & cohend == 2 ~ "marriage",
+      ongoing == 1 ~ "ongoing",
+      TRUE ~ "other"
+    )
+  ) %>%
+  dplyr::transmute(
+    pidp,
+    cohab_spellno = spellno,
+    relationship_spell_id,
+    cohab_start_ym = start_ym,
+    cohab_end_ym = end_ym,
+    cohab_start_if = start_if,
+    cohab_end_if = end_if,
+    spell_outcome,
+    marriage_start_ym
+  )
+
+# Same conservative LAT -> cohabitation linkage as the validated workflow, but
+# WITHOUT any 36-month event-time restriction.
+lat_cohab_candidates <- lat_episode_audit %>%
+  dplyr::inner_join(cohab_spells, by = "pidp", relationship = "many-to-many") %>%
+  dplyr::mutate(
+    gap_last_lat_to_cohab = cohab_start_ym - last_lat_interview_ym,
+    before_next_observed_lat_episode =
+      is.na(next_lat_episode_first_ym) |
+      cohab_start_ym < next_lat_episode_first_ym
+  ) %>%
+  dplyr::filter(
+    cohab_start_if %in% LAT_COHAB_START_FLAGS,
+    gap_last_lat_to_cohab > 0,
+    gap_last_lat_to_cohab <= LAT_COHAB_MAX_LAST_LAT_GAP,
+    before_next_observed_lat_episode
+  ) %>%
+  dplyr::group_by(pidp, lat_episode_id) %>%
+  dplyr::arrange(cohab_start_ym, cohab_spellno, .by_group = TRUE) %>%
+  dplyr::slice_head(n = 1L) %>%
+  dplyr::ungroup()
+
+lat_outcomes <- lat_episode_audit %>%
+  dplyr::left_join(
+    lat_cohab_candidates %>%
+      dplyr::select(
+        lat_episode_id,
+        linked_cohab_start_ym = cohab_start_ym,
+        linked_cohab_spell_id = relationship_spell_id,
+        linked_cohab_spell_outcome = spell_outcome,
+        gap_last_lat_to_cohab
+      ),
+    by = "lat_episode_id",
+    relationship = "one-to-one"
+  ) %>%
+  dplyr::mutate(
+    months_LATstart_to_cohab = linked_cohab_start_ym - episode_reference_start_ym,
+    linked_cohab_any =
+      !is.na(months_LATstart_to_cohab) & months_LATstart_to_cohab > 0
+  )
+
+write_csv_quiet(
+  lat_outcomes %>%
+    dplyr::summarise(
+      all_reconstructed_LAT_episodes = dplyr::n(),
+      episodes_with_any_linked_cohabitation = sum(linked_cohab_any),
+      median_LATstart_to_cohab_months = safe_median(
+        months_LATstart_to_cohab[linked_cohab_any]
+      ),
+      p25_LATstart_to_cohab_months = safe_quantile(
+        months_LATstart_to_cohab[linked_cohab_any], .25
+      ),
+      p75_LATstart_to_cohab_months = safe_quantile(
+        months_LATstart_to_cohab[linked_cohab_any], .75
+      ),
+      max_LATstart_to_cohab_months = safe_max(
+        months_LATstart_to_cohab[linked_cohab_any]
+      )
+    ),
+  "02_anytime_cohabitation_link_summary.csv",
+  "diagnostics"
+)
+
+write_csv_quiet(
+  lat_outcomes %>%
+    dplyr::filter(linked_cohab_any) %>%
+    dplyr::mutate(
+      event_time_band = dplyr::case_when(
+        months_LATstart_to_cohab <= 12 ~ "1-12",
+        months_LATstart_to_cohab <= 24 ~ "13-24",
+        months_LATstart_to_cohab <= 36 ~ "25-36",
+        months_LATstart_to_cohab <= 60 ~ "37-60",
+        months_LATstart_to_cohab <= 84 ~ "61-84",
+        months_LATstart_to_cohab <= 120 ~ "85-120",
+        TRUE ~ "121+"
+      )
+    ) %>%
+    dplyr::count(event_time_band, name = "linked_cohabitations"),
+  "03_linked_cohabitation_event_time_distribution.csv",
+  "diagnostics"
+)
+
+
+# ==============================================================================
+# 6. LINK CLEAN INCIDENT LAT EVENTS TO THE RECONSTRUCTED LAT EPISODES
+# ==============================================================================
+
+incident_episode_candidates <- incident_events %>%
+  dplyr::transmute(
+    original_incident_match_set_id = match_set_id,
+    pidp = treated_pidp,
+    baseline_wave,
+    positive_wave,
+    baseline_month,
+    positive_month,
+    event_month,
+    age = treated_age,
+    sex = treated_sex,
+    baseline_to_positive_months
+  ) %>%
+  dplyr::inner_join(
+    lat_outcomes %>%
+      dplyr::select(
+        pidp,
+        lat_episode_id,
+        episode_reference_start_ym,
+        first_lat_interview_ym,
+        last_lat_interview_ym,
+        linked_cohab_start_ym,
+        months_LATstart_to_cohab,
+        linked_cohab_any
+      ),
+    by = "pidp",
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::mutate(
+    event_start_difference = abs(event_month - episode_reference_start_ym),
+    positive_interview_difference = abs(positive_month - first_lat_interview_ym)
+  ) %>%
+  dplyr::filter(
+    event_start_difference <= MAX_LAT_START_DATE_SHIFT_MONTHS,
+    positive_interview_difference <= MAX_GAP_WITHIN_LAT_EPISODE_MONTHS
+  ) %>%
+  dplyr::arrange(
+    original_incident_match_set_id,
+    event_start_difference,
+    positive_interview_difference
+  ) %>%
+  dplyr::group_by(original_incident_match_set_id) %>%
+  dplyr::slice_head(n = 1L) %>%
+  dplyr::ungroup()
+
+incident_episode_map <- incident_episode_candidates %>%
+  dplyr::transmute(
+    original_incident_match_set_id,
+    pidp,
+    episode_id = lat_episode_id,
+    onset_ym = episode_reference_start_ym,
+    first_lat_interview_ym,
+    last_lat_interview_ym,
+    baseline_wave,
+    positive_wave,
+    baseline_month,
+    positive_month,
+    age,
+    sex,
+    baseline_to_positive_months,
+    linked_cohab_start_ym,
+    months_LATstart_to_cohab,
+    linked_cohab_any,
+    event_start_difference,
+    positive_interview_difference
+  )
+
+incident_link_audit <- tibble::tibble(
+  metric = c(
+    "clean incident LAT events",
+    "incident events linked to reconstructed LAT episode",
+    "incident-link rate percent",
+    "linked incident LAT episodes with any later cohabitation",
+    "linked incident LAT episodes without linked cohabitation"
+  ),
+  value = c(
+    nrow(incident_events),
+    nrow(incident_episode_map),
+    100 * nrow(incident_episode_map) / nrow(incident_events),
+    sum(incident_episode_map$linked_cohab_any),
+    sum(!incident_episode_map$linked_cohab_any)
+  )
+)
+write_csv_quiet(
+  incident_link_audit,
+  "04_incident_LAT_episode_link_audit.csv",
+  "diagnostics"
+)
+
+if (nrow(incident_episode_map) == 0L) {
+  stop("No clean incident LAT events linked to reconstructed LAT episodes.")
+}
+
+
+# ==============================================================================
+# 7. PSYCHOLOGICAL OUTCOME SCALING AND INCIDENT LAT ROWS
+# ==============================================================================
+
+# Use the exact last-unpartnered SD from the validated incident-LAT stack, making
+# the effect scale directly comparable to the existing incident-LAT analyses.
+incident_ls_sd <- incident_treated_stack %>%
+  dplyr::filter(period == "last_unpartnered") %>%
+  dplyr::summarise(sd = safe_sd(life_sat)) %>%
+  dplyr::pull(sd)
+
+incident_distress_sd <- incident_treated_stack %>%
+  dplyr::filter(period == "last_unpartnered") %>%
+  dplyr::summarise(sd = safe_sd(-ghq_wb)) %>%
+  dplyr::pull(sd)
+
+if (!is.finite(incident_ls_sd) || incident_ls_sd <= 0 ||
+    !is.finite(incident_distress_sd) || incident_distress_sd <= 0) {
+  stop("Could not recover valid incident-LAT last-unpartnered outcome SDs.")
+}
+
+write_csv_quiet(
+  tibble::tibble(
+    outcome = c("Life satisfaction", "Psychological distress (GHQ-12)"),
+    scaling_sd = c(incident_ls_sd, incident_distress_sd),
+    scaling_sample = "exact last-unpartnered observation among clean incident LAT formers"
+  ),
+  "05_outcome_scaling.csv",
+  "diagnostics"
+)
+
+# Exact first-LAT reference observation from the validated incident-LAT stack.
+first_lat_ref <- incident_treated_stack %>%
+  dplyr::filter(period == "first_LAT") %>%
+  dplyr::inner_join(
+    incident_episode_map %>%
+      dplyr::select(
+        original_incident_match_set_id,
+        pidp,
+        episode_id,
+        onset_ym,
+        linked_cohab_start_ym
+      ),
+    by = c(
+      "match_set_id" = "original_incident_match_set_id",
+      "unit_pidp" = "pidp"
+    ),
+    relationship = "many-to-one"
+  ) %>%
+  dplyr::transmute(
+    pidp = unit_pidp,
+    episode_id,
+    observed_ym = interview_month_index,
+    lat_duration_months = observed_ym - onset_ym,
+    life_sat_z = life_sat / incident_ls_sd,
+    distress_z = (-ghq_wb) / incident_distress_sd
+  ) %>%
+  dplyr::arrange(pidp, episode_id, observed_ym) %>%
+  dplyr::group_by(pidp, episode_id) %>%
+  dplyr::slice_head(n = 1L) %>%
+  dplyr::ungroup()
+
+# All subsequent observed LAT rows for the clean incident episodes.
+lat_rows_incident <- lat_rows %>%
+  dplyr::inner_join(
+    incident_episode_map %>%
+      dplyr::select(pidp, episode_id),
+    by = c("pidp" = "pidp", "lat_episode_id" = "episode_id"),
+    relationship = "many-to-one"
+  ) %>%
+  dplyr::transmute(
+    pidp,
+    episode_id = lat_episode_id,
+    observed_ym = interview_ym,
+    lat_duration_months,
+    life_sat_z = life_satisfaction / incident_ls_sd,
+    distress_z = distress / incident_distress_sd
+  )
+
+
+# ==============================================================================
+# 8. RISK-SET MATCHING: PRIMARY + TWO CONTROL-DEFINITION SENSITIVITIES
+# ==============================================================================
+
+primary_match_index <- build_riskset_match_index(
+  incident_episode_map,
+  strict_never_cohab_controls = FALSE,
+  require_observed_LAT_at_risk_time = FALSE
+)
+
+observed_match_index <- build_riskset_match_index(
+  incident_episode_map,
+  strict_never_cohab_controls = FALSE,
+  require_observed_LAT_at_risk_time = TRUE
+)
+
+strict_match_index <- build_riskset_match_index(
+  incident_episode_map,
+  strict_never_cohab_controls = TRUE,
+  require_observed_LAT_at_risk_time = TRUE
+)
+
+match_summary <- dplyr::bind_rows(
+  summarise_match_index(
+    primary_match_index,
+    "Primary: at-risk evidence from later linked cohabitation OR observed LAT"
+  ),
+  summarise_match_index(
+    observed_match_index,
+    "Sensitivity: observed LAT at/beyond treated event-equivalent duration"
+  ),
+  summarise_match_index(
+    strict_match_index,
+    "Sensitivity: never-observed-cohab + observed LAT at/beyond risk duration"
+  )
+)
+write_csv_quiet(match_summary, "06_riskset_matching_summary.csv", "diagnostics")
+
+# Sequential matching attrition by requirement.
+matching_attrition <- dplyr::bind_rows(
+  matching_attrition_audit(
+    incident_episode_map,
+    "Primary risk-set matching",
+    strict_never_cohab_controls = FALSE,
+    require_observed_LAT_at_risk_time = FALSE
+  ),
+  matching_attrition_audit(
+    incident_episode_map,
+    "Observed-continuing-LAT sensitivity",
+    strict_never_cohab_controls = FALSE,
+    require_observed_LAT_at_risk_time = TRUE
+  ),
+  matching_attrition_audit(
+    incident_episode_map,
+    "Never-observed-cohab strict sensitivity",
+    strict_never_cohab_controls = TRUE,
+    require_observed_LAT_at_risk_time = TRUE
+  )
+)
+write_csv_quiet(
+  matching_attrition,
+  "06a_matching_attrition_by_requirement.csv",
+  "diagnostics"
+)
+
+# Achieved balance after matching.
+achieved_balance <- dplyr::bind_rows(
+  achieved_onset_balance(
+    primary_match_index,
+    incident_episode_map,
+    "Primary risk-set matching"
+  ),
+  achieved_onset_balance(
+    observed_match_index,
+    incident_episode_map,
+    "Observed-continuing-LAT sensitivity"
+  ),
+  achieved_onset_balance(
+    strict_match_index,
+    incident_episode_map,
+    "Never-observed-cohab strict sensitivity"
+  )
+)
+write_csv_quiet(
+  achieved_balance,
+  "06b_achieved_matching_balance.csv",
+  "diagnostics"
+)
+
+# Explicit treated flow.
+all_progressors <- incident_episode_map %>% dplyr::filter(linked_cohab_any)
+matched_progressor_ids <- primary_match_index %>%
+  dplyr::filter(treated == 1L) %>%
+  dplyr::distinct(unit_episode_id)
+
+progressor_flow <- tibble::tibble(
+  metric = c(
+    "linked clean incident LAT episodes",
+    "any-time linked cohabitation progressors",
+    "progressors retained after primary risk-set matching",
+    "progressors lost because no eligible primary matched control",
+    "percent of progressors retained"
+  ),
+  value = c(
+    nrow(incident_episode_map),
+    nrow(all_progressors),
+    nrow(matched_progressor_ids),
+    nrow(all_progressors) - nrow(matched_progressor_ids),
+    ifelse(
+      nrow(all_progressors) > 0,
+      100 * nrow(matched_progressor_ids) / nrow(all_progressors),
+      NA_real_
+    )
+  )
+)
+write_csv_quiet(progressor_flow, "07_progressor_sample_flow.csv", "diagnostics")
+
+# Incident-progressor cohabitation timing, specifically for the clean incident
+# cohort and separately for retained versus unmatched treated relationships.
+incident_progressor_timing <- all_progressors %>%
+  dplyr::mutate(
+    primary_match_status = dplyr::if_else(
+      episode_id %in% matched_progressor_ids$unit_episode_id,
+      "retained_primary_match",
+      "unmatched_primary"
+    ),
+    event_time_band = dplyr::case_when(
+      months_LATstart_to_cohab <= 12 ~ "1-12",
+      months_LATstart_to_cohab <= 24 ~ "13-24",
+      months_LATstart_to_cohab <= 36 ~ "25-36",
+      months_LATstart_to_cohab <= 60 ~ "37-60",
+      months_LATstart_to_cohab <= 84 ~ "61-84",
+      months_LATstart_to_cohab <= 120 ~ "85-120",
+      TRUE ~ "121+"
+    )
+  )
+
+write_csv_quiet(
+  incident_progressor_timing %>%
+    dplyr::count(primary_match_status, event_time_band, name = "progressors") %>%
+    dplyr::group_by(primary_match_status) %>%
+    dplyr::mutate(percent_within_match_status = 100 * progressors / sum(progressors)) %>%
+    dplyr::ungroup(),
+  "07a_incident_progressor_event_time_by_match_status.csv",
+  "diagnostics"
+)
+
+write_csv_quiet(
+  incident_progressor_timing %>%
+    dplyr::group_by(primary_match_status) %>%
+    dplyr::summarise(
+      progressors = dplyr::n(),
+      median_months_LATstart_to_cohab = safe_median(months_LATstart_to_cohab),
+      p25_months_LATstart_to_cohab = safe_quantile(months_LATstart_to_cohab, .25),
+      p75_months_LATstart_to_cohab = safe_quantile(months_LATstart_to_cohab, .75),
+      max_months_LATstart_to_cohab = safe_max(months_LATstart_to_cohab),
+      .groups = "drop"
+    ),
+  "07b_incident_progressor_event_time_summary_by_match_status.csv",
+  "diagnostics"
+)
+
+# Number of usable psychological observations during LAT and strictly before
+# cohabitation among all clean incident progressors. This diagnoses whether the
+# main support limitation is the annual spacing of psychological measurement.
+progressor_precohab_obs <- all_progressors %>%
+  dplyr::select(pidp, episode_id, linked_cohab_start_ym) %>%
+  dplyr::left_join(
+    lat_rows_incident,
+    by = c("pidp", "episode_id"),
+    relationship = "one-to-many"
+  ) %>%
+  dplyr::filter(is.na(observed_ym) | observed_ym < linked_cohab_start_ym) %>%
+  dplyr::group_by(pidp, episode_id) %>%
+  dplyr::summarise(
+    n_LS_precohab = sum(is.finite(life_sat_z)),
+    n_distress_precohab = sum(is.finite(distress_z)),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    primary_match_status = dplyr::if_else(
+      episode_id %in% matched_progressor_ids$unit_episode_id,
+      "retained_primary_match",
+      "unmatched_primary"
+    )
+  )
+
+progressor_precohab_obs_summary <- dplyr::bind_rows(
+  progressor_precohab_obs %>%
+    dplyr::transmute(
+      primary_match_status,
+      outcome = "Life satisfaction",
+      n_precohab_observations = n_LS_precohab
+    ),
+  progressor_precohab_obs %>%
+    dplyr::transmute(
+      primary_match_status,
+      outcome = "Psychological distress",
+      n_precohab_observations = n_distress_precohab
+    )
+) %>%
+  dplyr::mutate(
+    observation_count_category = dplyr::case_when(
+      n_precohab_observations <= 0 ~ "0",
+      n_precohab_observations == 1 ~ "1",
+      n_precohab_observations == 2 ~ "2",
+      n_precohab_observations == 3 ~ "3",
+      n_precohab_observations >= 4 ~ "4+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::count(
+    primary_match_status, outcome, observation_count_category,
+    name = "progressor_relationships"
+  ) %>%
+  dplyr::group_by(primary_match_status, outcome) %>%
+  dplyr::mutate(
+    percent_within_match_status_outcome =
+      100 * progressor_relationships / sum(progressor_relationships)
+  ) %>%
+  dplyr::ungroup()
+
+write_csv_quiet(
+  progressor_precohab_obs_summary,
+  "07c_incident_progressor_precohab_psych_observation_counts.csv",
+  "diagnostics"
+)
+
+if (SAVE_ANALYTIC_STACKS) {
+  saveRDS(primary_match_index, file.path(DATA_DIR, "primary_riskset_match_index.rds"))
+  saveRDS(observed_match_index, file.path(DATA_DIR, "observed_continuing_LAT_match_index.rds"))
+  saveRDS(strict_match_index, file.path(DATA_DIR, "strict_never_cohab_match_index.rds"))
+}
+
+
+# ==============================================================================
+# 9. BUILD PRE-COHABITATION PSYCHOLOGICAL TRAJECTORY STACKS
+# ==============================================================================
+
+primary_stack <- build_trajectory_stack(
+  primary_match_index,
+  first_lat_ref,
+  lat_rows_incident
+)
+
+observed_stack <- build_trajectory_stack(
+  observed_match_index,
+  first_lat_ref,
+  lat_rows_incident
+)
+
+strict_stack <- build_trajectory_stack(
+  strict_match_index,
+  first_lat_ref,
+  lat_rows_incident
+)
+
+# Hard temporal audit: no psychological row may occur at/after the matched event
+# time; for controls that later cohabit, no row may occur at/after own cohabitation.
+temporal_audit_one <- function(stack, label) {
+  if (nrow(stack) == 0L) {
+    return(tibble::tibble(
+      analysis = label,
+      rows = 0L,
+      rows_at_or_after_pseudo_event = 0L,
+      control_rows_at_or_after_own_cohab = 0L,
+      max_observed_minus_pseudo_event = NA_real_
+    ))
+  }
+
+  tibble::tibble(
+    analysis = label,
+    rows = nrow(stack),
+    rows_at_or_after_pseudo_event = sum(
+      stack$observed_ym >= stack$pseudo_event_ym,
+      na.rm = TRUE
+    ),
+    control_rows_at_or_after_own_cohab = sum(
+      stack$treated == 0L &
+        !is.na(stack$unit_actual_cohab_ym) &
+        stack$observed_ym >= stack$unit_actual_cohab_ym,
+      na.rm = TRUE
+    ),
+    max_observed_minus_pseudo_event = max(
+      stack$observed_ym - stack$pseudo_event_ym,
+      na.rm = TRUE
+    )
+  )
+}
+
+temporal_audit <- dplyr::bind_rows(
+  temporal_audit_one(primary_stack, "Primary risk-set stack"),
+  temporal_audit_one(observed_stack, "Observed-continuing-LAT sensitivity stack"),
+  temporal_audit_one(strict_stack, "Strict never-observed-cohab sensitivity stack")
+)
+write_csv_quiet(temporal_audit, "08_precohab_temporal_audit.csv", "diagnostics")
+
+if (any(temporal_audit$rows_at_or_after_pseudo_event > 0, na.rm = TRUE) ||
+    any(temporal_audit$control_rows_at_or_after_own_cohab > 0, na.rm = TRUE)) {
+  stop(
+    "Temporal audit failed: at least one psychological observation occurs at/after ",
+    "the relevant cohabitation censoring time. Inspect diagnostics/08_precohab_temporal_audit.csv."
+  )
+}
+
+stage_counts <- primary_stack %>%
+  dplyr::group_by(stage, treated) %>%
+  dplyr::summarise(
+    rows = dplyr::n(),
+    unique_people = dplyr::n_distinct(unit_pidp),
+    matched_sets = dplyr::n_distinct(match_set_id),
+    .groups = "drop"
+  )
+write_csv_quiet(stage_counts, "09_primary_stage_counts.csv", "diagnostics")
+
+if (SAVE_ANALYTIC_STACKS) {
+  saveRDS(primary_stack, file.path(DATA_DIR, "primary_precohab_trajectory_stack.rds"))
+  saveRDS(observed_stack, file.path(DATA_DIR, "observed_precohab_trajectory_stack.rds"))
+  saveRDS(strict_stack, file.path(DATA_DIR, "strict_precohab_trajectory_stack.rds"))
+}
+
+
+# ==============================================================================
+# 10. PRIMARY MATCHED TRAJECTORY MODELS
+# ==============================================================================
+
+primary_ls_model <- fit_trajectory(primary_stack, "life_sat_z", "PRIMARY_RISKSET_LS")
+primary_distress_model <- fit_trajectory(primary_stack, "distress_z", "PRIMARY_RISKSET_DISTRESS")
+
+# Outcome-complete support is established BEFORE inferential labels are assigned.
+primary_support <- dplyr::bind_rows(
+  stage_support_for_outcome(
+    primary_stack, "life_sat_z", "Life satisfaction", "Primary risk-set matching"
+  ),
+  stage_support_for_outcome(
+    primary_stack, "distress_z", "Psychological distress", "Primary risk-set matching"
+  )
+)
+write_csv_quiet(primary_support, "10_primary_outcome_stage_support.csv", "diagnostics")
+
+primary_stage_results <- dplyr::bind_rows(
+  coef_table(
+    primary_ls_model,
+    "Future cohabitation vs continuing LAT risk-set controls",
+    "Life satisfaction"
+  ),
+  coef_table(
+    primary_distress_model,
+    "Future cohabitation vs continuing LAT risk-set controls",
+    "Psychological distress"
+  )
+) %>%
+  dplyr::left_join(
+    primary_support %>%
+      dplyr::select(outcome, stage, treated_sets),
+    by = c("outcome", "stage")
+  ) %>%
+  dplyr::mutate(
+    status = dplyr::case_when(
+      !is.finite(std_error) | !is.finite(p_value) ~ "INSUFFICIENT_INFERENCE",
+      is.na(treated_sets) | treated_sets < MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY ~
+        "DESCRIPTIVE_LOW_SUPPORT",
+      TRUE ~ "OK"
+    ),
+    p_holm_supported_stage_outcome = {
+      p_for_adjust <- ifelse(status == "OK", p_value, NA_real_)
+      safe_p_adjust(p_for_adjust, method = "holm")
+    }
+  )
+
+write_csv_quiet(
+  primary_stage_results,
+  "T01_primary_stage_specific_trajectory_interactions.csv"
+)
+
+supported_ls_stages <- primary_support %>%
+  dplyr::filter(
+    outcome == "Life satisfaction",
+    treated_sets >= MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY
+  ) %>%
+  dplyr::pull(stage)
+
+supported_distress_stages <- primary_support %>%
+  dplyr::filter(
+    outcome == "Psychological distress",
+    treated_sets >= MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY
+  ) %>%
+  dplyr::pull(stage)
+
+# PRIMARY omnibus: only stages with adequate outcome-complete treated-set support.
+primary_joint <- dplyr::bind_rows(
+  manual_wald(
+    primary_ls_model,
+    find_stage_terms(primary_ls_model, supported_ls_stages),
+    "Future cohabitation vs continuing LAT risk-set controls",
+    "Life satisfaction",
+    paste0(
+      "PRIMARY support-qualified omnibus; stages with >=",
+      MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY,
+      " outcome-complete treated matched sets"
+    )
+  ),
+  manual_wald(
+    primary_distress_model,
+    find_stage_terms(primary_distress_model, supported_distress_stages),
+    "Future cohabitation vs continuing LAT risk-set controls",
+    "Psychological distress",
+    paste0(
+      "PRIMARY support-qualified omnibus; stages with >=",
+      MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY,
+      " outcome-complete treated matched sets"
+    )
+  )
+) %>%
+  dplyr::mutate(
+    p_holm_2_primary_outcomes = safe_p_adjust(p_value, method = "holm")
+  )
+write_csv_quiet(primary_joint, "T02_primary_support_qualified_omnibus_tests.csv")
+
+# Descriptive sensitivity only: all estimable post-LAT stages, regardless of
+# identifying support. Do not use this as the principal inferential summary when
+# some stage coefficients are based on only a handful of matched sets.
+all_stages <- LAT_STAGE_SPECS$stage
+all_estimable_joint <- dplyr::bind_rows(
+  manual_wald(
+    primary_ls_model,
+    find_stage_terms(primary_ls_model, all_stages),
+    "Future cohabitation vs continuing LAT risk-set controls",
+    "Life satisfaction",
+    "All-estimable-stage omnibus (descriptive sensitivity)"
+  ),
+  manual_wald(
+    primary_distress_model,
+    find_stage_terms(primary_distress_model, all_stages),
+    "Future cohabitation vs continuing LAT risk-set controls",
+    "Psychological distress",
+    "All-estimable-stage omnibus (descriptive sensitivity)"
+  )
+) %>%
+  dplyr::mutate(
+    p_holm_2_outcomes = safe_p_adjust(p_value, method = "holm")
+  )
+write_csv_quiet(
+  all_estimable_joint,
+  "T03_all_estimable_omnibus_descriptive_sensitivity.csv"
+)
+
+
+# ==============================================================================
+# 11. BALANCED FIRST-LAT -> TARGET-STAGE SENSITIVITIES
+# ==============================================================================
+
+balanced_results <- purrr::map_dfr(LAT_STAGE_SPECS$stage, function(stg) {
+  dplyr::bind_rows(
+    fit_balanced_stage(
+      primary_stack, stg, "life_sat_z", "Life satisfaction",
+      "Future cohabitation vs continuing LAT risk-set controls", "BAL_PRIMARY_LS"
+    ),
+    fit_balanced_stage(
+      primary_stack, stg, "distress_z", "Psychological distress",
+      "Future cohabitation vs continuing LAT risk-set controls", "BAL_PRIMARY_DISTRESS"
+    )
+  )
+}) %>%
+  dplyr::mutate(
+    p_holm_supported_balanced_tests = {
+      p_for_adjust <- ifelse(status == "OK", p_value, NA_real_)
+      safe_p_adjust(p_for_adjust, method = "holm")
+    }
+  )
+
+write_csv_quiet(
+  balanced_results,
+  "T04_balanced_firstLAT_to_target_stage_sensitivities.csv"
+)
+
+
+# ==============================================================================
+# 12. OBSERVED-CONTINUING-LAT CONTROL SENSITIVITY
+# ==============================================================================
+
+observed_ls_model <- fit_trajectory(
+  observed_stack, "life_sat_z", "OBSERVED_CONTINUING_LAT_LS"
+)
+observed_distress_model <- fit_trajectory(
+  observed_stack, "distress_z", "OBSERVED_CONTINUING_LAT_DISTRESS"
+)
+
+observed_support <- dplyr::bind_rows(
+  stage_support_for_outcome(
+    observed_stack, "life_sat_z", "Life satisfaction",
+    "Observed-continuing-LAT controls"
+  ),
+  stage_support_for_outcome(
+    observed_stack, "distress_z", "Psychological distress",
+    "Observed-continuing-LAT controls"
+  )
+)
+write_csv_quiet(
+  observed_support,
+  "11_observed_continuing_LAT_stage_support.csv",
+  "diagnostics"
+)
+
+observed_stage_results <- dplyr::bind_rows(
+  coef_table(
+    observed_ls_model,
+    "Future cohabitation vs observed-continuing-LAT controls",
+    "Life satisfaction"
+  ),
+  coef_table(
+    observed_distress_model,
+    "Future cohabitation vs observed-continuing-LAT controls",
+    "Psychological distress"
+  )
+) %>%
+  dplyr::left_join(
+    observed_support %>% dplyr::select(outcome, stage, treated_sets),
+    by = c("outcome", "stage")
+  ) %>%
+  dplyr::mutate(
+    status = dplyr::case_when(
+      !is.finite(std_error) | !is.finite(p_value) ~ "INSUFFICIENT_INFERENCE",
+      is.na(treated_sets) | treated_sets < MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY ~
+        "DESCRIPTIVE_LOW_SUPPORT",
+      TRUE ~ "OK"
+    ),
+    p_holm_supported_stage_outcome = {
+      p_for_adjust <- ifelse(status == "OK", p_value, NA_real_)
+      safe_p_adjust(p_for_adjust, method = "holm")
+    }
+  )
+write_csv_quiet(
+  observed_stage_results,
+  "T05_observed_continuing_LAT_stage_specific_results.csv"
+)
+
+observed_ls_stages <- observed_support %>%
+  dplyr::filter(
+    outcome == "Life satisfaction",
+    treated_sets >= MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY
+  ) %>%
+  dplyr::pull(stage)
+observed_distress_stages <- observed_support %>%
+  dplyr::filter(
+    outcome == "Psychological distress",
+    treated_sets >= MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY
+  ) %>%
+  dplyr::pull(stage)
+
+observed_joint <- dplyr::bind_rows(
+  manual_wald(
+    observed_ls_model,
+    find_stage_terms(observed_ls_model, observed_ls_stages),
+    "Future cohabitation vs observed-continuing-LAT controls",
+    "Life satisfaction",
+    "Observed-continuing-LAT support-qualified omnibus"
+  ),
+  manual_wald(
+    observed_distress_model,
+    find_stage_terms(observed_distress_model, observed_distress_stages),
+    "Future cohabitation vs observed-continuing-LAT controls",
+    "Psychological distress",
+    "Observed-continuing-LAT support-qualified omnibus"
+  )
+) %>%
+  dplyr::mutate(p_holm_2_outcomes = safe_p_adjust(p_value, method = "holm"))
+write_csv_quiet(
+  observed_joint,
+  "T06_observed_continuing_LAT_omnibus_tests.csv"
+)
+
+
+# ==============================================================================
+# 13. STRICT CONTROL SENSITIVITY: NEVER-OBSERVED-COHAB CONTROLS
+# ==============================================================================
+
+strict_ls_model <- fit_trajectory(
+  strict_stack, "life_sat_z", "STRICT_NEVER_COHAB_CONTROLS_LS"
+)
+strict_distress_model <- fit_trajectory(
+  strict_stack, "distress_z", "STRICT_NEVER_COHAB_CONTROLS_DISTRESS"
+)
+
+strict_support <- dplyr::bind_rows(
+  stage_support_for_outcome(
+    strict_stack, "life_sat_z", "Life satisfaction",
+    "Strict never-observed-cohab controls"
+  ),
+  stage_support_for_outcome(
+    strict_stack, "distress_z", "Psychological distress",
+    "Strict never-observed-cohab controls"
+  )
+)
+write_csv_quiet(
+  strict_support,
+  "12_strict_never_cohab_control_stage_support.csv",
+  "diagnostics"
+)
+
+strict_stage_results <- dplyr::bind_rows(
+  coef_table(
+    strict_ls_model,
+    "Future cohabitation vs never-observed-cohab continuing LAT controls",
+    "Life satisfaction"
+  ),
+  coef_table(
+    strict_distress_model,
+    "Future cohabitation vs never-observed-cohab continuing LAT controls",
+    "Psychological distress"
+  )
+) %>%
+  dplyr::left_join(
+    strict_support %>% dplyr::select(outcome, stage, treated_sets),
+    by = c("outcome", "stage")
+  ) %>%
+  dplyr::mutate(
+    status = dplyr::case_when(
+      !is.finite(std_error) | !is.finite(p_value) ~ "INSUFFICIENT_INFERENCE",
+      is.na(treated_sets) | treated_sets < MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY ~
+        "DESCRIPTIVE_LOW_SUPPORT",
+      TRUE ~ "OK"
+    ),
+    p_holm_supported_stage_outcome = {
+      p_for_adjust <- ifelse(status == "OK", p_value, NA_real_)
+      safe_p_adjust(p_for_adjust, method = "holm")
+    }
+  )
+write_csv_quiet(
+  strict_stage_results,
+  "T07_strict_never_cohab_stage_specific_results.csv"
+)
+
+strict_ls_stages <- strict_support %>%
+  dplyr::filter(
+    outcome == "Life satisfaction",
+    treated_sets >= MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY
+  ) %>%
+  dplyr::pull(stage)
+strict_distress_stages <- strict_support %>%
+  dplyr::filter(
+    outcome == "Psychological distress",
+    treated_sets >= MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY
+  ) %>%
+  dplyr::pull(stage)
+
+strict_joint <- dplyr::bind_rows(
+  manual_wald(
+    strict_ls_model,
+    find_stage_terms(strict_ls_model, strict_ls_stages),
+    "Future cohabitation vs never-observed-cohab continuing LAT controls",
+    "Life satisfaction",
+    "Strict-control support-qualified omnibus"
+  ),
+  manual_wald(
+    strict_distress_model,
+    find_stage_terms(strict_distress_model, strict_distress_stages),
+    "Future cohabitation vs never-observed-cohab continuing LAT controls",
+    "Psychological distress",
+    "Strict-control support-qualified omnibus"
+  )
+) %>%
+  dplyr::mutate(p_holm_2_outcomes = safe_p_adjust(p_value, method = "holm"))
+write_csv_quiet(strict_joint, "T08_strict_never_cohab_omnibus_tests.csv")
+
+
+# ==============================================================================
+# 14. FIRST-LAT -> LAST-PRECOHABITATION CHANGE SENSITIVITY
+# ==============================================================================
+
+change_ls_data <- build_first_to_last_change_dataset(
+  primary_match_index,
+  first_lat_ref,
+  lat_rows_incident,
+  "life_sat_z",
+  "Life satisfaction"
+)
+
+change_distress_data <- build_first_to_last_change_dataset(
+  primary_match_index,
+  first_lat_ref,
+  lat_rows_incident,
+  "distress_z",
+  "Psychological distress"
+)
+
+if (SAVE_ANALYTIC_STACKS) {
+  saveRDS(change_ls_data, file.path(DATA_DIR, "first_to_last_precohab_change_LS.rds"))
+  saveRDS(change_distress_data, file.path(DATA_DIR, "first_to_last_precohab_change_distress.rds"))
+}
+
+first_to_last_support <- dplyr::bind_rows(
+  change_ls_data %>%
+    dplyr::summarise(
+      outcome = "Life satisfaction",
+      matched_sets = dplyr::n_distinct(match_set_id),
+      treated_relationships = dplyr::n_distinct(unit_episode_id[treated == 1L]),
+      control_relationships = dplyr::n_distinct(unit_episode_id[treated == 0L]),
+      median_elapsed_treated = safe_median(elapsed_months[treated == 1L]),
+      median_elapsed_controls = safe_median(elapsed_months[treated == 0L]),
+      median_last_to_event_treated = safe_median(months_last_to_pseudo_event[treated == 1L]),
+      median_last_to_event_controls = safe_median(months_last_to_pseudo_event[treated == 0L])
+    ),
+  change_distress_data %>%
+    dplyr::summarise(
+      outcome = "Psychological distress",
+      matched_sets = dplyr::n_distinct(match_set_id),
+      treated_relationships = dplyr::n_distinct(unit_episode_id[treated == 1L]),
+      control_relationships = dplyr::n_distinct(unit_episode_id[treated == 0L]),
+      median_elapsed_treated = safe_median(elapsed_months[treated == 1L]),
+      median_elapsed_controls = safe_median(elapsed_months[treated == 0L]),
+      median_last_to_event_treated = safe_median(months_last_to_pseudo_event[treated == 1L]),
+      median_last_to_event_controls = safe_median(months_last_to_pseudo_event[treated == 0L])
+    )
+)
+write_csv_quiet(
+  first_to_last_support,
+  "13_first_to_last_precohab_change_support.csv",
+  "diagnostics"
+)
+
+first_to_last_results <- dplyr::bind_rows(
+  fit_first_to_last_change(
+    change_ls_data,
+    "Life satisfaction",
+    "FIRST_TO_LAST_PRECOHAB_LS",
+    "First LAT -> last pre-event LAT change; adjusted for exact elapsed months"
+  ),
+  fit_first_to_last_change(
+    change_distress_data,
+    "Psychological distress",
+    "FIRST_TO_LAST_PRECOHAB_DISTRESS",
+    "First LAT -> last pre-event LAT change; adjusted for exact elapsed months"
+  )
+) %>%
+  dplyr::mutate(
+    p_holm_2_outcomes = {
+      p_for_adjust <- ifelse(status == "OK", p_value, NA_real_)
+      safe_p_adjust(p_for_adjust, method = "holm")
+    }
+  )
+write_csv_quiet(
+  first_to_last_results,
+  "T09_first_to_last_precohab_change_sensitivity.csv"
+)
+
+
+# ==============================================================================
+# 15. DESCRIPTIVE MEANS BY STAGE AND GROUP
+# ==============================================================================
+
+primary_descriptives <- primary_stack %>%
+  tidyr::pivot_longer(
+    cols = c(life_sat_z, distress_z),
+    names_to = "outcome",
+    values_to = "value_sd"
+  ) %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(
+      outcome,
+      life_sat_z = "Life satisfaction",
+      distress_z = "Psychological distress"
+    )
+  ) %>%
+  dplyr::filter(is.finite(value_sd)) %>%
+  dplyr::group_by(stage, treated, condition, outcome) %>%
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    people = dplyr::n_distinct(unit_pidp),
+    matched_sets = dplyr::n_distinct(match_set_id),
+    mean_sd = mean(value_sd),
+    sd = stats::sd(value_sd),
+    se = sd / sqrt(n_rows),
+    conf_low = mean_sd - 1.96 * se,
+    conf_high = mean_sd + 1.96 * se,
+    .groups = "drop"
+  )
+write_csv_quiet(primary_descriptives, "T10_descriptive_stage_means.csv")
+
+
+# ==============================================================================
+# 16. KEY SYNTHESIS OUTPUT
+# ==============================================================================
+
+key_results <- dplyr::bind_rows(
+  primary_joint %>%
+    dplyr::transmute(
+      evidence = "PRIMARY support-qualified omnibus",
+      analysis, outcome, stage = NA_character_,
+      estimate = NA_real_, conf_low = NA_real_, conf_high = NA_real_,
+      p_value, adjusted_p = p_holm_2_primary_outcomes,
+      support = paste0("df=", df), status
+    ),
+  primary_stage_results %>%
+    dplyr::transmute(
+      evidence = "Primary stage-specific",
+      analysis, outcome, stage, estimate, conf_low, conf_high, p_value,
+      adjusted_p = p_holm_supported_stage_outcome,
+      support = paste0("treated_sets=", treated_sets), status
+    ),
+  balanced_results %>%
+    dplyr::transmute(
+      evidence = "Balanced first-LAT -> target-stage sensitivity",
+      analysis, outcome, stage = target_stage, estimate, conf_low, conf_high, p_value,
+      adjusted_p = p_holm_supported_balanced_tests,
+      support = paste0("matched_sets=", matched_sets), status
+    ),
+  observed_joint %>%
+    dplyr::transmute(
+      evidence = "Observed-continuing-LAT control sensitivity",
+      analysis, outcome, stage = NA_character_,
+      estimate = NA_real_, conf_low = NA_real_, conf_high = NA_real_,
+      p_value, adjusted_p = p_holm_2_outcomes,
+      support = paste0("df=", df), status
+    ),
+  strict_joint %>%
+    dplyr::transmute(
+      evidence = "Never-observed-cohab control sensitivity",
+      analysis, outcome, stage = NA_character_,
+      estimate = NA_real_, conf_low = NA_real_, conf_high = NA_real_,
+      p_value, adjusted_p = p_holm_2_outcomes,
+      support = paste0("df=", df), status
+    ),
+  first_to_last_results %>%
+    dplyr::transmute(
+      evidence = "First-LAT -> last-precohab change sensitivity",
+      analysis, outcome, stage = NA_character_, estimate, conf_low, conf_high, p_value,
+      adjusted_p = p_holm_2_outcomes,
+      support = paste0("matched_sets=", matched_sets), status
+    )
+)
+
+write_csv_quiet(key_results, "Z00_KEY_incident_LAT_to_cohab_no36_results.csv")
+
+
+# ==============================================================================
+# 17. OUTPUT CHECK, README, SESSION INFORMATION
+# ==============================================================================
+
+expected_outputs <- c(
+  "diagnostics/00_input_audit.csv",
+  "diagnostics/01_LAT_episode_summary.csv",
+  "diagnostics/02_anytime_cohabitation_link_summary.csv",
+  "diagnostics/03_linked_cohabitation_event_time_distribution.csv",
+  "diagnostics/04_incident_LAT_episode_link_audit.csv",
+  "diagnostics/05_outcome_scaling.csv",
+  "diagnostics/06_riskset_matching_summary.csv",
+  "diagnostics/06a_matching_attrition_by_requirement.csv",
+  "diagnostics/06b_achieved_matching_balance.csv",
+  "diagnostics/07_progressor_sample_flow.csv",
+  "diagnostics/07a_incident_progressor_event_time_by_match_status.csv",
+  "diagnostics/07b_incident_progressor_event_time_summary_by_match_status.csv",
+  "diagnostics/07c_incident_progressor_precohab_psych_observation_counts.csv",
+  "diagnostics/08_precohab_temporal_audit.csv",
+  "diagnostics/09_primary_stage_counts.csv",
+  "diagnostics/10_primary_outcome_stage_support.csv",
+  "diagnostics/11_observed_continuing_LAT_stage_support.csv",
+  "diagnostics/12_strict_never_cohab_control_stage_support.csv",
+  "diagnostics/13_first_to_last_precohab_change_support.csv",
+  "tables/T01_primary_stage_specific_trajectory_interactions.csv",
+  "tables/T02_primary_support_qualified_omnibus_tests.csv",
+  "tables/T03_all_estimable_omnibus_descriptive_sensitivity.csv",
+  "tables/T04_balanced_firstLAT_to_target_stage_sensitivities.csv",
+  "tables/T05_observed_continuing_LAT_stage_specific_results.csv",
+  "tables/T06_observed_continuing_LAT_omnibus_tests.csv",
+  "tables/T07_strict_never_cohab_stage_specific_results.csv",
+  "tables/T08_strict_never_cohab_omnibus_tests.csv",
+  "tables/T09_first_to_last_precohab_change_sensitivity.csv",
+  "tables/T10_descriptive_stage_means.csv",
+  "tables/Z00_KEY_incident_LAT_to_cohab_no36_results.csv"
+)
+
+output_check <- tibble::tibble(
+  file = expected_outputs,
+  exists = file.exists(file.path(OUT_DIR, expected_outputs))
+)
+write_csv_quiet(output_check, "98_output_check.csv", "diagnostics")
+
+capture.output(sessionInfo(), file = file.path(DIAG_DIR, "99_sessionInfo.txt"))
+
+readme_lines <- c(
+  "UKHLS INCIDENT LAT -> COHABITATION: NO 36-MONTH HORIZON - v2 AUDIT ENHANCED",
+  "Risk-set matched psychological trajectory analysis",
+  "",
+  paste0("V4.1 directory: ", normalizePath(V41_OUT_DIR, winslash = "/", mustWork = FALSE)),
+  paste0("Incident LAT directory: ", normalizePath(INCIDENT_LAT_DIR, winslash = "/", mustWork = FALSE)),
+  paste0("Output directory: ", normalizePath(OUT_DIR, winslash = "/", mustWork = FALSE)),
+  "",
+  "PRIMARY ESTIMAND",
+  "Among clean incident LAT relationships, compare psychological change during LAT",
+  "between focal relationships that subsequently cohabit and comparable incident LAT",
+  "relationships that remain LAT through the same relationship duration.",
+  "",
+  "NO FIXED FOLLOW-UP HORIZON",
+  "Cohabitation may occur at any later observed time. No <=36-month restriction is used.",
+  "",
+  "PRIMARY RISK-SET CONTROLS",
+  "For a treated LAT episode cohabiting d months after LAT onset, controls must be",
+  "at risk through duration d. Primary at-risk evidence can be an observed LAT",
+  "interview at/beyond d or a conservatively linked later LAT->cohabitation transition.",
+  "",
+  "OBSERVED-CONTINUING-LAT SENSITIVITY",
+  "Every control must have an observed LAT interview at or beyond the treated event-",
+  "equivalent duration. Controls may still cohabit later.",
+  "",
+  "STRICT NEVER-COHAB SENSITIVITY",
+  "Controls have no observed linked cohabitation and must have observed LAT support",
+  "through the treated event-equivalent duration.",
+  "",
+  "TEMPORAL RESTRICTION",
+  "Every psychological observation is strictly before the matched cohabitation time.",
+  "For controls who later cohabit, every included row is also before their own",
+  "cohabitation transition. Post-cohabitation psychology is never analyzed.",
+  "",
+  "PRIMARY INFERENCE",
+  paste0(
+    "Only duration stages with >=",
+    MIN_TREATED_SETS_FOR_SUPPORT_SENSITIVITY,
+    " outcome-complete treated matched sets enter the primary omnibus."
+  ),
+  "The all-estimable-stage omnibus is descriptive only when sparse stages are present.",
+  "",
+  "FIRST-TO-LAST CHANGE SENSITIVITY",
+  "Uses the latest available LAT psychological observation before the matched risk",
+  "time, requires at least 6 months since first LAT, and adjusts for exact elapsed",
+  "months. This avoids relying exclusively on broad LAT-duration bins.",
+  "",
+  "OUTCOME DIRECTION",
+  "Life satisfaction: positive progressor differential = more favorable trajectory.",
+  "Psychological distress (GHQ-12): negative progressor differential = more favorable trajectory.",
+  "",
+  "INTERPRETATION",
+  "Trajectory differentiation is compatible with relationship development, selective",
+  "progression, and/or anticipation. It is not a causal anticipation effect."
+)
+write_txt(readme_lines, "00_READ_ME_FIRST.txt", "diagnostics")
+
+cat("\nAnalysis complete.\n")
+cat("Output directory:\n  ", OUT_DIR, "\n\n", sep = "")
+print(output_check)
+
+################################################################################
+# END
+################################################################################

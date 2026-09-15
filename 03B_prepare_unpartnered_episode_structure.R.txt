@@ -1,0 +1,493 @@
+################################################################################
+# UKHLS NON-OVERLAPPING CLEAN-UNPARTNERED EPISODE PREPARATION
+# Reproducibility-package dependency for latent stable-trait / WPVS H1 analyses
+################################################################################
+#
+# PURPOSE
+# -------
+# Construct the non-overlapping clean-unpartnered episode identifiers and follow-
+# up boundaries required by the latent stable/WPVS Cox selection workflow.
+#
+# This script contains DATA PREPARATION ONLY. It deliberately does NOT select
+# psychological baselines using historical means/deviations and does NOT estimate
+# selection models. Psychological baseline eligibility is determined later from
+# the latent T-specific score lookups.
+#
+# The output directory/file names are retained exactly as expected by the
+# validated UKHLS_H1_latent_stable_WPVS_selection_v1.R workflow.
+################################################################################
+
+required_packages <- c("dplyr", "tibble", "readr", "stringr")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop("Install required package(s): ", paste(missing_packages, collapse = ", "))
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+})
+options(dplyr.summarise.inform = FALSE)
+
+# ------------------------------------------------------------------------------
+# 1. PATHS
+# ------------------------------------------------------------------------------
+COMMON_STATA_DIR <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "UKDA-6614-stata/stata/stata14_se"
+)
+
+NCRR1_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "psychological_selection_UKHLS_wave3plus_NCRR1_v3_current_unpartnered_primary"
+)
+STRICT_UNPARTNERED_RDS <- file.path(
+  NCRR1_DIR,
+  "NCRR1_v3_formation_analytic_base.rds"
+)
+
+v41_candidates <- c(
+  file.path(getwd(), "UKHLS_REVISED_selection_development_proximity_v4_1"),
+  file.path(COMMON_STATA_DIR, "UKHLS_REVISED_selection_development_proximity_v4_1"),
+  file.path(
+    "D:/Documenti/psicologia/big data/Understanding Society+BHPS",
+    "UKHLS_REVISED_selection_development_proximity_v4_1"
+  )
+)
+
+v41_exists <- v41_candidates[
+  file.exists(file.path(v41_candidates, "data", "01_panel_person_wave.rds")) &
+    file.exists(file.path(v41_candidates, "data", "02_phistory_clean.rds"))
+]
+if (length(v41_exists) == 0L) {
+  stop(
+    "Could not locate the validated v4.1 output directory.\n",
+    "Edit v41_candidates or set V41_OUT_DIR manually."
+  )
+}
+V41_OUT_DIR <- v41_exists[[1L]]
+
+PANEL_RDS <- file.path(V41_OUT_DIR, "data", "01_panel_person_wave.rds")
+PHISTORY_RDS <- file.path(V41_OUT_DIR, "data", "02_phistory_clean.rds")
+COMBINED_PANEL_RDS <- file.path(
+  COMMON_STATA_DIR,
+  "first_marriage_Tminus5_T0_diagnostic",
+  "combined_person_wave_panel.rds"
+)
+
+OUT_DIR <- file.path(
+  COMMON_STATA_DIR,
+  "unpartnered_episode_cohab_marriage_feasibility_v1"
+)
+DIAG_DIR <- file.path(OUT_DIR, "diagnostics")
+DATA_DIR <- file.path(OUT_DIR, "data")
+for (d in c(OUT_DIR, DIAG_DIR, DATA_DIR)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+V41_YM_OFFSET_FROM_STATA_MONTH <- 1960L * 12L
+PH_STATUS_MARRIED <- 2L
+PH_STATUS_CIVIL_PARTNER <- 3L
+PH_STATUS_COHAB <- 10L
+PH_UNION_STATUSES <- c(PH_STATUS_MARRIED, PH_STATUS_CIVIL_PARTNER, PH_STATUS_COHAB)
+PANEL_PARTNERED_STATUSES <- c("cohab", "married", "civil_partner")
+
+# ------------------------------------------------------------------------------
+# 2. HELPERS
+# ------------------------------------------------------------------------------
+id_chr <- function(x) {
+  z <- x
+  if (
+    inherits(z, "haven_labelled") ||
+      inherits(z, "labelled") ||
+      inherits(z, "haven_labelled_spss")
+  ) z <- unclass(z)
+  if (is.factor(z)) z <- as.character(z)
+  if (is.numeric(z) || is.integer(z)) {
+    out <- ifelse(
+      is.na(z), NA_character_,
+      format(z, scientific = FALSE, trim = TRUE, digits = 22)
+    )
+    out <- sub("\\.0+$", "", out)
+    return(out)
+  }
+  out <- trimws(as.character(z))
+  out[out %in% c("", "NA", "NaN")] <- NA_character_
+  sub("\\.0+$", "", out)
+}
+
+safe_min <- function(x) {
+  z <- suppressWarnings(as.numeric(x))
+  z <- z[is.finite(z)]
+  if (length(z) == 0L) NA_real_ else min(z)
+}
+
+safe_median <- function(x) {
+  z <- suppressWarnings(as.numeric(x))
+  z <- z[is.finite(z)]
+  if (length(z) == 0L) NA_real_ else stats::median(z)
+}
+
+safe_max <- function(x) {
+  z <- suppressWarnings(as.numeric(x))
+  z <- z[is.finite(z)]
+  if (length(z) == 0L) NA_real_ else max(z)
+}
+
+write_csv_quiet <- function(x, filename) {
+  readr::write_csv(
+    x,
+    file.path(DIAG_DIR, filename),
+    na = "",
+    progress = FALSE
+  )
+}
+
+episode_uid_fun <- function(pidp, episode_num) {
+  paste0(pidp, "__UNP_EP__", episode_num)
+}
+
+# ------------------------------------------------------------------------------
+# 3. LOAD AND VALIDATE INPUTS
+# ------------------------------------------------------------------------------
+required_inputs <- c(
+  STRICT_UNPARTNERED_RDS,
+  PANEL_RDS,
+  PHISTORY_RDS,
+  COMBINED_PANEL_RDS
+)
+missing_inputs <- required_inputs[!file.exists(required_inputs)]
+if (length(missing_inputs) > 0L) {
+  stop("Missing required input file(s):\n", paste(missing_inputs, collapse = "\n"))
+}
+
+formation_raw <- readRDS(STRICT_UNPARTNERED_RDS)
+panel_raw <- readRDS(PANEL_RDS)
+ph_raw <- readRDS(PHISTORY_RDS)
+combined_raw <- readRDS(COMBINED_PANEL_RDS)
+
+required_formation <- c(
+  "pidp_key", "wave_num", "interview_month_index",
+  "interview_year", "interview_month", "age_c", "sex"
+)
+required_panel <- c("pidp", "wave_n", "interview_ym", "ncrr1")
+required_combined <- c("pidp", "survey", "wave_num", "status")
+required_ph <- c("pidp", "status", "start_ym")
+
+for (chk in list(
+  list(obj = formation_raw, vars = required_formation, label = "clean-unpartnered base"),
+  list(obj = panel_raw, vars = required_panel, label = "v4.1 panel"),
+  list(obj = combined_raw, vars = required_combined, label = "combined person-wave panel"),
+  list(obj = ph_raw, vars = required_ph, label = "v4.1 PHISTORY")
+)) {
+  miss <- setdiff(chk$vars, names(chk$obj))
+  if (length(miss) > 0L) {
+    stop(chk$label, " is missing: ", paste(miss, collapse = ", "))
+  }
+}
+
+formation <- formation_raw %>%
+  dplyr::transmute(
+    pidp = id_chr(pidp_key),
+    wave_n = suppressWarnings(as.integer(wave_num)),
+    clean_ym_stata = suppressWarnings(as.numeric(interview_month_index)),
+    clean_ym = suppressWarnings(as.numeric(interview_month_index)) +
+      V41_YM_OFFSET_FROM_STATA_MONTH,
+    interview_year = suppressWarnings(as.integer(interview_year)),
+    interview_month = suppressWarnings(as.integer(interview_month)),
+    age_c = suppressWarnings(as.numeric(age_c)),
+    sex = as.character(sex)
+  ) %>%
+  dplyr::filter(!is.na(pidp), !is.na(wave_n), is.finite(clean_ym))
+
+status_lookup <- combined_raw %>%
+  dplyr::transmute(
+    pidp = id_chr(pidp),
+    survey = as.character(survey),
+    wave_n = suppressWarnings(as.integer(wave_num)),
+    status = tolower(as.character(status))
+  ) %>%
+  dplyr::filter(survey == "UKHLS", !is.na(pidp), !is.na(wave_n)) %>%
+  dplyr::select(pidp, wave_n, status)
+
+if (anyDuplicated(status_lookup[c("pidp", "wave_n")]) > 0L) {
+  stop("UKHLS status lookup is not unique by pidp x wave.")
+}
+
+panel <- panel_raw %>%
+  dplyr::transmute(
+    pidp = id_chr(pidp),
+    wave_n = suppressWarnings(as.integer(wave_n)),
+    interview_ym = suppressWarnings(as.numeric(interview_ym)),
+    ncrr1 = suppressWarnings(as.numeric(ncrr1))
+  ) %>%
+  dplyr::filter(!is.na(pidp), !is.na(wave_n), is.finite(interview_ym)) %>%
+  dplyr::left_join(
+    status_lookup,
+    by = c("pidp", "wave_n"),
+    relationship = "many-to-one"
+  ) %>%
+  dplyr::arrange(pidp, interview_ym, wave_n)
+
+ph <- ph_raw %>%
+  dplyr::transmute(
+    pidp = id_chr(pidp),
+    ph_status = suppressWarnings(as.integer(status)),
+    start_ym = suppressWarnings(as.numeric(start_ym))
+  ) %>%
+  dplyr::filter(!is.na(pidp), !is.na(ph_status))
+
+input_audit <- tibble::tibble(
+  object = c(
+    "strict clean-unpartnered landmarks",
+    "v4.1 panel rows after status join",
+    "combined UKHLS status lookup rows",
+    "v4.1 PHISTORY rows"
+  ),
+  rows = c(nrow(formation), nrow(panel), nrow(status_lookup), nrow(ph)),
+  people = c(
+    dplyr::n_distinct(formation$pidp),
+    dplyr::n_distinct(panel$pidp),
+    dplyr::n_distinct(status_lookup$pidp),
+    dplyr::n_distinct(ph$pidp)
+  )
+)
+write_csv_quiet(input_audit, "00_input_audit.csv")
+
+# ------------------------------------------------------------------------------
+# 4. EXACT-WAVE ALIGNMENT AUDIT
+# ------------------------------------------------------------------------------
+panel_key <- panel %>%
+  dplyr::select(pidp, wave_n, panel_interview_ym = interview_ym) %>%
+  dplyr::distinct()
+
+alignment <- formation %>%
+  dplyr::left_join(
+    panel_key,
+    by = c("pidp", "wave_n"),
+    relationship = "many-to-many"
+  ) %>%
+  dplyr::mutate(month_difference = panel_interview_ym - clean_ym)
+
+alignment_audit <- alignment %>%
+  dplyr::summarise(
+    clean_landmarks = dplyr::n_distinct(paste(pidp, wave_n, clean_ym)),
+    rows_with_panel_wave_match = sum(!is.na(panel_interview_ym)),
+    exact_month_matches = sum(!is.na(month_difference) & abs(month_difference) < 1e-8),
+    nonzero_month_mismatches = sum(!is.na(month_difference) & abs(month_difference) >= 1e-8),
+    missing_panel_wave_match = sum(is.na(panel_interview_ym)),
+    min_clean_ym = safe_min(clean_ym),
+    median_clean_ym = safe_median(clean_ym),
+    max_clean_ym = safe_max(clean_ym)
+  )
+write_csv_quiet(alignment_audit, "01_clean_landmark_to_panel_alignment.csv")
+
+if (alignment_audit$nonzero_month_mismatches > 0L) {
+  warning("Some clean landmarks disagree with v4.1 interview timing after month-origin harmonization.")
+}
+
+# ------------------------------------------------------------------------------
+# 5. PARTNERSHIP-BOUNDARY EVENTS
+# ------------------------------------------------------------------------------
+panel_boundary_events <- panel %>%
+  dplyr::filter(
+    ncrr1 == 1 |
+      status %in% PANEL_PARTNERED_STATUSES
+  ) %>%
+  dplyr::transmute(
+    pidp,
+    event_ym = interview_ym,
+    boundary_source = dplyr::case_when(
+      ncrr1 == 1 & status %in% PANEL_PARTNERED_STATUSES ~
+        "panel LAT flag + coresidential/formal status",
+      ncrr1 == 1 ~ "panel LAT / NCRR1=1",
+      status %in% PANEL_PARTNERED_STATUSES ~
+        "panel coresidential/formal status",
+      TRUE ~ "panel partnered"
+    )
+  )
+
+ph_boundary_events <- ph %>%
+  dplyr::filter(ph_status %in% PH_UNION_STATUSES, is.finite(start_ym)) %>%
+  dplyr::transmute(
+    pidp,
+    event_ym = start_ym,
+    boundary_source = dplyr::case_when(
+      ph_status == PH_STATUS_COHAB ~ "PHISTORY cohabitation start",
+      ph_status == PH_STATUS_MARRIED ~ "PHISTORY marriage start",
+      ph_status == PH_STATUS_CIVIL_PARTNER ~ "PHISTORY civil-partnership start",
+      TRUE ~ "PHISTORY union start"
+    )
+  )
+
+boundary_events <- dplyr::bind_rows(panel_boundary_events, ph_boundary_events) %>%
+  dplyr::filter(is.finite(event_ym)) %>%
+  dplyr::distinct(pidp, event_ym, boundary_source) %>%
+  dplyr::arrange(pidp, event_ym)
+
+boundary_source_audit <- boundary_events %>%
+  dplyr::count(boundary_source, name = "boundary_events") %>%
+  dplyr::arrange(dplyr::desc(boundary_events))
+write_csv_quiet(boundary_source_audit, "03_episode_boundary_sources.csv")
+
+# ------------------------------------------------------------------------------
+# 6. CONSTRUCT NON-OVERLAPPING CLEAN-UNPARTNERED EPISODES
+# ------------------------------------------------------------------------------
+clean_landmarks <- formation %>%
+  dplyr::arrange(pidp, clean_ym, wave_n) %>%
+  dplyr::distinct(pidp, wave_n, clean_ym, .keep_all = TRUE)
+
+boundary_times_by_pidp <- split(boundary_events$event_ym, boundary_events$pidp)
+
+assign_episode_numbers <- function(.x, .y) {
+  person_id <- as.character(.y$pidp[[1L]])
+  .x <- .x %>%
+    dplyr::arrange(clean_ym, wave_n) %>%
+    dplyr::mutate(previous_clean_ym = dplyr::lag(clean_ym))
+
+  bt <- boundary_times_by_pidp[[person_id]]
+  if (is.null(bt)) bt <- numeric(0)
+  bt <- sort(unique(bt[is.finite(bt)]))
+
+  intervening_boundary <- vapply(
+    seq_len(nrow(.x)),
+    function(i) {
+      prev <- .x$previous_clean_ym[[i]]
+      curr <- .x$clean_ym[[i]]
+      if (!is.finite(prev) || !is.finite(curr) || length(bt) == 0L) return(FALSE)
+      any(bt > prev & bt < curr)
+    },
+    logical(1)
+  )
+
+  same_month_boundary_at_current <- vapply(
+    seq_len(nrow(.x)),
+    function(i) {
+      curr <- .x$clean_ym[[i]]
+      if (!is.finite(curr) || length(bt) == 0L) return(FALSE)
+      any(bt == curr)
+    },
+    logical(1)
+  )
+
+  new_episode <- seq_len(nrow(.x)) == 1L | intervening_boundary
+
+  .x %>%
+    dplyr::mutate(
+      intervening_partnership_boundary = intervening_boundary,
+      same_month_boundary_at_clean_landmark = same_month_boundary_at_current,
+      episode_num = cumsum(new_episode),
+      episode_uid = episode_uid_fun(person_id, episode_num)
+    )
+}
+
+clean_ep <- clean_landmarks %>%
+  dplyr::group_by(pidp) %>%
+  dplyr::group_modify(assign_episode_numbers) %>%
+  dplyr::ungroup()
+
+person_followup <- panel %>%
+  dplyr::group_by(pidp) %>%
+  dplyr::summarise(
+    panel_first_ym = min(interview_ym, na.rm = TRUE),
+    panel_last_ym = max(interview_ym, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+episode_summary <- clean_ep %>%
+  dplyr::group_by(pidp, episode_num, episode_uid) %>%
+  dplyr::summarise(
+    episode_start_ym = min(clean_ym),
+    episode_last_clean_ym = max(clean_ym),
+    n_clean_landmarks = dplyr::n(),
+    any_same_month_boundary = any(same_month_boundary_at_clean_landmark, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(pidp, episode_start_ym, episode_num) %>%
+  dplyr::group_by(pidp) %>%
+  dplyr::mutate(next_episode_start_ym = dplyr::lead(episode_start_ym)) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(person_followup, by = "pidp", relationship = "many-to-one") %>%
+  dplyr::mutate(
+    end_is_next_episode =
+      !is.na(next_episode_start_ym) & next_episode_start_ym <= panel_last_ym,
+    episode_followup_end_ym = dplyr::case_when(
+      end_is_next_episode ~ next_episode_start_ym,
+      TRUE ~ panel_last_ym
+    ),
+    episode_followup_months = episode_followup_end_ym - episode_start_ym
+  )
+
+construction_summary <- tibble::tibble(
+  metric = c(
+    "clean-unpartnered landmarks",
+    "people with >=1 clean landmark",
+    "constructed non-overlapping unpartnered episodes",
+    "people with >=2 constructed episodes",
+    "episodes with >1 clean landmark",
+    "clean landmarks starting a new episode after a partnership boundary",
+    "episodes with positive follow-up"
+  ),
+  value = c(
+    nrow(clean_ep),
+    dplyr::n_distinct(clean_ep$pidp),
+    nrow(episode_summary),
+    episode_summary %>% dplyr::count(pidp) %>% dplyr::filter(n >= 2L) %>% nrow(),
+    sum(episode_summary$n_clean_landmarks > 1L, na.rm = TRUE),
+    sum(clean_ep$intervening_partnership_boundary, na.rm = TRUE),
+    sum(episode_summary$episode_followup_months > 0, na.rm = TRUE)
+  )
+)
+write_csv_quiet(construction_summary, "02_episode_construction_summary.csv")
+
+followup_distribution <- episode_summary %>%
+  dplyr::summarise(
+    episodes = dplyr::n(),
+    min_months = safe_min(episode_followup_months),
+    median_months = safe_median(episode_followup_months),
+    max_months = safe_max(episode_followup_months),
+    episodes_ge12m = sum(episode_followup_months >= 12, na.rm = TRUE),
+    episodes_ge24m = sum(episode_followup_months >= 24, na.rm = TRUE),
+    episodes_ge36m = sum(episode_followup_months >= 36, na.rm = TRUE),
+    episodes_ge60m = sum(episode_followup_months >= 60, na.rm = TRUE)
+  )
+write_csv_quiet(followup_distribution, "05_episode_followup_distribution.csv")
+
+saveRDS(
+  clean_ep,
+  file.path(DATA_DIR, "clean_unpartnered_landmarks_with_episode_id.rds")
+)
+saveRDS(
+  episode_summary,
+  file.path(DATA_DIR, "clean_unpartnered_episode_summary.rds")
+)
+
+output_check <- tibble::tibble(
+  file = c(
+    file.path("diagnostics", "00_input_audit.csv"),
+    file.path("diagnostics", "01_clean_landmark_to_panel_alignment.csv"),
+    file.path("diagnostics", "02_episode_construction_summary.csv"),
+    file.path("diagnostics", "03_episode_boundary_sources.csv"),
+    file.path("diagnostics", "05_episode_followup_distribution.csv"),
+    file.path("data", "clean_unpartnered_landmarks_with_episode_id.rds"),
+    file.path("data", "clean_unpartnered_episode_summary.rds")
+  )
+) %>%
+  dplyr::mutate(exists = file.exists(file.path(OUT_DIR, file)))
+readr::write_csv(
+  output_check,
+  file.path(DIAG_DIR, "99_output_check.csv"),
+  na = "",
+  progress = FALSE
+)
+if (any(!output_check$exists)) {
+  stop("Episode preparation finished incompletely.")
+}
+
+cat("\nNon-overlapping clean-unpartnered episode objects prepared successfully.\n")
+cat("Output directory: ", OUT_DIR, "\n", sep = "")
+################################################################################

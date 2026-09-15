@@ -1,0 +1,179 @@
+################################################################################
+# MASTER REPRODUCIBILITY RUNNER
+# Psychological selection, relationship gain, maintenance/sorting, anticipation
+# BHPS / Understanding Society (UKHLS)
+#
+# The psychological-selection branch uses the FINAL wave-adjusted stable-trait /
+# WPVS decomposition. Obsolete prior-mean/deviation inferential models are not
+# part of this runner.
+################################################################################
+
+# ----------------------------- USER OPTIONS -----------------------------------
+STOP_ON_ERROR <- TRUE
+RUN_PREPARATION <- TRUE
+RUN_RDAS_DIAGNOSTIC_ADDON <- TRUE
+RUN_OPTIONAL_PARALLEL_DIAGNOSTIC <- FALSE
+
+# The component scripts retain the study paths documented in
+# 00_README_REPRODUCIBILITY.txt. Edit their path blocks if reproducing elsewhere.
+
+# -------------------------- FIND THIS DIRECTORY -------------------------------
+cmd <- commandArgs(trailingOnly = FALSE)
+file_arg <- grep("^--file=", cmd, value = TRUE)
+source_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
+if (length(file_arg) >= 1L) {
+  master_file <- sub("^--file=", "", file_arg[1L])
+  SCRIPT_DIR <- dirname(normalizePath(master_file, winslash = "/", mustWork = TRUE))
+} else if (!is.null(source_file) && nzchar(source_file)) {
+  SCRIPT_DIR <- dirname(normalizePath(source_file, winslash = "/", mustWork = TRUE))
+} else {
+  SCRIPT_DIR <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+setwd(SCRIPT_DIR)
+
+LOG_DIR <- file.path(SCRIPT_DIR, "reproduction_logs")
+dir.create(LOG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------ RUN ORDER -------------------------------------
+steps <- data.frame(
+  step = c(
+    "00A", "00B", "00C",
+    "00D", "01", "01B", "01C", "01D",
+    "02", "03A", "03B", "03C", "04", "05", "06", "07", "90"
+  ),
+  file = c(
+    "00A_prepare_person_wave_panel.R.txt",
+    "00B_prepare_interview_timing.R.txt",
+    "00C_prepare_PHISTORY.R.txt",
+    "00_dependency_core_v4_1.R.txt",
+    "01_core_relationship_development_proximity.R.txt",
+    "01B_relationship_development_sensitivities.R.txt",
+    "01C_RDAS_gradient_pair_balanced_diagnostics.R.txt",
+    "01D_Table_S2_postestimation.R.txt",
+    "02_incident_LAT_formation_gain.R.txt",
+    "03_prepare_current_unpartnered_selection_base.R.txt",
+    "03B_prepare_unpartnered_episode_structure.R.txt",
+    "UKHLS_latent_stable_WPVS_final_measurement_stage_v2_1_WAVECENTERED_AGEFIX.R.txt",
+    "UKHLS_H1_latent_stable_WPVS_selection_v1.R.txt",
+    "05_RDAS_sorting_progression.R.txt",
+    "06_LAT_to_cohabitation_pathway_no36.R.txt",
+    "07_pathway_subjective_anticipation.R.txt",
+    "90_optional_parallel_anticipation_diagnostic.R.txt"
+  ),
+  role = c(
+    "Prepare harmonized BHPS/UKHLS person-wave panel",
+    "Prepare interview-month timing panel",
+    "Clean/validate PHISTORY relationship histories",
+    "Create validated v4.1 reusable relationship panel",
+    "Primary v4.2 relationship-development and proximity analyses",
+    "Balanced common-spell and strict temporal-ordering sensitivities",
+    "Additional RDAS gradient/pair-balanced diagnostics",
+    "Reproduce and validate Table S2 Panels A, B, and D from saved trajectory models",
+    "Incident LAT formation-associated psychological change and LAT matched risk sets",
+    "Prepare exact-wave clean-unpartnered selection landmark base",
+    "Prepare non-overlapping clean-unpartnered episode structure",
+    "Estimate wave-adjusted stable-trait/WPVS measurement models and scores",
+    "Final H1 selection: stable between-person + current WPVS",
+    "Prospective RDAS sorting into marriage/breakup",
+    "Current no-fixed-horizon LAT-to-cohabitation pathway analysis",
+    "Marriage pathway plus NCRR11/NCRR12 subjective anticipation analyses",
+    "Older parallel diagnostic; not required for current primary manuscript"
+  ),
+  stringsAsFactors = FALSE
+)
+
+steps$run <- TRUE
+steps$run[steps$step %in% c("00A", "00B", "00C")] <- RUN_PREPARATION
+steps$run[steps$step == "01C"] <- RUN_RDAS_DIAGNOSTIC_ADDON
+steps$run[steps$step == "90"] <- RUN_OPTIONAL_PARALLEL_DIAGNOSTIC
+
+missing_scripts <- steps$file[
+  steps$run & !file.exists(file.path(SCRIPT_DIR, steps$file))
+]
+if (length(missing_scripts) > 0L) {
+  stop("Missing required component script(s):\n", paste(missing_scripts, collapse = "\n"))
+}
+
+rscript <- file.path(
+  R.home("bin"),
+  if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript"
+)
+if (!file.exists(rscript)) rscript <- "Rscript"
+
+run_one <- function(step, file, role) {
+  script_path <- file.path(SCRIPT_DIR, file)
+  log_path <- file.path(LOG_DIR, paste0(step, "_", sub("\\.txt$", "", basename(file)), ".log"))
+
+  cat("\n===============================================================================\n")
+  cat("STEP ", step, ": ", role, "\n", sep = "")
+  cat("Script: ", script_path, "\n", sep = "")
+  cat("Log:    ", log_path, "\n", sep = "")
+  cat("===============================================================================\n")
+
+  status <- system2(
+    rscript,
+    args = shQuote(script_path),
+    stdout = log_path,
+    stderr = log_path,
+    wait = TRUE
+  )
+
+  ok <- identical(as.integer(status), 0L)
+  cat(if (ok) "COMPLETED\n" else paste0("FAILED (exit status ", status, ")\n"))
+
+  data.frame(
+    step = step,
+    file = file,
+    role = role,
+    attempted = TRUE,
+    exit_status = as.integer(status),
+    success = ok,
+    log = normalizePath(log_path, winslash = "/", mustWork = FALSE),
+    stringsAsFactors = FALSE
+  )
+}
+
+run_log <- data.frame()
+for (i in seq_len(nrow(steps))) {
+  s <- steps[i, ]
+  if (!isTRUE(s$run)) {
+    run_log <- rbind(
+      run_log,
+      data.frame(
+        step = s$step,
+        file = s$file,
+        role = s$role,
+        attempted = FALSE,
+        exit_status = NA_integer_,
+        success = NA,
+        log = NA_character_,
+        stringsAsFactors = FALSE
+      )
+    )
+    next
+  }
+
+  ans <- run_one(s$step, s$file, s$role)
+  run_log <- rbind(run_log, ans)
+
+  if (!isTRUE(ans$success) && STOP_ON_ERROR) {
+    utils::write.csv(
+      run_log,
+      file.path(LOG_DIR, "MASTER_RUN_LOG.csv"),
+      row.names = FALSE
+    )
+    stop("Reproduction stopped at step ", s$step, ". Inspect: ", ans$log)
+  }
+}
+
+utils::write.csv(
+  run_log,
+  file.path(LOG_DIR, "MASTER_RUN_LOG.csv"),
+  row.names = FALSE
+)
+writeLines(capture.output(sessionInfo()), file.path(LOG_DIR, "MASTER_SESSION_INFO.txt"))
+
+cat("\nMaster workflow finished.\n")
+cat("Run log: ", file.path(LOG_DIR, "MASTER_RUN_LOG.csv"), "\n", sep = "")
+cat("See 00_README_REPRODUCIBILITY.txt and 01_CODEBOOK.txt for interpretation.\n")
+################################################################################

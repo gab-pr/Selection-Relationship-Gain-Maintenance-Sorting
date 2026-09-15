@@ -1,0 +1,3730 @@
+# =============================================================================
+# BHPS + UKHLS
+# PHISTORY-BASED FIRST-MARRIAGE RECONSTRUCTION, UKHLS SPSS DATE REFINEMENT, AND VALIDATION - v7 MONTHLY-DATE FIX
+#
+# This script REPLACES the previous validation workflow.
+#
+# AUTHORITATIVE PARTNERSHIP-HISTORY SOURCE:
+#   phistory_long.dta
+#
+# OPTIONAL CROSS-CHECK SOURCE:
+#   phistory_wide.dta
+#
+# User-supplied paths:
+#   D:/Documenti/psicologia/big data/Understanding Society+BHPS/
+#      Marital and Cohabitation Histories/stata/phistory_long.dta
+#
+#   D:/Documenti/psicologia/big data/Understanding Society+BHPS/
+#      Marital and Cohabitation Histories/stata/phistory_wide.dta
+#
+# PHISTORY_LONG variables used:
+#   pidp       cross-wave person identifier
+#   spellno    spell number, earliest first
+#   spellnor   spell number, recent first [OPTIONAL; absent in some releases]
+#   status     2 = marriage, 3 = civil partnership, 10 = cohabitation
+#   partner    partner pidp
+#   startdate  spell start date
+#   start_if   start-date imputation flag
+#                0 = no imputation
+#                1 = month imputed
+#                2 = whole date imputed
+#   enddate    spell end date
+#   end_if     end-date imputation flag
+#   mrgend     how marriage/civil partnership ended
+#   cohend     how cohabitation ended
+#                0 = ongoing
+#                1 = break up
+#                2 = marriage
+#   ongoing    ongoing spell indicator
+#   ttl_married
+#   ever_married
+#   lastintdate / lastinty / lastintm
+#   hhorig
+#   starty / startm
+#   endy / endm
+#
+# CORE DESIGN
+# -----------
+# 1. Keep the existing prospectively observed first-marriage candidates.
+#
+# 2. Use PHISTORY_LONG to identify each respondent's TRUE earliest marriage
+#    spell (status == 2), not merely the first marriage observed in the panel.
+#
+# 3. Validate the true first-marriage start against the prospective transition:
+#
+#       last unmarried interview < marriage start <= first married interview
+#
+#    Month-level validation is primary because PHISTORY provides starty/startm
+#    and may impute day/month components.
+#
+# 4. Classify prospective transitions as:
+#       - validated genuine first marriage
+#       - probable remarriage / earlier marriage exists
+#       - marriage date before T-1
+#       - marriage date after T0
+#       - no marriage spell in PHISTORY
+#       - incomplete marriage start month/year
+#
+# 5. Recover the cohabitation spell immediately preceding first marriage:
+#       - preferably a cohabitation spell with cohend == 2
+#       - ending in/near the first-marriage month
+#       - same partner where partner pidp is usable
+#
+# 6. Create exact continuous interview time relative to ACTUAL first marriage:
+#
+#       years_from_first_marriage =
+#           (interview_date - first_marriage_anchor_date) / 365.25
+#
+#    PHISTORY month/year is treated as month-level timing. If an exact usable
+#    PHISTORY startdate is available, it is retained separately. For a common
+#    deterministic month-level anchor, the 15th of the reported month is used.
+#
+# 7. Preserve familiar substantive labels T-5,...,T0 as YEAR landmarks, not
+#    survey waves. The model itself should use continuous elapsed years.
+#
+# =============================================================================
+
+
+# =============================================================================
+# 0. PACKAGES
+# =============================================================================
+
+pkgs <- c(
+  "haven",
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "stringr",
+  "readr",
+  "tibble"
+)
+
+missing_pkgs <- pkgs[
+  !vapply(
+    pkgs,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_pkgs) > 0L) {
+  stop(
+    "Install package(s): ",
+    paste(
+      missing_pkgs,
+      collapse = ", "
+    )
+  )
+}
+
+library(haven)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(readr)
+library(tibble)
+
+
+# =============================================================================
+# 1. PATHS
+# =============================================================================
+
+ukhls_dir <- "D:/Documenti/psicologia/big data/Understanding Society+BHPS/UKDA-6614-stata/stata/stata14_se/ukhls"
+
+ukhls_spss_dir <- "D:/Documenti/psicologia/big data/Understanding Society+BHPS/SPSS/spss/ukhls"
+
+bhps_spss_dir <- "D:/Documenti/psicologia/big data/Understanding Society+BHPS/SPSS/spss/bhps"
+
+common_stata_dir <- dirname(
+  ukhls_dir
+)
+
+first_marriage_diagnostic_dir <- file.path(
+  common_stata_dir,
+  "first_marriage_Tminus5_T0_diagnostic"
+)
+
+timing_diagnostic_dir <- file.path(
+  common_stata_dir,
+  "first_marriage_calendar_timing_diagnostic"
+)
+
+phistory_long_path <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "Marital and Cohabitation Histories/stata/phistory_long.dta"
+)
+
+phistory_wide_path <- paste0(
+  "D:/Documenti/psicologia/big data/Understanding Society+BHPS/",
+  "Marital and Cohabitation Histories/stata/phistory_wide.dta"
+)
+
+# UKHLS direct current-marriage month/year reports.
+#
+# IMPORTANT:
+# In the Stata release, f_indresp.dta does not contain the needed variables,
+# whereas they are present in the SPSS release. Therefore this workflow uses
+# the SPSS INDRESP files for this refinement step.
+#
+# The files are located recursively rather than assuming a flat directory.
+find_exact_file_recursive <- function(
+    root,
+    filename
+) {
+
+  ff <- list.files(
+    root,
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+
+  hit <- ff[
+    tolower(
+      basename(
+        ff
+      )
+    ) ==
+      tolower(
+        filename
+      )
+  ]
+
+  if (length(hit) == 0L) {
+    return(
+      NA_character_
+    )
+  }
+
+  if (length(hit) > 1L) {
+    stop(
+      "More than one file named ",
+      filename,
+      " found under:\n",
+      root,
+      "\n\n",
+      paste(
+        hit,
+        collapse = "\n"
+      )
+    )
+  }
+
+  hit[1L]
+}
+
+
+ukhls_a_indresp_path <- find_exact_file_recursive(
+  ukhls_spss_dir,
+  "a_indresp.sav"
+)
+
+ukhls_f_indresp_path <- find_exact_file_recursive(
+  ukhls_spss_dir,
+  "f_indresp.sav"
+)
+
+output_dir <- file.path(
+  common_stata_dir,
+  "first_marriage_phistory_validation"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+# =============================================================================
+# 2. REQUIRED INPUT FILES
+# =============================================================================
+
+required_paths <- c(
+  treated =
+    file.path(
+      first_marriage_diagnostic_dir,
+      "marriage_treated_first_observed.rds"
+    ),
+
+  combined_panel =
+    file.path(
+      first_marriage_diagnostic_dir,
+      "combined_person_wave_panel.rds"
+    ),
+
+  timing_panel =
+    file.path(
+      timing_diagnostic_dir,
+      "combined_interview_timing_panel.rds"
+    ),
+
+  phistory_long =
+    phistory_long_path
+)
+
+missing_paths <- required_paths[
+  !file.exists(
+    required_paths
+  )
+]
+
+if (length(missing_paths) > 0L) {
+  stop(
+    "Missing required input(s):\n",
+    paste(
+      missing_paths,
+      collapse = "\n"
+    )
+  )
+}
+
+treated <- readRDS(
+  required_paths[[
+    "treated"
+  ]]
+)
+
+combined_panel <- readRDS(
+  required_paths[[
+    "combined_panel"
+  ]]
+)
+
+timing_panel <- readRDS(
+  required_paths[[
+    "timing_panel"
+  ]]
+)
+
+phistory_long_raw <- haven::read_dta(
+  phistory_long_path
+)
+
+
+# =============================================================================
+# 3. GENERIC CLEANING UTILITIES
+# =============================================================================
+
+read_survey_file <- function(
+    path
+) {
+
+  if (is.na(path) ||
+      !file.exists(path)) {
+    stop(
+      "Survey file not found: ",
+      path
+    )
+  }
+
+  ext <- tolower(
+    tools::file_ext(
+      path
+    )
+  )
+
+  if (ext == "dta") {
+    return(
+      haven::read_dta(
+        path
+      )
+    )
+  }
+
+  if (ext == "sav") {
+    return(
+      haven::read_sav(
+        path
+      )
+    )
+  }
+
+  stop(
+    "Unsupported survey file extension: ",
+    ext,
+    " for ",
+    path
+  )
+}
+
+
+clean_int <- function(
+    x
+) {
+
+  z <- suppressWarnings(
+    as.integer(
+      as.numeric(
+        x
+      )
+    )
+  )
+
+  z[
+    !is.na(z) &
+      z < 0
+  ] <- NA_integer_
+
+  z
+}
+
+
+clean_month <- function(
+    x
+) {
+
+  z <- clean_int(
+    x
+  )
+
+  z[
+    !is.na(z) &
+      !z %in%
+        1:12
+  ] <- NA_integer_
+
+  z
+}
+
+
+clean_year <- function(
+    x
+) {
+
+  z <- clean_int(
+    x
+  )
+
+  z[
+    !is.na(z) &
+      (
+        z < 1900 |
+          z > 2035
+      )
+  ] <- NA_integer_
+
+  z
+}
+
+
+clean_code_keep_zero <- function(
+    x
+) {
+
+  z <- suppressWarnings(
+    as.integer(
+      as.numeric(
+        x
+      )
+    )
+  )
+
+  z[
+    !is.na(z) &
+      z < 0
+  ] <- NA_integer_
+
+  z
+}
+
+
+month_index <- function(
+    year,
+    month
+) {
+
+  ifelse(
+    !is.na(year) &
+      !is.na(month),
+    year *
+      12L +
+      month,
+    NA_real_
+  )
+}
+
+
+midmonth_date <- function(
+    year,
+    month
+) {
+
+  out <- rep(
+    as.Date(
+      NA
+    ),
+    length(
+      year
+    )
+  )
+
+  ok <- !is.na(year) &
+    !is.na(month)
+
+  out[
+    ok
+  ] <- as.Date(
+    sprintf(
+      "%04d-%02d-15",
+      year[
+        ok
+      ],
+      month[
+        ok
+      ]
+    )
+  )
+
+  out
+}
+
+
+clean_stata_month_index <- function(
+    x
+) {
+
+  z <- suppressWarnings(
+    as.integer(
+      as.numeric(
+        x
+      )
+    )
+  )
+
+  z[
+    !is.na(z) &
+      z < 0
+  ] <- NA_integer_
+
+  z
+}
+
+
+expected_stata_month_index <- function(
+    year,
+    month
+) {
+
+  ifelse(
+    !is.na(year) &
+      !is.na(month),
+    (year - 1960L) *
+      12L +
+      (month - 1L),
+    NA_integer_
+  )
+}
+
+
+safe_pct <- function(
+    n,
+    d
+) {
+
+  if (is.na(d) ||
+      d == 0) {
+    return(
+      NA_real_
+    )
+  }
+
+  100 *
+    n /
+    d
+}
+
+
+safe_median <- function(
+    x
+) {
+
+  x <- x[
+    is.finite(
+      x
+    )
+  ]
+
+  if (length(x) == 0L) {
+    return(
+      NA_real_
+    )
+  }
+
+  median(
+    x
+  )
+}
+
+
+safe_quantile <- function(
+    x,
+    p
+) {
+
+  x <- x[
+    is.finite(
+      x
+    )
+  ]
+
+  if (length(x) == 0L) {
+    return(
+      NA_real_
+    )
+  }
+
+  as.numeric(
+    quantile(
+      x,
+      p,
+      names =
+        FALSE
+    )
+  )
+}
+
+
+# =============================================================================
+# 4. PROSPECTIVE FIRST-OBSERVED MARRIAGE CANDIDATES
+# =============================================================================
+
+treated_base <- treated |>
+  select(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  distinct()
+
+
+# =============================================================================
+# 5. PROSPECTIVE T-1 AND T0 INTERVIEW DATES
+# =============================================================================
+#
+# T-1 and T0 here retain their ORIGINAL prospective meaning only for
+# validation:
+#
+#   T-1 = last interview at which the respondent was not married
+#   T0  = first interview at which the respondent was observed married
+#
+# After validation, the definitive temporal zero will become ACTUAL marriage.
+# =============================================================================
+
+prospective_dates <- treated_base |>
+  crossing(
+    prospective_event_time =
+      c(
+        -1L,
+        0L
+      )
+  ) |>
+  mutate(
+    wave_num =
+      event_wave +
+        prospective_event_time
+  ) |>
+  left_join(
+    timing_panel |>
+      select(
+        pidp,
+        survey,
+        wave_num,
+        interview_year,
+        interview_month,
+        interview_day,
+        interview_month_index,
+        interview_date
+      ),
+    by = c(
+      "pidp",
+      "survey",
+      "wave_num"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  # IMPORTANT:
+  # wave_num differs between T-1 and T0. If it is left as an implicit ID
+  # variable, pivot_wider() creates two rows per prospective transition.
+  # Specify the intended transition-level ID columns explicitly.
+  pivot_wider(
+    id_cols =
+      c(
+        pidp,
+        survey,
+        event_wave
+      ),
+    names_from =
+      prospective_event_time,
+    values_from =
+      c(
+        interview_year,
+        interview_month,
+        interview_day,
+        interview_month_index,
+        interview_date
+      ),
+    names_glue =
+      "{.value}_T{prospective_event_time}"
+  ) |>
+  rename(
+    last_unmarried_year =
+      `interview_year_T-1`,
+    first_married_year =
+      interview_year_T0,
+
+    last_unmarried_month =
+      `interview_month_T-1`,
+    first_married_month =
+      interview_month_T0,
+
+    last_unmarried_day =
+      `interview_day_T-1`,
+    first_married_day =
+      interview_day_T0,
+
+    last_unmarried_month_index =
+      `interview_month_index_T-1`,
+    first_married_month_index =
+      interview_month_index_T0,
+
+    last_unmarried_interview_date =
+      `interview_date_T-1`,
+    first_married_interview_date =
+      interview_date_T0
+  )
+
+
+# Assert exactly one prospective-date row per candidate transition.
+prospective_date_key_check <- prospective_dates |>
+  count(
+    pidp,
+    survey,
+    event_wave,
+    name =
+      "n_rows"
+  )
+
+if (any(
+  prospective_date_key_check$n_rows !=
+    1L
+)) {
+  stop(
+    "prospective_dates is not unique by pidp + survey + event_wave. ",
+    "Inspect prospective_date_key_check.csv."
+  )
+}
+
+write_csv(
+  prospective_date_key_check,
+  file.path(
+    output_dir,
+    "prospective_date_key_check.csv"
+  )
+)
+
+
+# =============================================================================
+# 6. CLEAN PHISTORY_LONG
+# =============================================================================
+
+required_phistory_vars <- c(
+  "pidp",
+  "spellno",
+  "status",
+  "partner",
+  "startdate",
+  "start_if",
+  "enddate",
+  "end_if",
+  "mrgend",
+  "cohend",
+  "ongoing",
+  "ttl_spells",
+  "ttl_married",
+  "ttl_cohabit",
+  "ever_married",
+  "ever_cohabit",
+  "lastintdate",
+  "lastinty",
+  "lastintm",
+  "hhorig",
+  "starty",
+  "startm",
+  "endy",
+  "endm"
+)
+
+missing_phistory_vars <- setdiff(
+  required_phistory_vars,
+  names(
+    phistory_long_raw
+  )
+)
+
+if (length(missing_phistory_vars) > 0L) {
+  stop(
+    "PHISTORY_LONG is missing expected variable(s): ",
+    paste(
+      missing_phistory_vars,
+      collapse = ", "
+    )
+  )
+}
+
+phistory_optional_variable_audit <- tibble(
+  variable = "spellnor",
+  present = "spellnor" %in% names(phistory_long_raw),
+  note = ifelse(
+    "spellnor" %in% names(phistory_long_raw),
+    "Available and retained.",
+    "Absent in this PHISTORY_LONG release; set to NA. Not required because spellno orders spells earliest first."
+  )
+)
+
+write_csv(
+  phistory_optional_variable_audit,
+  file.path(
+    output_dir,
+    "phistory_optional_variable_audit.csv"
+  )
+)
+
+
+# Preserve original haven date variables before cleaning.
+phistory_long <- phistory_long_raw |>
+  transmute(
+    pidp,
+
+    spellno =
+      clean_int(
+        spellno
+      ),
+
+    spellnor =
+      if ("spellnor" %in% names(phistory_long_raw)) {
+        clean_int(
+          phistory_long_raw$spellnor
+        )
+      } else {
+        NA_integer_
+      },
+
+    status =
+      clean_code_keep_zero(
+        status
+      ),
+
+    partner =
+      suppressWarnings(
+        as.numeric(
+          partner
+        )
+      ),
+
+    startdate_raw =
+      startdate,
+
+    start_if =
+      clean_code_keep_zero(
+        start_if
+      ),
+
+    enddate_raw =
+      enddate,
+
+    end_if =
+      clean_code_keep_zero(
+        end_if
+      ),
+
+    mrgend =
+      clean_code_keep_zero(
+        mrgend
+      ),
+
+    cohend =
+      clean_code_keep_zero(
+        cohend
+      ),
+
+    ongoing =
+      clean_code_keep_zero(
+        ongoing
+      ),
+
+    ttl_spells =
+      clean_int(
+        ttl_spells
+      ),
+
+    ttl_married =
+      clean_int(
+        ttl_married
+      ),
+
+    ttl_cohabit =
+      clean_int(
+        ttl_cohabit
+      ),
+
+    ever_married =
+      clean_code_keep_zero(
+        ever_married
+      ),
+
+    ever_cohabit =
+      clean_code_keep_zero(
+        ever_cohabit
+      ),
+
+    lastintdate_raw =
+      lastintdate,
+
+    lastinty =
+      clean_year(
+        lastinty
+      ),
+
+    lastintm =
+      clean_month(
+        lastintm
+      ),
+
+    hhorig =
+      clean_code_keep_zero(
+        hhorig
+      ),
+
+    starty =
+      clean_year(
+        starty
+      ),
+
+    startm =
+      clean_month(
+        startm
+      ),
+
+    endy =
+      clean_year(
+        endy
+      ),
+
+    endm =
+      clean_month(
+        endm
+      )
+  ) |>
+  mutate(
+    start_month_index =
+      month_index(
+        starty,
+        startm
+      ),
+
+    end_month_index =
+      month_index(
+        endy,
+        endm
+      ),
+
+    start_midmonth_date =
+      midmonth_date(
+        starty,
+        startm
+      ),
+
+    startdate_monthly_index =
+      clean_stata_month_index(
+        startdate_raw
+      ),
+
+    expected_startdate_monthly_index =
+      expected_stata_month_index(
+        starty,
+        startm
+      ),
+
+    startdate_matches_starty_startm =
+      !is.na(
+        startdate_monthly_index
+      ) &
+        !is.na(
+          expected_startdate_monthly_index
+        ) &
+        startdate_monthly_index ==
+          expected_startdate_monthly_index,
+
+    end_midmonth_date =
+      midmonth_date(
+        endy,
+        endm
+      ),
+
+    enddate_monthly_index =
+      clean_stata_month_index(
+        enddate_raw
+      ),
+
+    expected_enddate_monthly_index =
+      expected_stata_month_index(
+        endy,
+        endm
+      ),
+
+    enddate_matches_endy_endm =
+      !is.na(
+        enddate_monthly_index
+      ) &
+        !is.na(
+          expected_enddate_monthly_index
+        ) &
+        enddate_monthly_index ==
+          expected_enddate_monthly_index,
+
+    status_label =
+      case_when(
+        status == 2 ~
+          "marriage",
+
+        status == 3 ~
+          "civil_partnership",
+
+        status == 10 ~
+          "cohabitation",
+
+        TRUE ~
+          NA_character_
+      ),
+
+    start_imputation_label =
+      case_when(
+        start_if == 0 ~
+          "no_imputation",
+
+        start_if == 1 ~
+          "month_imputed",
+
+        start_if == 2 ~
+          "whole_date_imputed",
+
+        TRUE ~
+          NA_character_
+      )
+  )
+
+
+saveRDS(
+  phistory_long,
+  file.path(
+    output_dir,
+    "phistory_long_clean.rds"
+  )
+)
+
+
+# =============================================================================
+# 6B. VERIFY PHISTORY MONTHLY DATE FORMAT
+# =============================================================================
+#
+# PHISTORY startdate/enddate are Stata MONTHLY indices, not Stata daily dates.
+# For example:
+#   monthly_index = (year - 1960) * 12 + (month - 1)
+#
+# Therefore no exact marriage DAY is available from startdate. Calendar anchors
+# are set to the 15th of the reported/imputed marriage month.
+# =============================================================================
+
+phistory_startdate_format_audit <- phistory_long |>
+  filter(
+    status == 2
+  ) |>
+  summarise(
+    marriage_spells_with_both_representations =
+      sum(
+        !is.na(
+          startdate_monthly_index
+        ) &
+          !is.na(
+            expected_startdate_monthly_index
+          )
+      ),
+
+    exact_month_index_matches =
+      sum(
+        startdate_matches_starty_startm,
+        na.rm =
+          TRUE
+      ),
+
+    pct_exact_month_index_matches =
+      if_else(
+        marriage_spells_with_both_representations >
+          0,
+        100 *
+          exact_month_index_matches /
+          marriage_spells_with_both_representations,
+        NA_real_
+      ),
+
+    max_absolute_month_index_difference =
+      {
+        dd <- abs(
+          startdate_monthly_index -
+            expected_startdate_monthly_index
+        )
+
+        if (
+          all(
+            is.na(
+              dd
+            )
+          )
+        ) {
+          NA_real_
+        } else {
+          max(
+            dd,
+            na.rm =
+              TRUE
+          )
+        }
+      }
+  )
+
+
+write_csv(
+  phistory_startdate_format_audit,
+  file.path(
+    output_dir,
+    "PHISTORY_startdate_monthly_format_audit.csv"
+  )
+)
+
+
+# =============================================================================
+# 7. PHISTORY COVERAGE FOR PROSPECTIVE CANDIDATES
+# =============================================================================
+
+phistory_person_coverage <- treated_base |>
+  left_join(
+    phistory_long |>
+      distinct(
+        pidp
+      ) |>
+      mutate(
+        present_in_phistory =
+          TRUE
+      ),
+    by =
+      "pidp",
+    relationship =
+      "many-to-one"
+  ) |>
+  mutate(
+    present_in_phistory =
+      coalesce(
+        present_in_phistory,
+        FALSE
+      )
+  )
+
+write_csv(
+  phistory_person_coverage,
+  file.path(
+    output_dir,
+    "phistory_coverage_prospective_marriers.csv"
+  )
+)
+
+
+# =============================================================================
+# 8. IDENTIFY ALL MARRIAGE SPELLS AND TRUE FIRST MARRIAGE
+# =============================================================================
+
+marriage_spells <- phistory_long |>
+  filter(
+    status == 2
+  ) |>
+  arrange(
+    pidp,
+    spellno,
+    start_month_index
+  ) |>
+  group_by(
+    pidp
+  ) |>
+  mutate(
+    marriage_order_within_person =
+      row_number(),
+    n_marriage_spells_observed =
+      n()
+  ) |>
+  ungroup()
+
+
+write_csv(
+  marriage_spells,
+  file.path(
+    output_dir,
+    "phistory_marriage_spells_all.csv"
+  )
+)
+
+
+true_first_marriage <- marriage_spells |>
+  arrange(
+    pidp,
+    spellno,
+    start_month_index
+  ) |>
+  group_by(
+    pidp
+  ) |>
+  slice(
+    1L
+  ) |>
+  ungroup() |>
+  transmute(
+    pidp,
+
+    first_marriage_spellno =
+      spellno,
+
+    first_marriage_spellnor =
+      spellnor,
+
+    first_marriage_partner =
+      partner,
+
+    first_marriage_start_year =
+      starty,
+
+    first_marriage_start_month =
+      startm,
+
+    first_marriage_start_month_index =
+      start_month_index,
+
+    first_marriage_start_midmonth_date =
+      start_midmonth_date,
+
+    first_marriage_startdate_raw =
+      startdate_raw,
+
+    first_marriage_start_if =
+      start_if,
+
+    first_marriage_start_imputation =
+      start_imputation_label,
+
+    first_marriage_end_year =
+      endy,
+
+    first_marriage_end_month =
+      endm,
+
+    first_marriage_end_month_index =
+      end_month_index,
+
+    first_marriage_end_midmonth_date =
+      end_midmonth_date,
+
+    first_marriage_enddate_raw =
+      enddate_raw,
+
+    first_marriage_end_if =
+      end_if,
+
+    first_marriage_mrgend =
+      mrgend,
+
+    first_marriage_ongoing =
+      ongoing,
+
+    phistory_ttl_married =
+      ttl_married,
+
+    phistory_ever_married =
+      ever_married,
+
+    phistory_ttl_cohabit =
+      ttl_cohabit,
+
+    phistory_ever_cohabit =
+      ever_cohabit,
+
+    n_marriage_spells_observed
+  )
+
+
+write_csv(
+  true_first_marriage,
+  file.path(
+    output_dir,
+    "phistory_true_first_marriage_person_level.csv"
+  )
+)
+
+
+# =============================================================================
+# 9. IDENTIFY MARRIAGE SPELL CLOSEST TO PROSPECTIVE TRANSITION
+# =============================================================================
+#
+# This is diagnostic only. It allows us to identify prospective transitions
+# that correspond to a later marriage rather than the true first marriage.
+# =============================================================================
+
+marriage_spells_for_candidates <- treated_base |>
+  left_join(
+    prospective_dates,
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  ) |>
+  left_join(
+    marriage_spells |>
+      select(
+        pidp,
+        marriage_order_within_person,
+        spellno,
+        partner,
+        starty,
+        startm,
+        start_month_index,
+        start_if,
+        start_imputation_label
+      ),
+    by =
+      "pidp",
+    relationship =
+      "many-to-many"
+  ) |>
+  mutate(
+    marriage_start_complete =
+      !is.na(
+        start_month_index
+      ),
+
+    marriage_between_prospective_interviews =
+      marriage_start_complete &
+        !is.na(
+          last_unmarried_month_index
+        ) &
+        !is.na(
+          first_married_month_index
+        ) &
+        start_month_index >=
+          last_unmarried_month_index &
+        start_month_index <=
+          first_married_month_index,
+
+    distance_to_transition_interval_months =
+      case_when(
+
+        !marriage_start_complete ~
+          Inf,
+
+        marriage_between_prospective_interviews ~
+          0,
+
+        start_month_index <
+          last_unmarried_month_index ~
+          last_unmarried_month_index -
+            start_month_index,
+
+        start_month_index >
+          first_married_month_index ~
+          start_month_index -
+            first_married_month_index,
+
+        TRUE ~
+          Inf
+      )
+  )
+
+
+focal_marriage_spell_diagnostic <- marriage_spells_for_candidates |>
+  group_by(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  arrange(
+    desc(
+      marriage_between_prospective_interviews
+    ),
+    distance_to_transition_interval_months,
+    marriage_order_within_person,
+    .by_group =
+      TRUE
+  ) |>
+  slice(
+    1L
+  ) |>
+  ungroup() |>
+  transmute(
+    pidp,
+    survey,
+    event_wave,
+
+    focal_marriage_order_in_phistory =
+      marriage_order_within_person,
+
+    focal_marriage_spellno =
+      spellno,
+
+    focal_marriage_partner =
+      partner,
+
+    focal_marriage_start_year =
+      starty,
+
+    focal_marriage_start_month =
+      startm,
+
+    focal_marriage_start_month_index =
+      start_month_index,
+
+    focal_marriage_start_if =
+      start_if,
+
+    focal_marriage_start_imputation =
+      start_imputation_label,
+
+    focal_marriage_between_prospective_interviews =
+      marriage_between_prospective_interviews,
+
+    focal_marriage_distance_to_interval_months =
+      distance_to_transition_interval_months
+  )
+
+
+# Keep people with no marriage spell at all.
+focal_marriage_spell_diagnostic <- treated_base |>
+  left_join(
+    focal_marriage_spell_diagnostic,
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  )
+
+
+write_csv(
+  focal_marriage_spell_diagnostic,
+  file.path(
+    output_dir,
+    "phistory_focal_marriage_spell_diagnostic.csv"
+  )
+)
+
+
+# =============================================================================
+# 10. VALIDATE TRUE FIRST MARRIAGE AGAINST PROSPECTIVE TRANSITION
+# =============================================================================
+
+validation <- treated_base |>
+  left_join(
+    prospective_dates,
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  ) |>
+  left_join(
+    true_first_marriage,
+    by =
+      "pidp",
+    relationship =
+      "many-to-one"
+  ) |>
+  left_join(
+    focal_marriage_spell_diagnostic,
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  ) |>
+  mutate(
+
+    present_in_phistory =
+      pidp %in%
+        phistory_long$pidp,
+
+    any_marriage_spell_in_phistory =
+      !is.na(
+        first_marriage_spellno
+      ) |
+        !is.na(
+          first_marriage_start_month_index
+        ),
+
+    first_marriage_start_complete =
+      !is.na(
+        first_marriage_start_month_index
+      ),
+
+    first_marriage_between_last_unmarried_and_first_married =
+      first_marriage_start_complete &
+        !is.na(
+          last_unmarried_month_index
+        ) &
+        !is.na(
+          first_married_month_index
+        ) &
+        first_marriage_start_month_index >=
+          last_unmarried_month_index &
+        first_marriage_start_month_index <=
+          first_married_month_index,
+
+    first_marriage_before_last_unmarried =
+      first_marriage_start_complete &
+        !is.na(
+          last_unmarried_month_index
+        ) &
+        first_marriage_start_month_index <
+          last_unmarried_month_index,
+
+    first_marriage_after_first_married =
+      first_marriage_start_complete &
+        !is.na(
+          first_married_month_index
+        ) &
+        first_marriage_start_month_index >
+          first_married_month_index,
+
+    focal_transition_is_later_marriage =
+      coalesce(
+        focal_marriage_between_prospective_interviews,
+        FALSE
+      ) &
+        !is.na(
+          focal_marriage_order_in_phistory
+        ) &
+        focal_marriage_order_in_phistory >
+          1,
+
+    months_last_unmarried_to_first_marriage =
+      first_marriage_start_month_index -
+        last_unmarried_month_index,
+
+    months_first_marriage_to_first_married_interview =
+      first_married_month_index -
+        first_marriage_start_month_index,
+
+    validated_genuine_first_marriage =
+      first_marriage_between_last_unmarried_and_first_married,
+
+    validation_reason =
+      case_when(
+
+        !present_in_phistory ~
+          "Not present in PHISTORY_LONG",
+
+        !any_marriage_spell_in_phistory ~
+          "No marriage spell in PHISTORY_LONG",
+
+        !first_marriage_start_complete ~
+          "First marriage spell lacks usable start month/year",
+
+        first_marriage_between_last_unmarried_and_first_married ~
+          "Validated genuine first marriage",
+
+        focal_transition_is_later_marriage ~
+          "Prospective transition is a later marriage/remarriage",
+
+        first_marriage_before_last_unmarried ~
+          "True first marriage predates prospective last-unmarried interview",
+
+        first_marriage_after_first_married ~
+          "True first marriage follows prospective first-married interview",
+
+        TRUE ~
+          "Other mismatch"
+      )
+  )
+
+
+write_csv(
+  validation,
+  file.path(
+    output_dir,
+    "phistory_first_marriage_validation_person_level.csv"
+  )
+)
+
+
+# =============================================================================
+# 10B. REFINE UKHLS IMPUTED FIRST-MARRIAGE DATES USING DIRECT CURRENT-MARRIAGE
+#      MONTH/YEAR REPORTS FROM a_indresp AND f_indresp
+# =============================================================================
+#
+# In this release, the literal variables:
+#   a_lcmarm
+#   a_lcmary4
+# are wave-prefixed in the SPSS release:
+#   a_indresp.sav -> a_lcmarm / a_lcmary4
+#   f_indresp.sav -> f_lcmarm / f_lcmary4
+#
+# Refinement applies only to UKHLS validated genuine first marriages with
+# PHISTORY start_if == 1 or 2.
+#
+# A direct report is eligible to replace the PHISTORY imputed month/year only
+# when:
+#   - month/year are complete and valid; AND
+#   - the reported marriage month lies between the last prospectively unmarried
+#     and first prospectively married interviews.
+#
+# If a_indresp and f_indresp yield the SAME eligible date, this is corroborated.
+# If only one source yields an eligible date, that date is used.
+# If they yield DIFFERENT eligible dates, the case is flagged as a conflict and
+# PHISTORY is retained rather than choosing arbitrarily.
+#
+# For start_if == 0, PHISTORY remains authoritative.
+# =============================================================================
+
+required_ukhls_direct_paths <- c(
+  a_indresp_spss =
+    ukhls_a_indresp_path,
+  f_indresp_spss =
+    ukhls_f_indresp_path
+)
+
+missing_ukhls_direct_paths <- required_ukhls_direct_paths[
+  !file.exists(
+    required_ukhls_direct_paths
+  )
+]
+
+if (length(missing_ukhls_direct_paths) > 0L) {
+  stop(
+    "Missing UKHLS INDRESP file(s) needed for direct marriage-date refinement:\n",
+    paste(
+      missing_ukhls_direct_paths,
+      collapse = "\n"
+    )
+  )
+}
+
+
+read_ukhls_direct_marriage <- function(
+    path,
+    source_wave_label
+) {
+
+  dat <- read_survey_file(
+    path
+  )
+
+  # SPSS variable names are matched case-insensitively.
+  nm_lower <- tolower(
+    names(
+      dat
+    )
+  )
+
+  get_var_name_ci <- function(
+      target
+  ) {
+
+    hit <- which(
+      nm_lower ==
+        tolower(
+          target
+        )
+    )
+
+    if (length(hit) == 0L) {
+      return(
+        NA_character_
+      )
+    }
+
+    names(
+      dat
+    )[
+      hit[1L]
+    ]
+  }
+
+  pidp_var <- get_var_name_ci(
+    "pidp"
+  )
+
+  # Marriage variables are wave-prefixed in the SPSS release:
+  #   Wave a -> a_lcmarm / a_lcmary4
+  #   Wave f -> f_lcmarm / f_lcmary4
+  #
+  # Derive the expected names from source_wave_label rather than hard-coding
+  # a particular wave prefix.
+  expected_lcmarm_var <- paste0(
+    source_wave_label,
+    "_lcmarm"
+  )
+
+  expected_lcmary4_var <- paste0(
+    source_wave_label,
+    "_lcmary4"
+  )
+
+  lcmarm_var <- get_var_name_ci(
+    expected_lcmarm_var
+  )
+
+  lcmary4_var <- get_var_name_ci(
+    expected_lcmary4_var
+  )
+
+  missing <- c(
+    pidp =
+      pidp_var,
+    marriage_month =
+      lcmarm_var,
+    marriage_year =
+      lcmary4_var
+  )
+
+  missing <- names(
+    missing
+  )[
+    is.na(
+      missing
+    )
+  ]
+
+  if (length(missing) > 0L) {
+    stop(
+      basename(
+        path
+      ),
+      " is missing expected variable(s): ",
+      paste(
+        missing,
+        collapse = ", "
+      ),
+      "\nExpected wave-specific variables: ",
+      expected_lcmarm_var,
+      ", ",
+      expected_lcmary4_var,
+      "\nAvailable variables containing 'lcmar': ",
+      paste(
+        names(
+          dat
+        )[
+          grepl(
+            "lcmar",
+            names(
+              dat
+            ),
+            ignore.case = TRUE
+          )
+        ],
+        collapse = ", "
+      )
+    )
+  }
+
+  out <- tibble(
+    pidp =
+      dat[[
+        pidp_var
+      ]],
+
+    direct_source_wave =
+      source_wave_label,
+
+    direct_source_file =
+      basename(
+        path
+      ),
+
+    direct_marriage_month =
+      clean_month(
+        dat[[
+          lcmarm_var
+        ]]
+      ),
+
+    direct_marriage_year =
+      clean_year(
+        dat[[
+          lcmary4_var
+        ]]
+      )
+  ) |>
+    mutate(
+      direct_marriage_month_index =
+        month_index(
+          direct_marriage_year,
+          direct_marriage_month
+        ),
+
+      direct_marriage_midmonth_date =
+        midmonth_date(
+          direct_marriage_year,
+          direct_marriage_month
+        ),
+
+      direct_marriage_complete =
+        !is.na(
+          direct_marriage_month_index
+        )
+    )
+
+  audit <- tibble(
+    source_wave =
+      source_wave_label,
+    source_file =
+      basename(
+        path
+      ),
+    source_path =
+      path,
+    pidp_variable_used =
+      pidp_var,
+    marriage_month_variable_used =
+      lcmarm_var,
+    marriage_year_variable_used =
+      lcmary4_var,
+    n_rows =
+      nrow(
+        dat
+      ),
+    complete_direct_marriage_dates =
+      sum(
+        out$direct_marriage_complete,
+        na.rm =
+          TRUE
+      )
+  )
+
+  list(
+    data =
+      out,
+    audit =
+      audit
+  )
+}
+
+
+ukhls_direct_a <- read_ukhls_direct_marriage(
+  ukhls_a_indresp_path,
+  "a"
+)
+
+ukhls_direct_f <- read_ukhls_direct_marriage(
+  ukhls_f_indresp_path,
+  "f"
+)
+
+ukhls_direct_reports <- bind_rows(
+  ukhls_direct_a$data,
+  ukhls_direct_f$data
+)
+
+ukhls_direct_variable_audit <- bind_rows(
+  ukhls_direct_a$audit,
+  ukhls_direct_f$audit
+)
+
+ukhls_direct_source_file_audit <- tibble(
+  requested_source =
+    c(
+      "Wave a SPSS INDRESP",
+      "Wave f SPSS INDRESP"
+    ),
+  path =
+    c(
+      ukhls_a_indresp_path,
+      ukhls_f_indresp_path
+    ),
+  exists =
+    c(
+      !is.na(
+        ukhls_a_indresp_path
+      ) &&
+        file.exists(
+          ukhls_a_indresp_path
+        ),
+      !is.na(
+        ukhls_f_indresp_path
+      ) &&
+        file.exists(
+          ukhls_f_indresp_path
+        )
+    )
+)
+
+write_csv(
+  ukhls_direct_source_file_audit,
+  file.path(
+    output_dir,
+    "UKHLS_direct_current_marriage_source_file_audit.csv"
+  )
+)
+
+write_csv(
+  ukhls_direct_variable_audit,
+  file.path(
+    output_dir,
+    "UKHLS_direct_current_marriage_variable_audit.csv"
+  )
+)
+
+
+ukhls_imputed_validated <- validation |>
+  filter(
+    survey == "UKHLS",
+    validated_genuine_first_marriage,
+    first_marriage_start_if %in%
+      c(
+        1L,
+        2L
+      )
+  ) |>
+  select(
+    pidp,
+    survey,
+    event_wave,
+    first_marriage_start_if,
+    first_marriage_start_imputation,
+    first_marriage_start_year,
+    first_marriage_start_month,
+    first_marriage_start_month_index,
+    first_marriage_start_midmonth_date,
+    last_unmarried_month_index,
+    first_married_month_index,
+    last_unmarried_interview_date,
+    first_married_interview_date
+  )
+
+
+ukhls_direct_candidates <- ukhls_imputed_validated |>
+  left_join(
+    ukhls_direct_reports,
+    by =
+      "pidp",
+    relationship =
+      "many-to-many"
+  ) |>
+  mutate(
+    direct_date_in_prospective_interval =
+      direct_marriage_complete &
+        !is.na(
+          last_unmarried_month_index
+        ) &
+        !is.na(
+          first_married_month_index
+        ) &
+        direct_marriage_month_index >=
+          last_unmarried_month_index &
+        direct_marriage_month_index <=
+          first_married_month_index,
+
+    direct_minus_phistory_months =
+      direct_marriage_month_index -
+        first_marriage_start_month_index
+  )
+
+
+write_csv(
+  ukhls_direct_candidates,
+  file.path(
+    output_dir,
+    "UKHLS_direct_current_marriage_candidates_for_imputed_PHISTORY.csv"
+  )
+)
+
+
+ukhls_direct_resolution <- ukhls_direct_candidates |>
+  group_by(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  summarise(
+    phistory_start_if =
+      first(
+        first_marriage_start_if
+      ),
+
+    phistory_start_imputation =
+      first(
+        first_marriage_start_imputation
+      ),
+
+    phistory_marriage_year =
+      first(
+        first_marriage_start_year
+      ),
+
+    phistory_marriage_month =
+      first(
+        first_marriage_start_month
+      ),
+
+    phistory_marriage_month_index =
+      first(
+        first_marriage_start_month_index
+      ),
+
+    n_direct_sources_with_complete_date =
+      sum(
+        direct_marriage_complete,
+        na.rm =
+          TRUE
+      ),
+
+    n_direct_sources_in_interval =
+      sum(
+        direct_date_in_prospective_interval,
+        na.rm =
+          TRUE
+      ),
+
+    n_distinct_eligible_direct_dates =
+      n_distinct(
+        direct_marriage_month_index[
+          direct_date_in_prospective_interval
+        ],
+        na.rm =
+          TRUE
+      ),
+
+    eligible_direct_month_index =
+      if (
+        n_distinct_eligible_direct_dates ==
+          1L
+      ) {
+        unique(
+          direct_marriage_month_index[
+            direct_date_in_prospective_interval
+          ]
+        )[1L]
+      } else {
+        NA_real_
+      },
+
+    eligible_direct_year =
+      if (
+        n_distinct_eligible_direct_dates ==
+          1L
+      ) {
+        unique(
+          direct_marriage_year[
+            direct_date_in_prospective_interval
+          ]
+        )[1L]
+      } else {
+        NA_integer_
+      },
+
+    eligible_direct_month =
+      if (
+        n_distinct_eligible_direct_dates ==
+          1L
+      ) {
+        unique(
+          direct_marriage_month[
+            direct_date_in_prospective_interval
+          ]
+        )[1L]
+      } else {
+        NA_integer_
+      },
+
+    direct_sources_supporting_selected_date =
+      if (
+        n_distinct_eligible_direct_dates ==
+          1L
+      ) {
+        paste(
+          sort(
+            unique(
+              direct_source_wave[
+                direct_date_in_prospective_interval &
+                  direct_marriage_month_index ==
+                    eligible_direct_month_index
+              ]
+            )
+          ),
+          collapse =
+            ";"
+        )
+      } else {
+        NA_character_
+      },
+
+    direct_report_conflict =
+      n_distinct_eligible_direct_dates >
+        1L,
+
+    direct_report_resolved =
+      n_distinct_eligible_direct_dates ==
+        1L,
+
+    direct_minus_phistory_months =
+      if (
+        n_distinct_eligible_direct_dates ==
+          1L
+      ) {
+        eligible_direct_month_index -
+          phistory_marriage_month_index
+      } else {
+        NA_real_
+      },
+
+    .groups =
+      "drop"
+  ) |>
+  mutate(
+    eligible_direct_midmonth_date =
+      midmonth_date(
+        eligible_direct_year,
+        eligible_direct_month
+      ),
+
+    direct_report_agrees_exactly_with_phistory_month =
+      direct_report_resolved &
+        direct_minus_phistory_months ==
+          0
+  )
+
+
+write_csv(
+  ukhls_direct_resolution,
+  file.path(
+    output_dir,
+    "UKHLS_direct_current_marriage_resolution_person_level.csv"
+  )
+)
+
+
+ukhls_direct_refinement_summary <- ukhls_direct_resolution |>
+  group_by(
+    phistory_start_if,
+    phistory_start_imputation
+  ) |>
+  summarise(
+    n =
+      n(),
+
+    with_any_complete_direct_report =
+      sum(
+        n_direct_sources_with_complete_date >
+          0
+      ),
+
+    with_any_direct_report_in_interval =
+      sum(
+        n_direct_sources_in_interval >
+          0
+      ),
+
+    resolved_unique_direct_date =
+      sum(
+        direct_report_resolved
+      ),
+
+    conflicting_eligible_direct_dates =
+      sum(
+        direct_report_conflict
+      ),
+
+    exact_month_agreement_with_phistory =
+      sum(
+        direct_report_agrees_exactly_with_phistory_month,
+        na.rm =
+          TRUE
+      ),
+
+    pct_resolved_unique_direct_date =
+      100 *
+        resolved_unique_direct_date /
+        n,
+
+    median_direct_minus_phistory_months =
+      safe_median(
+        direct_minus_phistory_months
+      ),
+
+    p10_direct_minus_phistory_months =
+      safe_quantile(
+        direct_minus_phistory_months,
+        0.10
+      ),
+
+    p90_direct_minus_phistory_months =
+      safe_quantile(
+        direct_minus_phistory_months,
+        0.90
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+write_csv(
+  ukhls_direct_refinement_summary,
+  file.path(
+    output_dir,
+    "UKHLS_direct_current_marriage_refinement_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 10C. DEFINE REFINED FIRST-MARRIAGE TEMPORAL ANCHOR
+# =============================================================================
+#
+# Hierarchy:
+#
+# 1. PHISTORY start_if == 0:
+#      use reported PHISTORY month/year, anchored at the 15th.
+#      PHISTORY startdate is a monthly index, not an exact calendar day.
+#
+# 2. UKHLS start_if in {1,2}:
+#      if exactly one eligible direct month/year is identified from a/f
+#      INDRESP, use its mid-month anchor.
+#
+# 3. Otherwise:
+#      retain PHISTORY mid-month imputed anchor, explicitly flagged as imputed.
+#
+# This preserves all validated cases. "High precision" means directly
+# reported month/year, not an exact day.
+# =============================================================================
+
+validation_refined <- validation |>
+  left_join(
+    ukhls_direct_resolution |>
+      select(
+        pidp,
+        event_wave,
+        direct_report_resolved,
+        direct_report_conflict,
+        eligible_direct_year,
+        eligible_direct_month,
+        eligible_direct_month_index,
+        eligible_direct_midmonth_date,
+        direct_sources_supporting_selected_date,
+        direct_minus_phistory_months,
+        direct_report_agrees_exactly_with_phistory_month
+      ),
+    by = c(
+      "pidp",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  ) |>
+  mutate(
+    use_ukhls_direct_month_year =
+      survey == "UKHLS" &
+        validated_genuine_first_marriage &
+        first_marriage_start_if %in%
+          c(
+            1L,
+            2L
+          ) &
+        coalesce(
+          direct_report_resolved,
+          FALSE
+        ),
+
+    refined_first_marriage_year =
+      case_when(
+        use_ukhls_direct_month_year ~
+          eligible_direct_year,
+
+        TRUE ~
+          first_marriage_start_year
+      ),
+
+    refined_first_marriage_month =
+      case_when(
+        use_ukhls_direct_month_year ~
+          eligible_direct_month,
+
+        TRUE ~
+          first_marriage_start_month
+      ),
+
+    refined_first_marriage_month_index =
+      month_index(
+        refined_first_marriage_year,
+        refined_first_marriage_month
+      ),
+
+    refined_first_marriage_anchor_date =
+      case_when(
+        use_ukhls_direct_month_year ~
+          eligible_direct_midmonth_date,
+
+        TRUE ~
+          first_marriage_start_midmonth_date
+      ),
+
+    refined_anchor_source =
+      case_when(
+        use_ukhls_direct_month_year ~
+          "UKHLS direct current-marriage month/year",
+
+        first_marriage_start_if == 0 ~
+          "PHISTORY reported month/year",
+
+        first_marriage_start_if == 1 ~
+          "PHISTORY month-imputed start",
+
+        first_marriage_start_if == 2 ~
+          "PHISTORY whole-date-imputed start",
+
+        TRUE ~
+          "PHISTORY month/year"
+      ),
+
+    refined_anchor_precision =
+      case_when(
+        use_ukhls_direct_month_year ~
+          "direct_reported_month_year",
+
+        first_marriage_start_if == 0 ~
+          "reported_month_year",
+
+        first_marriage_start_if == 1 ~
+          "phistory_month_imputed",
+
+        first_marriage_start_if == 2 ~
+          "phistory_whole_date_imputed",
+
+        TRUE ~
+          "other"
+      ),
+
+    high_precision_primary_anchor =
+      refined_anchor_precision %in%
+        c(
+          "reported_month_year",
+          "direct_reported_month_year"
+        ),
+
+    medium_or_high_precision_anchor =
+      refined_anchor_precision %in%
+        c(
+          "reported_month_year",
+          "direct_reported_month_year",
+          "phistory_month_imputed"
+        )
+
+  )
+
+
+write_csv(
+  validation_refined,
+  file.path(
+    output_dir,
+    "phistory_first_marriage_validation_person_level_REFINED.csv"
+  )
+)
+
+
+refined_anchor_summary <- validation_refined |>
+  filter(
+    validated_genuine_first_marriage
+  ) |>
+  count(
+    survey,
+    refined_anchor_precision,
+    refined_anchor_source,
+    name =
+      "n"
+  ) |>
+  group_by(
+    survey
+  ) |>
+  mutate(
+    percent =
+      100 *
+        n /
+        sum(
+          n
+        )
+  ) |>
+  ungroup()
+
+
+write_csv(
+  refined_anchor_summary,
+  file.path(
+    output_dir,
+    "refined_first_marriage_anchor_summary.csv"
+  )
+)
+
+
+refined_anchor_sample_sizes <- validation_refined |>
+  filter(
+    validated_genuine_first_marriage
+  ) |>
+  group_by(
+    survey
+  ) |>
+  summarise(
+    validated_first_marriages =
+      n(),
+
+    high_precision_primary_anchor =
+      sum(
+        high_precision_primary_anchor
+      ),
+
+    pct_high_precision_primary_anchor =
+      100 *
+        high_precision_primary_anchor /
+        validated_first_marriages,
+
+    medium_or_high_precision_anchor =
+      sum(
+        medium_or_high_precision_anchor
+      ),
+
+    pct_medium_or_high_precision_anchor =
+      100 *
+        medium_or_high_precision_anchor /
+        validated_first_marriages,
+
+    remaining_whole_date_imputed =
+      sum(
+        refined_anchor_precision ==
+          "phistory_whole_date_imputed"
+      ),
+
+    pct_remaining_whole_date_imputed =
+      100 *
+        remaining_whole_date_imputed /
+        validated_first_marriages,
+
+    .groups =
+      "drop"
+  )
+
+
+write_csv(
+  refined_anchor_sample_sizes,
+  file.path(
+    output_dir,
+    "refined_first_marriage_anchor_sample_sizes.csv"
+  )
+)
+
+
+
+ukhls_direct_upgrade_count <- validation_refined |>
+  filter(
+    survey == "UKHLS",
+    validated_genuine_first_marriage
+  ) |>
+  summarise(
+    validated_ukhls_first_marriages =
+      n(),
+
+    phistory_start_if_1_or_2 =
+      sum(
+        first_marriage_start_if %in%
+          c(
+            1L,
+            2L
+          )
+      ),
+
+    upgraded_with_direct_current_marriage_month_year =
+      sum(
+        use_ukhls_direct_month_year,
+        na.rm =
+          TRUE
+      ),
+
+    remaining_start_if_1_or_2_without_direct_upgrade =
+      phistory_start_if_1_or_2 -
+        upgraded_with_direct_current_marriage_month_year
+  )
+
+
+write_csv(
+  ukhls_direct_upgrade_count,
+  file.path(
+    output_dir,
+    "UKHLS_direct_current_marriage_upgrade_count.csv"
+  )
+)
+
+
+# =============================================================================
+# 11. VALIDATION SUMMARY
+# =============================================================================
+
+validation_counts <- validation |>
+  group_by(
+    survey
+  ) |>
+  summarise(
+
+    prospective_marriers =
+      n(),
+
+    present_in_phistory =
+      sum(
+        present_in_phistory,
+        na.rm =
+          TRUE
+      ),
+
+    any_marriage_spell =
+      sum(
+        any_marriage_spell_in_phistory,
+        na.rm =
+          TRUE
+      ),
+
+    usable_first_marriage_date =
+      sum(
+        first_marriage_start_complete,
+        na.rm =
+          TRUE
+      ),
+
+    validated_genuine_first_marriage =
+      sum(
+        validated_genuine_first_marriage,
+        na.rm =
+          TRUE
+      ),
+
+    focal_transition_later_marriage =
+      sum(
+        focal_transition_is_later_marriage,
+        na.rm =
+          TRUE
+      ),
+
+    first_marriage_before_last_unmarried =
+      sum(
+        first_marriage_before_last_unmarried,
+        na.rm =
+          TRUE
+      ),
+
+    first_marriage_after_first_married =
+      sum(
+        first_marriage_after_first_married,
+        na.rm =
+          TRUE
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+validation_summary <- validation_counts |>
+  mutate(
+
+    pct_present_in_phistory =
+      100 *
+        present_in_phistory /
+        prospective_marriers,
+
+    pct_usable_first_marriage_date =
+      100 *
+        usable_first_marriage_date /
+        prospective_marriers,
+
+    pct_validated_among_usable =
+      if_else(
+        usable_first_marriage_date >
+          0,
+        100 *
+          validated_genuine_first_marriage /
+          usable_first_marriage_date,
+        NA_real_
+      ),
+
+    pct_later_marriage_among_prospective =
+      100 *
+        focal_transition_later_marriage /
+        prospective_marriers
+  ) |>
+  select(
+    survey,
+    prospective_marriers,
+    present_in_phistory,
+    pct_present_in_phistory,
+    any_marriage_spell,
+    usable_first_marriage_date,
+    pct_usable_first_marriage_date,
+    validated_genuine_first_marriage,
+    pct_validated_among_usable,
+    focal_transition_later_marriage,
+    pct_later_marriage_among_prospective,
+    first_marriage_before_last_unmarried,
+    first_marriage_after_first_married
+  )
+
+
+write_csv(
+  validation_summary,
+  file.path(
+    output_dir,
+    "PHISTORY_FIRST_MARRIAGE_validation_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 12. VALIDATION REASON COUNTS
+# =============================================================================
+
+validation_reason_counts <- validation |>
+  count(
+    survey,
+    validation_reason,
+    name =
+      "n"
+  ) |>
+  group_by(
+    survey
+  ) |>
+  mutate(
+    percent =
+      100 *
+        n /
+        sum(
+          n
+        )
+  ) |>
+  ungroup()
+
+
+write_csv(
+  validation_reason_counts,
+  file.path(
+    output_dir,
+    "PHISTORY_validation_reason_counts.csv"
+  )
+)
+
+
+# =============================================================================
+# 13. START-DATE IMPUTATION QUALITY
+# =============================================================================
+
+start_imputation_summary <- validation |>
+  filter(
+    first_marriage_start_complete
+  ) |>
+  count(
+    survey,
+    first_marriage_start_if,
+    first_marriage_start_imputation,
+    name =
+      "n"
+  ) |>
+  group_by(
+    survey
+  ) |>
+  mutate(
+    percent =
+      100 *
+        n /
+        sum(
+          n
+        )
+  ) |>
+  ungroup()
+
+
+write_csv(
+  start_imputation_summary,
+  file.path(
+    output_dir,
+    "first_marriage_start_imputation_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 14. TIMING WITHIN PROSPECTIVE INTERVAL
+# =============================================================================
+
+validated_timing_summary <- validation |>
+  filter(
+    validated_genuine_first_marriage
+  ) |>
+  group_by(
+    survey
+  ) |>
+  summarise(
+
+    n =
+      n(),
+
+    median_months_after_last_unmarried =
+      safe_median(
+        months_last_unmarried_to_first_marriage
+      ),
+
+    p10_months_after_last_unmarried =
+      safe_quantile(
+        months_last_unmarried_to_first_marriage,
+        0.10
+      ),
+
+    p90_months_after_last_unmarried =
+      safe_quantile(
+        months_last_unmarried_to_first_marriage,
+        0.90
+      ),
+
+    median_months_before_first_married_interview =
+      safe_median(
+        months_first_marriage_to_first_married_interview
+      ),
+
+    p10_months_before_first_married_interview =
+      safe_quantile(
+        months_first_marriage_to_first_married_interview,
+        0.10
+      ),
+
+    p90_months_before_first_married_interview =
+      safe_quantile(
+        months_first_marriage_to_first_married_interview,
+        0.90
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+write_csv(
+  validated_timing_summary,
+  file.path(
+    output_dir,
+    "validated_first_marriage_timing_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 15. RECOVER COHABITATION SPELL IMMEDIATELY PRECEDING FIRST MARRIAGE
+# =============================================================================
+#
+# Candidate premarital cohabitation spell:
+#   status == 10
+#   starts before first marriage
+#
+# Preferred ranking:
+#   1. cohend == 2 (ended in marriage)
+#   2. same partner as marriage, where both partner ids are usable
+#   3. end month closest to marriage month
+#   4. latest cohabitation spell before marriage
+#
+# This is deliberately diagnostic rather than blindly assuming adjacency.
+# =============================================================================
+
+validated_first_marriages <- validation |>
+  filter(
+    validated_genuine_first_marriage
+  ) |>
+  select(
+    pidp,
+    survey,
+    event_wave,
+    first_marriage_partner,
+    first_marriage_start_year,
+    first_marriage_start_month,
+    first_marriage_start_month_index,
+    first_marriage_start_midmonth_date,
+    first_marriage_start_if,
+    first_marriage_start_imputation
+  )
+
+
+cohabitation_spells <- phistory_long |>
+  filter(
+    status == 10
+  ) |>
+  select(
+    pidp,
+    cohab_spellno =
+      spellno,
+    cohab_spellnor =
+      spellnor,
+    cohab_partner =
+      partner,
+    cohab_start_year =
+      starty,
+    cohab_start_month =
+      startm,
+    cohab_start_month_index =
+      start_month_index,
+    cohab_start_midmonth_date =
+      start_midmonth_date,
+    cohab_start_if =
+      start_if,
+    cohab_start_imputation =
+      start_imputation_label,
+    cohab_end_year =
+      endy,
+    cohab_end_month =
+      endm,
+    cohab_end_month_index =
+      end_month_index,
+    cohab_end_midmonth_date =
+      end_midmonth_date,
+    cohab_end_if =
+      end_if,
+    cohab_end_reason =
+      cohend,
+    cohab_ongoing =
+      ongoing
+  )
+
+
+premarital_cohab_candidates <- validated_first_marriages |>
+  left_join(
+    cohabitation_spells,
+    by =
+      "pidp",
+    relationship =
+      "many-to-many"
+  ) |>
+  mutate(
+
+    cohab_starts_before_marriage =
+      !is.na(
+        cohab_start_month_index
+      ) &
+        !is.na(
+          first_marriage_start_month_index
+        ) &
+        cohab_start_month_index <
+          first_marriage_start_month_index,
+
+    cohab_ends_by_marriage =
+      is.na(
+        cohab_end_month_index
+      ) |
+        cohab_end_month_index <=
+          first_marriage_start_month_index,
+
+    cohab_ended_in_marriage =
+      cohab_end_reason ==
+        2,
+
+    same_partner_known =
+      !is.na(
+        first_marriage_partner
+      ) &
+        !is.na(
+          cohab_partner
+        ) &
+        first_marriage_partner >=
+          0 &
+        cohab_partner >=
+          0,
+
+    same_partner =
+      same_partner_known &
+        first_marriage_partner ==
+          cohab_partner,
+
+    months_cohab_end_to_marriage =
+      first_marriage_start_month_index -
+        cohab_end_month_index,
+
+    months_cohab_start_to_marriage =
+      first_marriage_start_month_index -
+        cohab_start_month_index
+  ) |>
+  filter(
+    cohab_starts_before_marriage
+  )
+
+
+selected_premarital_cohab <- premarital_cohab_candidates |>
+  group_by(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  arrange(
+    desc(
+      cohab_ended_in_marriage
+    ),
+    desc(
+      same_partner
+    ),
+    abs(
+      months_cohab_end_to_marriage
+    ),
+    desc(
+      cohab_start_month_index
+    ),
+    .by_group =
+      TRUE
+  ) |>
+  slice(
+    1L
+  ) |>
+  ungroup() |>
+  transmute(
+    pidp,
+    survey,
+    event_wave,
+
+    premarital_cohab_found =
+      TRUE,
+
+    premarital_cohab_spellno =
+      cohab_spellno,
+
+    premarital_cohab_partner =
+      cohab_partner,
+
+    premarital_cohab_start_year =
+      cohab_start_year,
+
+    premarital_cohab_start_month =
+      cohab_start_month,
+
+    premarital_cohab_start_month_index =
+      cohab_start_month_index,
+
+    premarital_cohab_start_midmonth_date =
+      cohab_start_midmonth_date,
+
+    premarital_cohab_start_if =
+      cohab_start_if,
+
+    premarital_cohab_start_imputation =
+      cohab_start_imputation,
+
+    premarital_cohab_end_year =
+      cohab_end_year,
+
+    premarital_cohab_end_month =
+      cohab_end_month,
+
+    premarital_cohab_end_month_index =
+      cohab_end_month_index,
+
+    premarital_cohab_end_midmonth_date =
+      cohab_end_midmonth_date,
+
+    premarital_cohab_end_reason =
+      cohab_end_reason,
+
+    premarital_cohab_ended_in_marriage =
+      cohab_ended_in_marriage,
+
+    premarital_cohab_same_partner =
+      same_partner,
+
+    premarital_cohab_same_partner_known =
+      same_partner_known,
+
+    months_cohab_start_to_marriage,
+
+    months_cohab_end_to_marriage
+  )
+
+
+premarital_cohab_person <- validated_first_marriages |>
+  select(
+    pidp,
+    survey,
+    event_wave
+  ) |>
+  left_join(
+    selected_premarital_cohab,
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  ) |>
+  mutate(
+    premarital_cohab_found =
+      coalesce(
+        premarital_cohab_found,
+        FALSE
+      )
+  )
+
+
+write_csv(
+  premarital_cohab_person,
+  file.path(
+    output_dir,
+    "phistory_premarital_cohabitation_person_level.csv"
+  )
+)
+
+
+# =============================================================================
+# 16. PREMARITAL COHABITATION SUMMARY
+# =============================================================================
+
+premarital_cohab_summary <- premarital_cohab_person |>
+  group_by(
+    survey
+  ) |>
+  summarise(
+
+    validated_first_marriages =
+      n(),
+
+    premarital_cohab_found =
+      sum(
+        premarital_cohab_found
+      ),
+
+    pct_premarital_cohab_found =
+      100 *
+        premarital_cohab_found /
+        validated_first_marriages,
+
+    ended_in_marriage =
+      sum(
+        coalesce(
+          premarital_cohab_ended_in_marriage,
+          FALSE
+        )
+      ),
+
+    same_partner_confirmed =
+      sum(
+        coalesce(
+          premarital_cohab_same_partner,
+          FALSE
+        )
+      ),
+
+    median_months_cohab_start_to_marriage =
+      safe_median(
+        months_cohab_start_to_marriage
+      ),
+
+    p25_months_cohab_start_to_marriage =
+      safe_quantile(
+        months_cohab_start_to_marriage,
+        0.25
+      ),
+
+    p75_months_cohab_start_to_marriage =
+      safe_quantile(
+        months_cohab_start_to_marriage,
+        0.75
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+write_csv(
+  premarital_cohab_summary,
+  file.path(
+    output_dir,
+    "premarital_cohabitation_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 17. HARMONIZED VALIDATED FIRST-MARRIAGE FILE
+# =============================================================================
+
+validated_first_marriage_file <- validation_refined |>
+  filter(
+    validated_genuine_first_marriage
+  ) |>
+  select(
+    pidp,
+    survey,
+    event_wave,
+
+    first_marriage_spellno,
+    first_marriage_spellnor,
+    first_marriage_partner,
+
+    first_marriage_start_year,
+    first_marriage_start_month,
+    first_marriage_start_month_index,
+    first_marriage_start_midmonth_date,
+    first_marriage_startdate_raw,
+    first_marriage_start_if,
+    first_marriage_start_imputation,
+
+    refined_first_marriage_year,
+    refined_first_marriage_month,
+    refined_first_marriage_month_index,
+    refined_first_marriage_anchor_date,
+    refined_anchor_source,
+    refined_anchor_precision,
+    high_precision_primary_anchor,
+    medium_or_high_precision_anchor,
+
+    use_ukhls_direct_month_year,
+    direct_report_resolved,
+    direct_report_conflict,
+    direct_sources_supporting_selected_date,
+    direct_minus_phistory_months,
+    direct_report_agrees_exactly_with_phistory_month,
+
+    first_marriage_end_year,
+    first_marriage_end_month,
+    first_marriage_mrgend,
+    first_marriage_ongoing,
+
+    phistory_ttl_married,
+    n_marriage_spells_observed,
+
+    last_unmarried_interview_date,
+    first_married_interview_date,
+
+    months_last_unmarried_to_first_marriage,
+    months_first_marriage_to_first_married_interview
+  ) |>
+  left_join(
+    premarital_cohab_person,
+    by = c(
+      "pidp",
+      "survey",
+      "event_wave"
+    ),
+    relationship =
+      "one-to-one"
+  )
+
+
+write_csv(
+  validated_first_marriage_file,
+  file.path(
+    output_dir,
+    "harmonized_actual_first_marriage_dates_VALIDATED.csv"
+  )
+)
+
+saveRDS(
+  validated_first_marriage_file,
+  file.path(
+    output_dir,
+    "harmonized_actual_first_marriage_dates_VALIDATED.rds"
+  )
+)
+
+
+# =============================================================================
+# 18. CREATE CONTINUOUS-TIME PERSON-WAVE PANEL
+# =============================================================================
+#
+# Merge exact interview dates and define continuous time relative to the
+# validated first-marriage month.
+#
+# The temporal anchor uses the precision hierarchy defined above.
+# All sources are month-level. The deterministic calendar anchor is the 15th
+# of the selected marriage month.
+#
+# IMPORTANT:
+# This is NOT discretized into survey-wave T values.
+#
+# years_from_first_marriage is the inferential continuous-time variable.
+#
+# integer_year_landmark is supplied only for descriptive plotting / labels.
+# =============================================================================
+
+continuous_time_panel <- combined_panel |>
+  inner_join(
+    validated_first_marriage_file |>
+      select(
+        pidp,
+        survey,
+        first_marriage_start_year,
+        first_marriage_start_month,
+        first_marriage_start_midmonth_date,
+        first_marriage_start_if,
+        first_marriage_start_imputation,
+
+        refined_first_marriage_year,
+        refined_first_marriage_month,
+        refined_first_marriage_month_index,
+        refined_first_marriage_anchor_date,
+        refined_anchor_source,
+        refined_anchor_precision,
+        high_precision_primary_anchor,
+        medium_or_high_precision_anchor,
+
+        premarital_cohab_found,
+        premarital_cohab_start_midmonth_date
+      ),
+    by = c(
+      "pidp",
+      "survey"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  left_join(
+    timing_panel |>
+      select(
+        pidp,
+        survey,
+        wave_num,
+        interview_date,
+        interview_year,
+        interview_month,
+        interview_day
+      ),
+    by = c(
+      "pidp",
+      "survey",
+      "wave_num"
+    ),
+    relationship =
+      "many-to-one"
+  ) |>
+  mutate(
+
+    days_from_first_marriage =
+      as.numeric(
+        interview_date -
+          refined_first_marriage_anchor_date
+      ),
+
+    years_from_first_marriage =
+      days_from_first_marriage /
+        365.25,
+
+    integer_year_landmark =
+      round(
+        years_from_first_marriage
+      ),
+
+    in_primary_minus5_to_0_window =
+      years_from_first_marriage >=
+        -5.5 &
+        years_from_first_marriage <=
+          0.5,
+
+    in_extended_minus5_to_plus2_window =
+      years_from_first_marriage >=
+        -5.5 &
+        years_from_first_marriage <=
+          2.5,
+
+    years_from_premarital_cohab_start =
+      if_else(
+        premarital_cohab_found &
+          !is.na(
+            premarital_cohab_start_midmonth_date
+          ) &
+          !is.na(
+            interview_date
+          ),
+        as.numeric(
+          interview_date -
+            premarital_cohab_start_midmonth_date
+        ) /
+          365.25,
+        NA_real_
+      )
+  )
+
+
+saveRDS(
+  continuous_time_panel,
+  file.path(
+    output_dir,
+    "validated_first_marriage_continuous_time_person_wave_panel.rds"
+  )
+)
+
+
+write_csv(
+  continuous_time_panel |>
+    select(
+      pidp,
+      survey,
+      wave_num,
+      interview_date,
+      refined_first_marriage_anchor_date,
+      refined_anchor_source,
+      refined_anchor_precision,
+      high_precision_primary_anchor,
+      medium_or_high_precision_anchor,
+      years_from_first_marriage,
+      integer_year_landmark,
+      in_primary_minus5_to_0_window,
+      in_extended_minus5_to_plus2_window
+    ),
+  file.path(
+    output_dir,
+    "validated_first_marriage_continuous_time_person_wave_timing.csv"
+  )
+)
+
+
+# =============================================================================
+# 19. CONTINUOUS-TIME COVERAGE BY YEAR LANDMARK
+# =============================================================================
+#
+# A person's observation is considered near T-k if it lies within +/- 0.5 year
+# of that literal year landmark.
+#
+# These are descriptive diagnostics only.
+# =============================================================================
+
+landmarks <- tibble(
+  landmark =
+    c(
+      -5,
+      -4,
+      -3,
+      -2,
+      -1,
+      0,
+      1,
+      2
+    )
+)
+
+
+continuous_landmark_coverage <- crossing(
+  validated_first_marriage_file |>
+    select(
+      pidp,
+      survey
+    ),
+  landmarks
+) |>
+  left_join(
+    continuous_time_panel |>
+      select(
+        pidp,
+        survey,
+        wave_num,
+        years_from_first_marriage
+      ),
+    by = c(
+      "pidp",
+      "survey"
+    ),
+    relationship =
+      "many-to-many"
+  ) |>
+  mutate(
+    absolute_distance_to_landmark =
+      abs(
+        years_from_first_marriage -
+          landmark
+      )
+  ) |>
+  group_by(
+    pidp,
+    survey,
+    landmark
+  ) |>
+  summarise(
+    closest_distance_years =
+      if (
+        all(
+          is.na(
+            absolute_distance_to_landmark
+          )
+        )
+      ) {
+        NA_real_
+      } else {
+        min(
+          absolute_distance_to_landmark,
+          na.rm =
+            TRUE
+        )
+      },
+
+    has_interview_within_pm6_months =
+      !is.na(
+        closest_distance_years
+      ) &
+        closest_distance_years <=
+          0.5,
+
+    .groups =
+      "drop"
+  )
+
+
+landmark_coverage_summary <- continuous_landmark_coverage |>
+  group_by(
+    survey,
+    landmark
+  ) |>
+  summarise(
+    validated_people =
+      n(),
+
+    with_interview_within_pm6_months =
+      sum(
+        has_interview_within_pm6_months
+      ),
+
+    pct_with_interview_within_pm6_months =
+      100 *
+        with_interview_within_pm6_months /
+        validated_people,
+
+    median_closest_distance_months =
+      safe_median(
+        closest_distance_years *
+          12
+      ),
+
+    p90_closest_distance_months =
+      safe_quantile(
+        closest_distance_years *
+          12,
+        0.90
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+write_csv(
+  landmark_coverage_summary,
+  file.path(
+    output_dir,
+    "continuous_time_year_landmark_coverage_summary.csv"
+  )
+)
+
+
+# =============================================================================
+# 20. OPTIONAL PHISTORY_WIDE CROSS-CHECK
+# =============================================================================
+#
+# PHISTORY_LONG is authoritative for this workflow.
+# PHISTORY_WIDE is only checked for existence and basic person coverage.
+# =============================================================================
+
+wide_crosscheck <- tibble(
+  phistory_wide_path =
+    phistory_wide_path,
+  file_exists =
+    file.exists(
+      phistory_wide_path
+    ),
+  note =
+    "PHISTORY_LONG is primary; PHISTORY_WIDE retained only as optional cross-check."
+)
+
+if (file.exists(
+  phistory_wide_path
+)) {
+
+  phistory_wide_head <- haven::read_dta(
+    phistory_wide_path,
+    n_max =
+      10
+  )
+
+  wide_crosscheck <- wide_crosscheck |>
+    mutate(
+      n_variables =
+        ncol(
+          phistory_wide_head
+        ),
+      pidp_present =
+        "pidp" %in%
+          names(
+            phistory_wide_head
+          )
+    )
+
+  rm(
+    phistory_wide_head
+  )
+}
+
+write_csv(
+  wide_crosscheck,
+  file.path(
+    output_dir,
+    "phistory_wide_optional_crosscheck.csv"
+  )
+)
+
+
+# =============================================================================
+# 21. DISCREPANCY FILES
+# =============================================================================
+
+write_csv(
+  validation |>
+    filter(
+      !validated_genuine_first_marriage
+    ),
+  file.path(
+    output_dir,
+    "phistory_first_marriage_discrepancies.csv"
+  )
+)
+
+
+write_csv(
+  validation |>
+    filter(
+      focal_transition_is_later_marriage
+    ),
+  file.path(
+    output_dir,
+    "phistory_probable_remarriages.csv"
+  )
+)
+
+
+# =============================================================================
+# 22. OUTPUT CHECK
+# =============================================================================
+
+expected_outputs <- c(
+  "prospective_date_key_check.csv",
+  "UKHLS_direct_current_marriage_source_file_audit.csv",
+  "UKHLS_direct_current_marriage_variable_audit.csv",
+  "UKHLS_direct_current_marriage_candidates_for_imputed_PHISTORY.csv",
+  "UKHLS_direct_current_marriage_resolution_person_level.csv",
+  "UKHLS_direct_current_marriage_refinement_summary.csv",
+  "phistory_first_marriage_validation_person_level_REFINED.csv",
+  "refined_first_marriage_anchor_summary.csv",
+  "refined_first_marriage_anchor_sample_sizes.csv",
+  "UKHLS_direct_current_marriage_upgrade_count.csv",
+  "phistory_optional_variable_audit.csv",
+  "phistory_long_clean.rds",
+  "PHISTORY_startdate_monthly_format_audit.csv",
+  "phistory_coverage_prospective_marriers.csv",
+  "phistory_marriage_spells_all.csv",
+  "phistory_true_first_marriage_person_level.csv",
+  "phistory_focal_marriage_spell_diagnostic.csv",
+  "phistory_first_marriage_validation_person_level.csv",
+  "PHISTORY_FIRST_MARRIAGE_validation_summary.csv",
+  "PHISTORY_validation_reason_counts.csv",
+  "first_marriage_start_imputation_summary.csv",
+  "validated_first_marriage_timing_summary.csv",
+  "phistory_premarital_cohabitation_person_level.csv",
+  "premarital_cohabitation_summary.csv",
+  "harmonized_actual_first_marriage_dates_VALIDATED.csv",
+  "harmonized_actual_first_marriage_dates_VALIDATED.rds",
+  "validated_first_marriage_continuous_time_person_wave_panel.rds",
+  "validated_first_marriage_continuous_time_person_wave_timing.csv",
+  "continuous_time_year_landmark_coverage_summary.csv",
+  "phistory_wide_optional_crosscheck.csv",
+  "phistory_first_marriage_discrepancies.csv",
+  "phistory_probable_remarriages.csv"
+)
+
+output_check <- tibble(
+  file =
+    expected_outputs,
+  exists =
+    file.exists(
+      file.path(
+        output_dir,
+        expected_outputs
+      )
+    )
+)
+
+write_csv(
+  output_check,
+  file.path(
+    output_dir,
+    "PHISTORY_validation_output_check.csv"
+  )
+)
+
+if (any(
+  !output_check$exists
+)) {
+  stop(
+    "One or more expected outputs were not created. Inspect PHISTORY_validation_output_check.csv."
+  )
+}
+
+
+# =============================================================================
+# 23. CONSOLE REPORT
+# =============================================================================
+
+cat(
+  "\n\n============================================================\n"
+)
+
+cat(
+  "PHISTORY-BASED FIRST-MARRIAGE VALIDATION COMPLETE\n"
+)
+
+cat(
+  "============================================================\n\n"
+)
+
+cat(
+  "VALIDATION SUMMARY\n\n"
+)
+
+print(
+  validation_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nVALIDATION REASONS\n\n"
+)
+
+print(
+  validation_reason_counts,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nFIRST-MARRIAGE START-DATE IMPUTATION\n\n"
+)
+
+print(
+  start_imputation_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nVALIDATED MARRIAGE TIMING\n\n"
+)
+
+print(
+  validated_timing_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nPREMARITAL COHABITATION SUMMARY\n\n"
+)
+
+print(
+  premarital_cohab_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nUKHLS DIRECT CURRENT-MARRIAGE REFINEMENT\n\n"
+)
+
+cat(
+  "SPSS Wave a file: ",
+  ukhls_a_indresp_path,
+  "\n",
+  "SPSS Wave f file: ",
+  ukhls_f_indresp_path,
+  "\n\n"
+)
+
+print(
+  ukhls_direct_refinement_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nREFINED MARRIAGE-ANCHOR SAMPLE SIZES\n\n"
+)
+
+print(
+  refined_anchor_sample_sizes,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nYEAR-LANDMARK COVERAGE\n\n"
+)
+
+print(
+  landmark_coverage_summary,
+  n =
+    Inf
+)
+
+cat(
+  "\n\nMost important files to inspect/upload:\n",
+  "  1. PHISTORY_startdate_monthly_format_audit.csv\n",
+  "  2. PHISTORY_FIRST_MARRIAGE_validation_summary.csv\n",
+  "  2. PHISTORY_validation_reason_counts.csv\n",
+  "  3. first_marriage_start_imputation_summary.csv\n",
+  "  4. validated_first_marriage_timing_summary.csv\n",
+  "  5. premarital_cohabitation_summary.csv\n",
+  "  6. UKHLS_direct_current_marriage_refinement_summary.csv\n",
+  "  7. refined_first_marriage_anchor_sample_sizes.csv\n",
+  "  8. refined_first_marriage_anchor_summary.csv\n",
+  "  9. continuous_time_year_landmark_coverage_summary.csv\n",
+  " 10. phistory_probable_remarriages.csv\n",
+  " 11. harmonized_actual_first_marriage_dates_VALIDATED.csv\n"
+)
+
+cat(
+  "\nDefinitive temporal interpretation:\n",
+  "  T-5,...,T0 should now refer to literal YEARS relative to actual first\n",
+  "  marriage. Continuous elapsed years are stored in:\n",
+  "  validated_first_marriage_continuous_time_person_wave_panel.rds\n"
+)
+
+cat(
+  "\nOutput directory:\n",
+  normalizePath(
+    output_dir,
+    winslash =
+      "/",
+    mustWork =
+      FALSE
+  ),
+  "\n"
+)
+
+cat(
+  "============================================================\n"
+)
